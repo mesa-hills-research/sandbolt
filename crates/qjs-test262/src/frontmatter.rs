@@ -95,16 +95,16 @@ fn fields<'a>(lines: &'a [&'a str]) -> Result<Vec<Field<'a>>, String> {
     let mut positions = Vec::new();
     let mut flow = Flow::default();
     for (index, line) in lines.iter().enumerate() {
-        if !significant(line) {
-            continue;
-        }
         if flow.active() {
-            flow.scan(line);
-        } else if indentation(line) == base && !line.trim_start().starts_with("- ") {
+            flow.line(line);
+        } else if significant(line)
+            && indentation(line) == base
+            && !line.trim_start().starts_with("- ")
+        {
             let (key, value) = pair(line.trim_start())?;
             positions.push((index, key, value));
             if value.starts_with(['[', '{', '\'', '"']) {
-                flow.scan(value);
+                flow.line(value);
             }
         }
     }
@@ -139,9 +139,8 @@ impl Flow {
         self.quote.is_some() || self.depth > 0
     }
 
-    // Return the unquoted, uncommented separators at depth zero.
-    fn separators(&mut self, text: &str, separator: char) -> Vec<usize> {
-        let mut result = Vec::new();
+    // Visit unquoted characters at depth zero and stop at a comment.
+    fn scan(&mut self, text: &str, mut visit: impl FnMut(usize, char)) -> usize {
         let mut chars = text.char_indices().peekable();
         let mut space = true;
         while let Some((index, ch)) = chars.next() {
@@ -158,10 +157,10 @@ impl Flow {
                     }
                 }
             } else if ch == '#' && space {
-                break;
+                return index;
             } else {
-                if ch == separator && self.depth == 0 {
-                    result.push(index);
+                if self.depth == 0 {
+                    visit(index, ch);
                 }
                 match ch {
                     '\'' | '"' if space => self.quote = Some(ch),
@@ -172,47 +171,49 @@ impl Flow {
             }
             space = ch.is_whitespace() || matches!(ch, '[' | '{' | ',' | ':');
         }
-        result
+        text.len()
     }
 
-    fn scan(&mut self, text: &str) {
-        self.separators(text, '\0');
+    fn line<'a>(&mut self, text: &'a str) -> (&'a str, bool) {
+        let end = self.scan(text, |_, _| {});
+        let text = text[..end].trim_end();
+        let continued = std::mem::take(&mut self.escaped);
+        if continued {
+            (&text[..text.len() - 1], true)
+        } else {
+            (text, false)
+        }
     }
 }
 
 fn strip_comment(value: &str) -> &str {
-    let mut quote = None;
-    let mut chars = value.char_indices().peekable();
-    let mut space = true;
-    while let Some((offset, ch)) = chars.next() {
-        match quote {
-            Some('\'') if ch == '\'' => {
-                if chars.peek().is_some_and(|&(_, ch)| ch == '\'') {
-                    chars.next();
-                } else {
-                    quote = None;
-                }
-            }
-            Some('"') if ch == '\\' => {
-                chars.next();
-            }
-            Some(open) if ch == open => quote = None,
-            None if ch == '#' && space => return value[..offset].trim_end(),
-            None if matches!(ch, '\'' | '"') && space => quote = Some(ch),
-            _ => {}
-        }
-        space = ch.is_whitespace() || matches!(ch, '[' | '{' | ',' | ':');
-    }
-    value.trim_end()
+    let end = Flow::default().scan(value, |_, _| {});
+    value[..end].trim_end()
 }
 
 fn flow_text(head: &str, rest: &[&str]) -> String {
-    std::iter::once(head)
-        .chain(rest.iter().copied())
-        .map(|line| strip_comment(line.trim()))
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut flow = Flow::default();
+    let mut result = String::new();
+    let mut blank = 0;
+    let mut continued = false;
+    for line in std::iter::once(head).chain(rest.iter().copied()) {
+        let (line, joins_next) = flow.line(line.trim());
+        if line.is_empty() && !joins_next {
+            blank += usize::from(flow.quote.is_some());
+            continue;
+        }
+        if !result.is_empty() {
+            if blank > 0 {
+                result.extend(std::iter::repeat_n('\n', blank));
+            } else if !continued {
+                result.push(' ');
+            }
+        }
+        result.push_str(line);
+        blank = 0;
+        continued = joins_next;
+    }
+    result
 }
 
 fn flow_parts(text: &str, start: char, end: char) -> Result<Vec<&str>, String> {
@@ -220,7 +221,12 @@ fn flow_parts(text: &str, start: char, end: char) -> Result<Vec<&str>, String> {
         .strip_prefix(start)
         .and_then(|text| text.strip_suffix(end))
         .ok_or_else(|| format!("unclosed metadata {start}{end} value"))?;
-    let mut offsets = Flow::default().separators(body, ',');
+    let mut offsets = Vec::new();
+    Flow::default().scan(body, |index, ch| {
+        if ch == ',' {
+            offsets.push(index);
+        }
+    });
     offsets.push(body.len());
     let mut start = 0;
     let mut result = Vec::new();
@@ -486,6 +492,17 @@ $DONOTEVALUATE();"##,
             Metadata::parse(source).unwrap().description.as_deref(),
             Some("one\ntwo\n  code\nthree")
         );
+    }
+
+    #[test]
+    fn multiline_quotes_keep_hashes_and_fold_lines() {
+        let source = "/*---\ndescription: \"first\\\n  second\n\n  # inside a quote\n  last\" # outside\nflags: [async]\n---*/";
+        let metadata = Metadata::parse(source).unwrap();
+        assert_eq!(
+            metadata.description.as_deref(),
+            Some("firstsecond\n# inside a quote last")
+        );
+        assert!(metadata.flag("async"));
     }
 
     #[test]
