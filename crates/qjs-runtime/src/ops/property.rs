@@ -562,13 +562,12 @@ fn set_from<'s>(
         }
         if let Some(index) = typed_index(ctx.heap(), id, key) {
             let same_receiver = ctx.get(receiver) == Value::object(id);
-            if same_receiver || !typed_has(ctx.heap(), id, index) {
-                crate::builtins::typed_atomics::typed_array_set_index(
-                    ctx,
-                    id,
-                    if same_receiver { index } else { None },
-                    value,
-                )?;
+            if same_receiver {
+                return crate::builtins::typed_atomics::typed_array_set_index(
+                    ctx, id, index, value,
+                );
+            }
+            if !typed_has(ctx.heap(), id, index) {
                 return Ok(true);
             }
             break;
@@ -1003,7 +1002,7 @@ fn define_raw(
         }
         if let Some(value) = desc.value {
             let value = ctx.root(value)?;
-            crate::builtins::typed_atomics::typed_array_set_index(ctx, id, index, value)?;
+            return crate::builtins::typed_atomics::typed_array_set_index(ctx, id, index, value);
         }
         return Ok(true);
     }
@@ -1672,6 +1671,9 @@ pub fn prevent_extensions<'s>(ctx: &mut ExecCtx<'_, 's>, object: Handle<'s>) -> 
                 Ok(reported)
             },
         );
+    }
+    if !crate::builtins::typed_atomics::typed_array_can_prevent_extensions(ctx.heap(), id) {
+        return Ok(false);
     }
     ctx.runtime
         .heap

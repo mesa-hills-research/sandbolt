@@ -2,6 +2,13 @@ use super::*;
 use crate::ledger::{AllocResult, HeapLedger, TrackedBox, TrackedVec};
 use crate::object::{ArrayBufferData, SharedArrayBufferData};
 
+const IMMUTABLE: u16 = 13;
+const TRANSFER_TO_IMMUTABLE: u16 = 14;
+const SLICE_TO_IMMUTABLE: u16 = 15;
+
+// QuickJS limits binary data blocks to INT32_MAX bytes.
+const MAX_BUFFER_LEN: usize = i32::MAX as usize;
+
 pub(super) fn install<'s>(ctx: &mut ExecCtx<'_, 's>) -> JsResult<()> {
     let global = ctx.root(Value::object(ctx.realm().global_object))?;
     for (offset, name, ctor, proto) in [
@@ -43,6 +50,13 @@ pub(super) fn install<'s>(ctx: &mut ExecCtx<'_, 's>) -> JsResult<()> {
                     ("transferToFixedLength", 0),
                 ],
             )?;
+            getters(ctx, proto, BUFFER_START + IMMUTABLE, &["immutable"])?;
+            methods(
+                ctx,
+                proto,
+                BUFFER_START + TRANSFER_TO_IMMUTABLE,
+                &[("transferToImmutable", 0), ("sliceToImmutable", 2)],
+            )?;
         } else {
             getters(
                 ctx,
@@ -62,6 +76,7 @@ pub(super) struct Info {
     pub(super) max: Option<usize>,
     pub(super) detached: bool,
     pub(super) shared: bool,
+    pub(super) immutable: bool,
 }
 
 pub(super) fn info(heap: &Heap, obj: ObjId) -> Option<Info> {
@@ -71,15 +86,24 @@ pub(super) fn info(heap: &Heap, obj: ObjId) -> Option<Info> {
             max: data.max_byte_length,
             detached: data.detached,
             shared: false,
+            immutable: data.immutable,
         }),
         ObjectData::SharedArrayBuffer(data) => Some(Info {
             len: data.backing.byte_length(),
             max: data.backing.max_byte_length(),
             detached: false,
             shared: true,
+            immutable: false,
         }),
         _ => None,
     }
+}
+
+pub(super) fn require_mutable(ctx: &mut ExecCtx<'_, '_>, buffer: ObjId) -> JsResult<()> {
+    if info(ctx.heap(), buffer).unwrap().immutable {
+        return Err(ctx.throw_type_error("ArrayBuffer is immutable"));
+    }
+    Ok(())
 }
 
 pub(super) fn shared(heap: &Heap, obj: ObjId) -> Option<&Arc<SharedBufferBacking>> {
@@ -107,7 +131,10 @@ pub(super) fn read(heap: &Heap, buffer: ObjId, offset: usize, out: &mut [u8]) {
 
 pub(super) fn write(ctx: &mut ExecCtx<'_, '_>, buffer: ObjId, offset: usize, input: &[u8]) {
     match &mut ctx.runtime.heap.objects.get_mut(buffer).unwrap().data {
-        ObjectData::ArrayBuffer(b) => b.bytes[offset..][..input.len()].copy_from_slice(input),
+        ObjectData::ArrayBuffer(b) => {
+            debug_assert!(!b.immutable);
+            b.bytes[offset..][..input.len()].copy_from_slice(input);
+        }
         ObjectData::SharedArrayBuffer(b) => b.backing.write(offset, input),
         _ => unreachable!(),
     }
@@ -128,6 +155,7 @@ pub(super) fn copy(
         && let ObjectData::ArrayBuffer(b) =
             &mut ctx.runtime.heap.objects.get_mut(source).unwrap().data
     {
+        debug_assert!(!b.immutable);
         b.bytes.copy_within(from..from + len, to);
         return;
     }
@@ -179,6 +207,7 @@ fn allocate<'s>(
     max: Option<usize>,
     shared: bool,
 ) -> JsResult<Handle<'s>> {
+    check_size(ctx, len.max(max.unwrap_or(0)))?;
     ctx.make_object(Some(proto), ObjectFlags::EXTENSIBLE, |ledger| {
         if shared {
             let backing = SharedArrayBufferData::new(ledger, len, max)?;
@@ -193,11 +222,18 @@ fn allocate<'s>(
                 ArrayBufferData {
                     bytes,
                     max_byte_length: max,
-                    detached: false,
+                    ..Default::default()
                 },
             )?))
         }
     })
+}
+
+fn check_size(ctx: &mut ExecCtx<'_, '_>, len: usize) -> JsResult<()> {
+    if len > MAX_BUFFER_LEN {
+        return Err(ctx.throw_range_error("ArrayBuffer length is too large"));
+    }
+    Ok(())
 }
 
 pub(super) fn wrap_shared<'s>(
@@ -251,7 +287,7 @@ pub(super) fn dispatch<'s>(
     args: Args<'s>,
 ) -> JsResult<Value> {
     let obj = ctx.object_id(this)?;
-    let shared = op >= 8;
+    let shared = matches!(op, 8..=12);
     let state = info(ctx.heap(), obj)
         .filter(|i| i.shared == shared)
         .ok_or_else(|| {
@@ -270,6 +306,7 @@ pub(super) fn dispatch<'s>(
         })),
         2 | 10 => Ok(Value::bool(state.max.is_some())),
         3 => Ok(Value::bool(state.detached)),
+        IMMUTABLE => Ok(Value::bool(state.immutable)),
         4 | 11 => {
             let Some(max) = state.max else {
                 return Err(ctx.throw_type_error("Buffer has a fixed length"));
@@ -291,14 +328,15 @@ pub(super) fn dispatch<'s>(
             }
             Ok(Value::UNDEFINED)
         }
-        5 | 12 => slice(ctx, this, obj, state, args),
-        6 | 7 => {
+        5 | 12 | SLICE_TO_IMMUTABLE => slice(ctx, this, obj, state, args, op == SLICE_TO_IMMUTABLE),
+        6 | 7 | TRANSFER_TO_IMMUTABLE => {
             let arg = item(ctx, args, 0)?;
             let len = if ctx.get(arg) == Value::UNDEFINED {
                 state.len
             } else {
                 index_arg(ctx, arg)?
             };
+            require_mutable(ctx, obj)?;
             if info(ctx.heap(), obj).unwrap().detached {
                 return Err(detached(ctx));
             }
@@ -324,6 +362,7 @@ pub(super) fn dispatch<'s>(
                 unreachable!()
             };
             dst.bytes = bytes;
+            dst.immutable = op == TRANSFER_TO_IMMUTABLE;
             Ok(ctx.get(result))
         }
         _ => unreachable!(),
@@ -331,6 +370,7 @@ pub(super) fn dispatch<'s>(
 }
 
 fn resize(ctx: &mut ExecCtx<'_, '_>, obj: ObjId, len: usize) -> JsResult<()> {
+    check_size(ctx, len)?;
     ctx.allocate(|runtime| {
         let heap = &mut runtime.heap;
         let ObjectData::ArrayBuffer(data) = &mut heap.objects.get_mut(obj).unwrap().data else {
@@ -346,10 +386,12 @@ fn slice<'s>(
     source: ObjId,
     state: Info,
     args: Args<'s>,
+    immutable: bool,
 ) -> JsResult<Value> {
     if state.detached {
         return Err(detached(ctx));
     }
+    require_mutable(ctx, source)?;
     let start = item(ctx, args, 0)?;
     let start = relative(convert::to_integer_or_infinity(ctx, start)?, state.len);
     let end = item(ctx, args, 1)?;
@@ -359,7 +401,12 @@ fn slice<'s>(
         relative(convert::to_integer_or_infinity(ctx, end)?, state.len)
     };
     let count = end.saturating_sub(start);
-    let dest = if let Some(ctor) = species_constructor(ctx, this)? {
+    let ctor = if immutable {
+        None
+    } else {
+        species_constructor(ctx, this)?
+    };
+    let dest = if let Some(ctor) = ctor {
         let len = ctx.root(number(count))?;
         let args = ctx.args(&[len])?;
         let result = call::construct(ctx, ctor, args, ctor)?;
@@ -374,13 +421,16 @@ fn slice<'s>(
     };
     let target = ctx.object_id(dest)?;
     let target_info = info(ctx.heap(), target)
-        .filter(|i| i.shared == state.shared && !i.detached && i.len >= count);
+        .filter(|i| i.shared == state.shared && !i.detached && !i.immutable && i.len >= count);
     if target_info.is_none() || same_storage(ctx.heap(), source, target) {
         return Err(ctx.throw_type_error("Invalid buffer returned by species constructor"));
     }
     let src = info(ctx.heap(), source).unwrap();
     if src.detached {
         return Err(detached(ctx));
+    }
+    if immutable && src.len < end {
+        return Err(ctx.throw_range_error("Slice exceeds buffer length"));
     }
     copy(
         ctx,
@@ -390,6 +440,14 @@ fn slice<'s>(
         0,
         count.min(src.len.saturating_sub(start)),
     );
+    if immutable {
+        let ObjectData::ArrayBuffer(data) =
+            &mut ctx.runtime.heap.objects.get_mut(target).unwrap().data
+        else {
+            unreachable!()
+        };
+        data.immutable = true;
+    }
     Ok(ctx.get(dest))
 }
 

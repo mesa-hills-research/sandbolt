@@ -12,6 +12,7 @@ pub struct ArrayBufferData {
     pub(crate) bytes: TrackedVec<u8>,
     pub(crate) max_byte_length: Option<usize>,
     pub(crate) detached: bool,
+    pub immutable: bool,
 }
 
 #[derive(Debug)]

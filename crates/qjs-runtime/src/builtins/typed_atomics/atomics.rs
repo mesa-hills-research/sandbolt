@@ -66,6 +66,9 @@ pub(super) fn dispatch<'s>(op: u16, ctx: &mut ExecCtx<'_, 's>, args: Args<'s>) -
     }
     let obj = ctx.object_id(first)?;
     let (view, initial_len) = typed::validate(ctx, obj)?;
+    if !matches!(op, LOAD | WAIT | NOTIFY) {
+        buffer::require_mutable(ctx, view.buffer)?;
+    }
     let waitable = matches!(op, WAIT | NOTIFY);
     use TypedArrayKind::*;
     if (waitable && !matches!(view.kind, Int32 | BigInt64))

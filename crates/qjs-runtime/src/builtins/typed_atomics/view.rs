@@ -124,6 +124,9 @@ pub(super) fn dispatch<'s>(
     }
     let op = op - 3;
     let set = op >= 11;
+    if set {
+        buffer::require_mutable(ctx, view.buffer)?;
+    }
     let kind = kinds().nth(usize::from(op % 11)).unwrap();
     let index = item(ctx, args, 0)?;
     let index = index_arg(ctx, index)?;

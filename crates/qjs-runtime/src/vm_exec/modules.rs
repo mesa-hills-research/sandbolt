@@ -400,6 +400,7 @@ fn bytes_module(ctx: &mut ExecCtx<'_, '_>, bytes: &[u8]) -> JsResult<Value> {
             ledger,
             ArrayBufferData {
                 bytes: TrackedVec::from_slice(ledger, bytes)?,
+                immutable: true,
                 ..Default::default()
             },
         )?))
