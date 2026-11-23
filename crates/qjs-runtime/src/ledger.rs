@@ -150,7 +150,17 @@ impl<T> TrackedVec<T> {
         }
         let target = required.max(self.capacity().saturating_mul(2)).max(4);
         match self.grow(ledger, target, false) {
-            Err(AllocError::Limit) if target != required => self.grow(ledger, required, false),
+            Err(AllocError::Limit) if target != required => {
+                // The old buffer remains charged until the copy finishes. Use the
+                // space that fits beside it instead of copying for each new item.
+                let ceiling = ledger.limit_bytes() - ledger.reserve_bytes();
+                let available = ceiling.saturating_sub(ledger.used_bytes());
+                let capacity = available
+                    .min(isize::MAX as usize)
+                    .checked_div(size_of::<T>())
+                    .unwrap_or(required);
+                self.grow(ledger, capacity.max(required), false)
+            }
             result => result,
         }
     }
@@ -311,6 +321,25 @@ mod tests {
             assert_eq!(ledger.peak_bytes(), base + 64 + 128);
         }
         assert_eq!(ledger.used_bytes(), base);
+    }
+
+    #[test]
+    fn growth_uses_available_capacity_when_doubling_cannot_fit() {
+        let ledger = HeapLedger::new(1024, 32).unwrap();
+        let base = ledger.used_bytes();
+        let mut buf = TrackedVec::<u64>::new();
+        buf.try_reserve_exact(&ledger, 50).unwrap();
+        for i in 0..50 {
+            buf.push_reserved(i);
+        }
+        let before = ledger.used_bytes();
+        let capacity = (ledger.limit_bytes() - ledger.reserve_bytes() - before) / size_of::<u64>();
+        assert!((51..100).contains(&capacity));
+        buf.push(&ledger, 50).unwrap();
+        assert_eq!(buf.capacity(), capacity);
+        assert!(buf.iter().copied().eq(0..51));
+        assert_eq!(ledger.peak_bytes(), before + capacity * size_of::<u64>());
+        assert_eq!(ledger.used_bytes(), base + capacity * size_of::<u64>());
     }
 
     #[test]
