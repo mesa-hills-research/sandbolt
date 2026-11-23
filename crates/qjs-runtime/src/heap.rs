@@ -1,8 +1,11 @@
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
+
 use crate::arena::{Arena, ArenaItem};
 use crate::atom::{AtomTable, KeyKind, PropKey};
 use crate::gc::{Trace, Tracer};
 use crate::ledger::{AllocResult, HeapLedger, TrackedVec};
-use crate::object::{Accessor, JsObject, ObjectData, ObjectFlags, WeakKey};
+use crate::object::{Accessor, HashIndex, JsObject, ObjectData, ObjectFlags, WeakKey};
 use crate::realm::Realm;
 use crate::shape::Shape;
 use crate::string::{JsString, StringUnits};
@@ -32,6 +35,21 @@ impl Trace for PersistentRoot {
     }
 }
 
+#[derive(Clone, Copy)]
+struct EmptyShape {
+    proto: ObjId,
+    id: ShapeId,
+    hash: u64,
+}
+
+#[derive(Default)]
+struct EmptyShapeCache {
+    null: Option<ShapeId>,
+    entries: TrackedVec<EmptyShape>,
+    index: HashIndex,
+    seed: RandomState,
+}
+
 pub struct Heap {
     pub ledger: HeapLedger,
     pub objects: Arena<JsObject>,
@@ -50,6 +68,7 @@ pub struct Heap {
     pub(crate) persistent_roots: Arena<PersistentRoot>,
     pub(crate) kept_objects: TrackedVec<WeakKey>,
     pub(crate) collections: usize,
+    empty_shapes: EmptyShapeCache,
 }
 
 impl Heap {
@@ -77,6 +96,7 @@ impl Heap {
             persistent_roots: Arena::new(),
             kept_objects: TrackedVec::new(),
             collections: 0,
+            empty_shapes: EmptyShapeCache::default(),
         };
         for symbol in WellKnown::ALL {
             heap.symbol_registry.insert(
@@ -126,13 +146,51 @@ impl Heap {
     }
 
     pub(crate) fn empty_shape(&mut self, proto: Option<ObjId>) -> AllocResult<ShapeId> {
-        let shared = self.shapes.iter().find_map(|(id, s)| {
-            (s.proto == proto && !s.dictionary && s.props.is_empty()).then_some(id)
-        });
-        if let Some(id) = shared {
+        let cache = &mut self.empty_shapes;
+        let Some(proto) = proto else {
+            if let Some(id) = cache.null {
+                return Ok(id);
+            }
+            let id = self.shapes.insert(&self.ledger, Shape::empty(None))?;
+            cache.null = Some(id);
             return Ok(id);
+        };
+        let hash = cache.seed.hash_one(proto);
+        if let Some(row) = cache
+            .index
+            .find(hash, |row| cache.entries[row].proto == proto)
+        {
+            return Ok(cache.entries[row].id);
         }
-        self.shapes.insert(&self.ledger, Shape::empty(proto))
+        cache.entries.try_reserve(&self.ledger, 1)?;
+        cache.index.reserve(&self.ledger)?;
+        let id = self
+            .shapes
+            .insert(&self.ledger, Shape::empty(Some(proto)))?;
+        cache.index.insert(hash, cache.entries.len());
+        cache.entries.push_reserved(EmptyShape { proto, id, hash });
+        Ok(id)
+    }
+
+    pub(crate) fn prune_empty_shapes(&mut self) {
+        let cache = &mut self.empty_shapes;
+        if cache.null.is_some_and(|id| !self.shapes.is_marked(id)) {
+            cache.null = None;
+        }
+        let mut to = 0;
+        for from in 0..cache.entries.len() {
+            let entry = cache.entries[from];
+            if self.shapes.is_marked(entry.id) && self.objects.is_marked(entry.proto) {
+                if from != to {
+                    cache.index.relocate(entry.hash, from, to);
+                    cache.entries[to] = entry;
+                }
+                to += 1;
+            } else {
+                cache.index.remove(entry.hash, |row| row == from);
+            }
+        }
+        cache.entries.truncate(to);
     }
 
     pub(crate) fn insert_object(
@@ -159,5 +217,49 @@ impl Heap {
             KeyKind::String(atom) => self.atoms.dynamic_string(atom).map(Value::string),
             KeyKind::Symbol(token) => self.symbol_registry.from_token(token).map(Value::symbol),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{EngineLimits, Runtime};
+
+    #[test]
+    fn empty_shape_cache_shares_live_shapes_without_rooting_them() {
+        let mut runtime = Runtime::new(EngineLimits::default()).unwrap();
+        let ordinary = ObjectFlags::EXTENSIBLE;
+        let proto = runtime
+            .heap
+            .insert_object(None, ordinary, ObjectData::Ordinary)
+            .unwrap();
+        runtime.vm.stack.push_reserved(Value::object(proto));
+        let first = runtime.heap.empty_shape(Some(proto)).unwrap();
+        assert_eq!(runtime.heap.empty_shape(Some(proto)), Ok(first));
+        runtime.collect();
+        assert!(runtime.heap.objects.get_weak(proto).is_some());
+        assert!(runtime.heap.shapes.get_weak(first).is_none());
+
+        let child = runtime
+            .heap
+            .insert_object(Some(proto), ordinary, ObjectData::Ordinary)
+            .unwrap();
+        let next = runtime.heap.object(child).shape;
+        assert_ne!(first, next);
+        runtime.vm.stack.push_reserved(Value::object(child));
+        runtime.collect();
+        assert_eq!(runtime.heap.empty_shape(Some(proto)), Ok(next));
+        runtime.vm.stack.clear();
+        runtime.collect();
+        assert!(runtime.heap.shapes.get_weak(next).is_none());
+        assert!(runtime.heap.objects.get_weak(proto).is_none());
+        assert!(
+            runtime
+                .heap
+                .empty_shapes
+                .entries
+                .iter()
+                .all(|entry| entry.proto != proto)
+        );
     }
 }

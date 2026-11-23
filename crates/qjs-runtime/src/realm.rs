@@ -543,7 +543,10 @@ impl Runtime {
 
     pub(crate) fn allocation_point(&mut self) {
         let ledger = &self.heap.ledger;
-        let collect = ledger.used_bytes() >= ledger.gc_threshold();
+        let threshold = ledger.gc_threshold();
+        let ceiling = ledger.limit_bytes() - ledger.reserve_bytes();
+        // At the ceiling, let a failed allocation request a collection.
+        let collect = threshold < ceiling && ledger.used_bytes() >= threshold;
         #[cfg(feature = "gc_stress")]
         let collect = {
             self.stress_countdown -= 1;

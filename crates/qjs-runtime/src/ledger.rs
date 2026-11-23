@@ -35,7 +35,7 @@ impl HeapLedger {
             used_bytes: Cell::new(used_bytes),
             peak_bytes: Cell::new(used_bytes),
             limit_bytes,
-            gc_threshold: Cell::new((limit_bytes - reserve_bytes) / 2),
+            gc_threshold: Cell::new((limit_bytes - reserve_bytes).min(2 * 1024 * 1024)),
             reserve_bytes,
             failpoint_countdown: Cell::new(None),
         })))
@@ -126,6 +126,30 @@ impl<T> TrackedVec<T> {
     }
     pub fn clear(&mut self) {
         self.data.clear();
+    }
+
+    pub(crate) fn shrink_to(&mut self, ledger: &HeapLedger, capacity: usize) {
+        let old = self.capacity();
+        let target = capacity.max(self.len());
+        if target >= old || size_of::<T>() == 0 {
+            return;
+        }
+        assert!(self.charge.as_ref().is_some_and(|l| l.same_account(ledger)));
+        let bytes = target * size_of::<T>();
+        // Keep both buffers charged while moving elements. The new buffer
+        // may use the reserve until the old charge is released.
+        if ledger.charge(bytes, true).is_err() {
+            return;
+        }
+        let mut next = Vec::new();
+        if next.try_reserve_exact(target).is_err() {
+            ledger.release_bytes(bytes);
+            return;
+        }
+        debug_assert_eq!(next.capacity(), target);
+        next.append(&mut self.data);
+        self.data = next;
+        ledger.release_bytes(old * size_of::<T>());
     }
     pub fn truncate(&mut self, len: usize) {
         self.data.truncate(len);
@@ -372,6 +396,70 @@ mod tests {
         assert!(buf.iter().copied().eq(0..51));
         assert_eq!(ledger.peak_bytes(), before + capacity * size_of::<u64>());
         assert_eq!(ledger.used_bytes(), base + capacity * size_of::<u64>());
+    }
+
+    #[test]
+    fn shrinking_preserves_elements_and_returns_capacity_charge() {
+        let ledger = HeapLedger::new(1024, 32).unwrap();
+        let base = ledger.used_bytes();
+        let mut buf = TrackedVec::<u64>::new();
+        buf.try_reserve_exact(&ledger, 64).unwrap();
+        for value in 0..8 {
+            buf.push_reserved(value);
+        }
+        let old = ledger.used_bytes();
+        ledger.fail_after(Some(0));
+        buf.shrink_to(&ledger, 4);
+        assert!(ledger.failpoint_armed());
+        assert_eq!(buf.capacity(), 8);
+        assert!(buf.iter().copied().eq(0..8));
+        let bytes = buf.capacity() * size_of::<u64>();
+        assert_eq!(ledger.used_bytes(), base + bytes);
+        assert_eq!(ledger.peak_bytes(), old + bytes);
+        buf.clear();
+        buf.shrink_to(&ledger, 0);
+        assert_eq!(buf.capacity(), 0);
+        assert_eq!(ledger.used_bytes(), base);
+    }
+
+    #[test]
+    fn box_keeps_its_charge_until_after_payload_drop() {
+        struct Payload {
+            ledger: HeapLedger,
+            expected: usize,
+        }
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                assert_eq!(self.ledger.used_bytes(), self.expected);
+            }
+        }
+
+        let ledger = HeapLedger::new(1024, 32).unwrap();
+        let base = ledger.used_bytes();
+        let expected = base + size_of::<TrackedBoxInner<Payload>>();
+        let boxed = TrackedBox::new(
+            &ledger,
+            Payload {
+                ledger: ledger.clone(),
+                expected,
+            },
+        )
+        .unwrap();
+        assert_eq!(size_of::<TrackedBox<Payload>>(), size_of::<usize>());
+        assert_eq!(ledger.used_bytes(), expected);
+        drop(boxed);
+        assert_eq!(ledger.used_bytes(), base);
+
+        ledger.fail_after(Some(0));
+        let failed = TrackedBox::new(
+            &ledger,
+            Payload {
+                ledger: ledger.clone(),
+                expected: base,
+            },
+        );
+        assert!(matches!(failed, Err(AllocError::Failpoint)));
+        assert_eq!(ledger.used_bytes(), base);
     }
 
     #[test]
