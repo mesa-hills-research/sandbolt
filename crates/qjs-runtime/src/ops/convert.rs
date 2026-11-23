@@ -146,7 +146,7 @@ pub fn to_number<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<f
 }
 
 pub(crate) fn space(unit: u16) -> bool {
-    matches!(unit, 0x09..=0x0d | 0x20 | 0xa0 | 0x1680 | 0x2000..=0x200a | 0x2028 | 0x2029 | 0x202f | 0x205f | 0x3000 | 0xfeff)
+    qjs_unicode::is_space(u32::from(unit))
 }
 
 pub(crate) fn string_to_number(ctx: &mut ExecCtx<'_, '_>, id: StrId) -> JsResult<f64> {
@@ -193,42 +193,22 @@ pub(crate) fn string_to_number(ctx: &mut ExecCtx<'_, '_>, id: StrId) -> JsResult
 }
 
 fn parse_number(bytes: &[u8]) -> f64 {
-    match bytes {
-        b"Infinity" | b"+Infinity" => return f64::INFINITY,
-        b"-Infinity" => return f64::NEG_INFINITY,
-        [b'0', prefix, rest @ ..] => {
-            let radix = match prefix {
-                b'x' | b'X' => 16,
-                b'o' | b'O' => 8,
-                b'b' | b'B' => 2,
-                _ => 0,
-            };
-            if radix != 0 {
-                if rest.is_empty() {
-                    return f64::NAN;
-                }
-                let mut n = 0.0;
-                for &byte in rest {
-                    let Some(digit) = char::from(byte).to_digit(radix) else {
-                        return f64::NAN;
-                    };
-                    n = n * f64::from(radix) + f64::from(digit);
-                }
-                return n;
-            }
-        }
-        _ => {}
+    let prefixed = matches!(bytes, [b'0', b'x' | b'X' | b'o' | b'O' | b'b' | b'B', ..]);
+    let flags = qjs_dtoa::AtodFlags {
+        int_only: prefixed,
+        accept_bin_oct: prefixed,
+        ..Default::default()
+    };
+    let (number, consumed) = qjs_dtoa::atod(
+        std::str::from_utf8(bytes).unwrap(),
+        if prefixed { 0 } else { 10 },
+        flags,
+    );
+    if consumed == bytes.len() {
+        number
+    } else {
+        f64::NAN
     }
-    if !bytes
-        .iter()
-        .all(|byte| matches!(byte, b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E'))
-    {
-        return f64::NAN;
-    }
-    std::str::from_utf8(bytes)
-        .unwrap()
-        .parse()
-        .unwrap_or(f64::NAN)
 }
 
 pub fn to_int32<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<i32> {
@@ -273,9 +253,10 @@ pub fn to_string<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<H
             write!(text, "{n}").unwrap();
             ctx.new_string(text.as_str())
         }
-        ValueKind::BigInt(id) => {
+        ValueKind::BigInt(_) => {
             ctx.root(raw)?;
-            bigint_text(ctx, id)
+            let result = crate::vm::exec::numeric::bigint_text(ctx, raw)?;
+            ctx.root(result)
         }
         ValueKind::Symbol(_) => Err(ctx.throw_type_error("cannot convert Symbol to string")),
         _ => Err(ctx.throw_type_error("cannot convert value to string")),
@@ -283,67 +264,15 @@ pub fn to_string<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<H
 }
 
 fn number_text<'s>(ctx: &mut ExecCtx<'_, 's>, n: f64) -> JsResult<Handle<'s>> {
-    if n.is_nan() {
-        return ctx.new_string("NaN");
-    }
-    if n == 0.0 {
-        return ctx.new_string("0");
-    }
-    if n == f64::INFINITY {
-        return ctx.new_string("Infinity");
-    }
-    if n == f64::NEG_INFINITY {
-        return ctx.new_string("-Infinity");
-    }
-    let mut text = TextBuffer::new();
-    if (1e-6..1e21).contains(&n.abs()) {
-        write!(text, "{n}").unwrap();
-    } else {
-        write!(text, "{n:e}").unwrap();
-    }
-    let text = text.as_str();
-    if let Some((mantissa, exponent)) = text.split_once('e')
-        && !exponent.starts_with('-')
-    {
-        let mut formatted = TextBuffer::new();
-        write!(formatted, "{mantissa}e+{exponent}").unwrap();
-        return ctx.new_string(formatted.as_str());
-    }
-    ctx.new_string(text)
-}
-
-fn bigint_text<'s>(ctx: &mut ExecCtx<'_, 's>, id: BigIntId) -> JsResult<Handle<'s>> {
-    let id = ctx.allocate(|runtime| {
-        let heap = &mut runtime.heap;
-        let data = heap.bigints.get(id).unwrap();
-        let mut magnitude = TrackedVec::from_slice(&heap.ledger, &data.limbs)?;
-        let mut digits = TrackedVec::new();
-        while let Some(last) = magnitude.last() {
-            if *last == 0 {
-                magnitude.pop();
-                continue;
-            }
-            let mut carry = 0;
-            for limb in magnitude.iter_mut().rev() {
-                let number = (carry << 32) | u64::from(*limb);
-                *limb = (number / 10) as u32;
-                carry = number % 10;
-            }
-            digits.push(&heap.ledger, b'0' + carry as u8)?;
-        }
-        if digits.is_empty() {
-            digits.push(&heap.ledger, b'0')?;
-        } else if data.negative {
-            digits.push(&heap.ledger, b'-')?;
-        }
-        digits.reverse();
-        let string = crate::string::JsString::Latin1 {
-            data: digits,
-            is_ascii: true,
-        };
-        heap.strings.insert(&heap.ledger, string)
-    })?;
-    ctx.root(Value::string(id))
+    let options = qjs_dtoa::DtoaOptions::default();
+    let bytes = qjs_dtoa::dtoa_max_len(n, 10, 0, options);
+    let ledger = ctx.heap().ledger.clone();
+    ctx.allocate(|_| ledger.charge_bytes(bytes))?;
+    let text = qjs_dtoa::dtoa(n, 10, 0, options);
+    let result = ctx.new_string(&text);
+    drop(text);
+    ledger.release_bytes(bytes);
+    result
 }
 
 pub fn to_property_key<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<PropKey> {

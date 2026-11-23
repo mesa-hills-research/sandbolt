@@ -4,6 +4,7 @@ use super::convert::{self, PreferredType};
 use crate::heap::{BigIntData, Heap};
 use crate::root::{ExecCtx, Handle};
 use crate::value::*;
+use crate::vm::exec::numeric::compare_big_string;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Equality {
@@ -280,74 +281,5 @@ fn compare_big_number(big: BigView<'_>, number: f64) -> Option<Ordering> {
         }
     } else {
         order
-    })
-}
-
-fn compare_big_string(
-    ctx: &mut ExecCtx<'_, '_>,
-    big: Value,
-    string: StrId,
-) -> JsResult<Option<Ordering>> {
-    ctx.allocate(|runtime| {
-        let heap = &runtime.heap;
-        let mut data = BigIntData::default();
-        let mut start = None;
-        let mut end = 0;
-        for (i, unit) in heap.string_units(string).enumerate() {
-            if !convert::space(unit) {
-                start.get_or_insert(i);
-                end = i + 1;
-            }
-        }
-        let Some(start) = start else {
-            return Ok(Some(compare_big(
-                BigView::of(heap, big).unwrap(),
-                BigView::from_data(&data),
-            )));
-        };
-        let mut units = heap
-            .string_units(string)
-            .skip(start)
-            .take(end - start)
-            .peekable();
-        let sign = matches!(units.peek(), Some(43 | 45));
-        if sign {
-            data.negative = units.next() == Some(45);
-        }
-        let mut radix = 10;
-        let leading_zero = units.peek() == Some(&48);
-        if leading_zero && !sign {
-            units.next();
-            radix = match units.peek() {
-                Some(88 | 120) => 16,
-                Some(79 | 111) => 8,
-                Some(66 | 98) => 2,
-                _ => 10,
-            };
-            if radix != 10 {
-                units.next();
-            }
-        }
-        if units.peek().is_none() && !(leading_zero && radix == 10) {
-            return Ok(None);
-        }
-        for unit in units {
-            let Some(digit) = char::from_u32(unit.into()).and_then(|c| c.to_digit(radix)) else {
-                return Ok(None);
-            };
-            let mut carry = u64::from(digit);
-            for limb in data.limbs.iter_mut() {
-                let n = u64::from(*limb) * u64::from(radix) + carry;
-                *limb = n as u32;
-                carry = n >> 32;
-            }
-            if carry != 0 {
-                data.limbs.push(&heap.ledger, carry as u32)?;
-            }
-        }
-        Ok(Some(compare_big(
-            BigView::of(heap, big).unwrap(),
-            BigView::from_data(&data),
-        )))
     })
 }

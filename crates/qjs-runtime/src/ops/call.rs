@@ -1,9 +1,9 @@
-use crate::atom::{Atom, PropKey};
+use crate::atom::Atom;
 use crate::heap::Heap;
 use crate::object::{ObjectData, ObjectFlags};
 use crate::root::{Args, ExecCtx, Handle, RootScope};
 use crate::value::*;
-use crate::vm::{CallFrame, MiniOp};
+use crate::vm::{CallFrame, MiniOp, exec};
 
 const FINALLY: u32 = 1 << 31;
 
@@ -32,58 +32,8 @@ pub fn construct<'s>(
     args: Args<'s>,
     new_target: Handle<'s>,
 ) -> JsResult<Value> {
-    let mut callee_id = ctx.object_id(callee)?;
-    let mut new_target_id = ctx.object_id(new_target)?;
-    for id in [callee_id, new_target_id] {
-        if !ctx
-            .heap()
-            .object(id)
-            .flags
-            .contains(ObjectFlags::IS_CONSTRUCTOR)
-        {
-            return Err(ctx.throw_type_error("expected a constructor"));
-        }
-    }
-    let actual_callee = ctx.get(callee);
-    while let ObjectData::BoundFunction(bound) = &ctx.heap().object(callee_id).data {
-        if new_target_id == callee_id {
-            new_target_id = bound.target;
-        }
-        callee_id = bound.target;
-    }
-    // Built-in native constructors (`0x1000..=0x1FFF`) perform their own argument
-    // validation and `OrdinaryCreateFromConstructor(newTarget, defaultProto)`.
-    if let ObjectData::NativeFunction(native_fn) = &ctx.heap().object(callee_id).data
-        && (0x1000..=0x1FFF).contains(&native_fn.function.0)
-    {
-        return invoke(
-            ctx,
-            actual_callee,
-            Value::UNDEFINED,
-            args,
-            Some(new_target_id),
-        );
-    }
-    let new_target = ctx.root(Value::object(new_target_id))?;
-    let proto = super::property::get_property(ctx, new_target, PropKey::atom(Atom::PROTOTYPE))?;
-    let realm = function_realm(ctx.heap(), new_target_id).unwrap_or(ctx.realm_id());
-    let proto = proto
-        .as_object()
-        .unwrap_or(ctx.heap().realm(realm).object_proto);
-    let rooted_proto = ctx.root(Value::object(proto))?;
-    let object = ctx.new_object_with_proto(Some(rooted_proto))?;
-    let result = invoke(
-        ctx,
-        actual_callee,
-        ctx.get(object),
-        args,
-        Some(new_target_id),
-    )?;
-    Ok(if result.as_object().is_some() {
-        result
-    } else {
-        ctx.get(object)
-    })
+    let id = ctx.object_id(new_target)?;
+    invoke(ctx, ctx.get(callee), ctx.get(new_target), args, Some(id))
 }
 
 pub(crate) fn function_realm(heap: &Heap, mut id: ObjId) -> Option<RealmId> {
@@ -108,7 +58,10 @@ fn invoke<'s>(
     let depth = ctx.runtime.vm.frames.len();
     let base = ctx.runtime.vm.stack.len();
     let caller = ctx.realm;
-    let reentry = usize::from(depth != 0);
+    let reentry = usize::from(depth != 0 || ctx.runtime.vm.reentry_depth != 0);
+    if depth == 0 && reentry == 0 {
+        ctx.runtime.vm.thrown_frames.clear();
+    }
     if !ctx
         .runtime
         .vm
@@ -118,7 +71,6 @@ fn invoke<'s>(
     }
     ctx.runtime.vm.reentry_depth += reentry;
     let result = (|| {
-        ctx.check_interrupt()?;
         ctx.reserve_stack(args.len() + 2)?;
         ctx.runtime.vm.stack.push_reserved(callee);
         ctx.runtime.vm.stack.push_reserved(this);
@@ -130,31 +82,46 @@ fn invoke<'s>(
         drive(ctx, depth)?;
         Ok(ctx.runtime.vm.stack[base])
     })();
+    while ctx.runtime.vm.frames.len() > depth {
+        let frame = ctx.runtime.vm.frames.pop().unwrap();
+        exec::coroutines::abort_frame(ctx, frame);
+    }
     ctx.runtime.vm.stack.truncate(base);
-    ctx.runtime.vm.frames.truncate(depth);
     ctx.runtime.vm.reentry_depth -= reentry;
     ctx.realm = caller;
     result
 }
 
-fn enter(
+pub(crate) fn enter(
     ctx: &mut ExecCtx<'_, '_>,
     base: usize,
     mut count: usize,
-    new_target: Option<ObjId>,
+    mut new_target: Option<ObjId>,
 ) -> JsResult<()> {
-    let constructing = new_target.is_some();
-    let mut callee = base_value(ctx, base)
+    ctx.check_interrupt()?;
+    let mut require_object = false;
+    let mut callee = ctx.runtime.vm.stack[base]
         .as_object()
         .ok_or_else(|| ctx.throw_type_error("expected a callable function"))?;
     loop {
+        if let Some(target) = new_target {
+            for id in [callee, target] {
+                if !ctx
+                    .heap()
+                    .object(id)
+                    .flags
+                    .contains(ObjectFlags::IS_CONSTRUCTOR)
+                {
+                    return Err(ctx.throw_type_error("expected a constructor"));
+                }
+            }
+        }
         let object = ctx.heap().object(callee);
         match &object.data {
             ObjectData::BoundFunction(bound) => {
                 let (target, this, extra) = (bound.target, bound.this_value, bound.args.len());
                 ctx.reserve_stack(extra)?;
-                let heap = &ctx.runtime.heap;
-                let ObjectData::BoundFunction(bound) = &heap.object(callee).data else {
+                let ObjectData::BoundFunction(bound) = &ctx.runtime.heap.object(callee).data else {
                     unreachable!()
                 };
                 let stack = &mut ctx.runtime.vm.stack;
@@ -162,28 +129,102 @@ fn enter(
                     stack.push_reserved(arg);
                 }
                 stack[base + 2..].rotate_right(extra);
-                if !constructing {
+                if new_target.is_none() {
                     stack[base + 1] = this;
                 }
+                if new_target == Some(callee) {
+                    new_target = Some(target);
+                    stack[base + 1] = Value::object(target);
+                }
                 callee = target;
+                stack[base] = Value::object(target);
                 count += extra;
             }
             ObjectData::Proxy(proxy) => {
-                callee = proxy
-                    .target
-                    .ok_or_else(|| ctx.throw_type_error("proxy is revoked"))?;
+                if !proxy.callable && new_target.is_none() {
+                    return Err(ctx.throw_type_error("expected a callable function"));
+                }
+                let (target, handler) = super::property::proxy_parts(ctx, callee)?;
+                if let Some(trap) = proxy_call(ctx, base, count, target, handler, new_target)? {
+                    require_object |= new_target.is_some();
+                    new_target = None;
+                    callee = trap;
+                    count = ctx.runtime.vm.stack.len() - base - 2;
+                } else {
+                    callee = target;
+                    ctx.runtime.vm.stack[base] = Value::object(target);
+                }
+            }
+            ObjectData::NativeFunction(native) if new_target.is_none() => {
+                let id = native.function.0;
+                if let Some((new_count, target)) =
+                    exec::transform_native_call(ctx, id, base, count)?
+                {
+                    callee = ctx.runtime.vm.stack[base]
+                        .as_object()
+                        .ok_or_else(|| ctx.throw_type_error("expected a callable function"))?;
+                    count = new_count;
+                    new_target = target;
+                    ctx.check_interrupt()?;
+                } else {
+                    break;
+                }
             }
             ObjectData::BytecodeFunction(_) | ObjectData::NativeFunction(_) => break,
             _ => return Err(ctx.throw_type_error("expected a callable function")),
         }
     }
-    let (realm, code) = match &ctx.heap().object(callee).data {
-        ObjectData::NativeFunction(f) => (f.realm, None),
-        ObjectData::BytecodeFunction(f) => (f.realm, Some(f.code)),
+    let (realm, code, preallocate) = match &ctx.heap().object(callee).data {
+        ObjectData::NativeFunction(f) => {
+            (f.realm, None, !(0x1000..=0x1fff).contains(&f.function.0))
+        }
+        ObjectData::BytecodeFunction(f) => {
+            if f.is_class_constructor && new_target.is_none() {
+                return Err(ctx.throw_type_error("class constructors must be invoked with 'new'"));
+            }
+            (f.realm, Some(f.code), !f.is_derived_constructor)
+        }
         _ => unreachable!(),
     };
-    if !ctx.runtime.vm.check_budget(0, 1, 0) {
+    let (arg_slots, locals, operands, capture_slots) = code
+        .and_then(|id| ctx.heap().bytecode.get(id).unwrap().compiled.as_ref())
+        .map_or((count, 0, 0, 0), |f| {
+            let slots = count.max(f.arg_count as usize);
+            (
+                slots,
+                f.var_count as usize,
+                f.stack_size as usize,
+                slots + f.var_count as usize,
+            )
+        });
+    let storage = arg_slots - count + locals + capture_slots;
+    if !ctx.runtime.vm.check_budget(storage + operands, 1, 0) {
         return Err(ctx.stack_overflow());
+    }
+    let capture_base = base + 2 + arg_slots + locals;
+    let floor = capture_base + capture_slots;
+    let this = if let Some(new_target) = new_target {
+        if preallocate {
+            ctx.with_scope(|ctx| {
+                let object = ctx.ordinary_create_from_constructor(
+                    new_target,
+                    |realm| realm.object_proto,
+                    ObjectFlags::EXTENSIBLE,
+                    |_| Ok(ObjectData::Ordinary),
+                )?;
+                Ok(ctx.get(object))
+            })?
+        } else {
+            Value::UNDEFINED
+        }
+    } else {
+        ctx.runtime.vm.stack[base + 1]
+    };
+    ctx.root(this)?;
+    ctx.reserve_stack(storage + operands)?;
+    ctx.runtime.vm.stack.pop();
+    for _ in 0..storage {
+        ctx.runtime.vm.stack.push_reserved(Value::UNDEFINED);
     }
     let frame = CallFrame {
         callee,
@@ -193,25 +234,114 @@ fn enter(
         pc: 0,
         base: base as u32,
         arg_count: count as u32,
+        arg_slots: arg_slots as u32,
+        capture_base: capture_base as u32,
+        floor: floor as u32,
+        last_pc: 0,
+        return_call: false,
+        require_object,
+        coroutine: None,
     };
-    ctx.allocate(|runtime| runtime.vm.frames.push(&runtime.heap.ledger, frame))
+    // The original call operands still contain new.target until the frame is live.
+    ctx.root(this)?;
+    ctx.allocate(|runtime| runtime.vm.frames.push(&runtime.heap.ledger, frame))?;
+    ctx.runtime.vm.stack.pop();
+    ctx.runtime.vm.stack[base + 1] = this;
+    let kind = code
+        .and_then(|code| ctx.heap().bytecode.get(code).unwrap().compiled.as_ref())
+        .map(|function| function.kind);
+    if let Some(kind) = kind {
+        exec::coroutines::enter(ctx, ctx.runtime.vm.frames.len() - 1, kind)?;
+    }
+    Ok(())
 }
 
-fn base_value(ctx: &ExecCtx<'_, '_>, index: usize) -> Value {
-    ctx.runtime.vm.stack[index]
-}
-
-fn drive(ctx: &mut ExecCtx<'_, '_>, depth: usize) -> JsResult<()> {
-    while ctx.runtime.vm.frames.len() > depth {
-        let frame_index = ctx.runtime.vm.frames.len() - 1;
-        let frame = ctx.runtime.vm.frames[frame_index];
-        ctx.realm = frame.realm;
-        let step = ctx.check_interrupt().and_then(|()| {
-            if let Some(code) = frame.code {
-                execute(ctx, frame, frame_index, code)
+fn proxy_call(
+    ctx: &mut ExecCtx<'_, '_>,
+    base: usize,
+    count: usize,
+    target: ObjId,
+    handler: ObjId,
+    new_target: Option<ObjId>,
+) -> JsResult<Option<ObjId>> {
+    ctx.reserve_stack(5)?;
+    let args = ctx.with_scope(|ctx| {
+        let target = ctx.root(Value::object(target))?;
+        let handler = ctx.root(Value::object(handler))?;
+        let Some(trap) = super::property::lookup_proxy_trap(
+            ctx,
+            handler,
+            Atom::get(if new_target.is_some() {
+                "construct"
             } else {
-                native(ctx, frame).map(Some)
+                "apply"
+            }),
+        )?
+        else {
+            return Ok(None);
+        };
+        let array = exec::array_from_stack(ctx, base + 2, count)?;
+        let last = new_target.map_or(ctx.runtime.vm.stack[base + 1], Value::object);
+        let (arg1, arg2) = if new_target.is_some() {
+            (ctx.get(array), last)
+        } else {
+            (last, ctx.get(array))
+        };
+        Ok(Some([
+            ctx.get(trap),
+            ctx.get(handler),
+            ctx.get(target),
+            arg1,
+            arg2,
+        ]))
+    })?;
+    if let Some(args) = args {
+        ctx.runtime.vm.stack.truncate(base);
+        for value in args {
+            ctx.runtime.vm.stack.push_reserved(value);
+        }
+        Ok(args[0].as_object())
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn drive(ctx: &mut ExecCtx<'_, '_>, depth: usize) -> JsResult<()> {
+    while ctx.runtime.vm.frames.len() > depth {
+        let index = ctx.runtime.vm.frames.len() - 1;
+        let frame = ctx.runtime.vm.frames[index];
+        ctx.realm = frame.realm;
+        let step = if frame.return_call {
+            Ok(ctx.runtime.vm.stack.last().copied())
+        } else if let Some(code) = frame.code {
+            if ctx.heap().bytecode.get(code).unwrap().compiled.is_some() {
+                exec::step(ctx, frame, index, code)
+            } else {
+                ctx.check_interrupt()
+                    .and_then(|()| execute_mini(ctx, frame, index, code))
             }
+        } else {
+            native(ctx, frame)
+                .and_then(|value| exec::native_stack(ctx, value))
+                .map(Some)
+        }
+        .and_then(|mut result| {
+            if let Some(value) = result
+                && value.as_object().is_none()
+            {
+                if frame.require_object {
+                    return Err(ctx.throw_type_error("Proxy construct trap must return an object"));
+                }
+                if frame.new_target.is_some() {
+                    let this = ctx.runtime.vm.stack[frame.base as usize + 1];
+                    if this.as_object().is_some() {
+                        result = Some(this);
+                    }
+                }
+            }
+            result
+                .map(|value| exec::coroutines::finish(ctx, frame, value))
+                .transpose()
         });
         match step {
             Ok(Some(value)) => {
@@ -225,7 +355,8 @@ fn drive(ctx: &mut ExecCtx<'_, '_>, depth: usize) -> JsResult<()> {
                 return Err(Abrupt::Interrupted);
             }
             Err(Abrupt::Thrown) => {
-                if !unwind(ctx, depth) {
+                exec::capture_throw(ctx);
+                if !unwind(ctx, depth)? {
                     return Err(Abrupt::Thrown);
                 }
             }
@@ -239,8 +370,8 @@ fn native(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame) -> JsResult<Value> {
         unreachable!()
     };
     let id = data.function;
-    if (0x1000..=0x1FFF).contains(&id.0) {
-        let base = frame.base as usize;
+    let base = frame.base as usize;
+    if (0x1000..=0x1fff).contains(&id.0) {
         return RootScope::new(ctx.runtime, frame.realm).run(|ctx| {
             crate::builtins::dispatch(
                 id,
@@ -259,7 +390,6 @@ fn native(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame) -> JsResult<Value> {
     let Some(function) = function else {
         return Err(ctx.throw_type_error("native function is not installed"));
     };
-    let base = frame.base as usize;
     RootScope::new(ctx.runtime, frame.realm).run(|ctx| {
         function(
             ctx,
@@ -269,7 +399,7 @@ fn native(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame) -> JsResult<Value> {
     })
 }
 
-fn execute(
+fn execute_mini(
     ctx: &mut ExecCtx<'_, '_>,
     frame: CallFrame,
     index: usize,
@@ -285,16 +415,16 @@ fn execute(
     };
     ctx.runtime.vm.frames[index].pc += 1;
     let base = frame.base as usize;
-    let floor = base + 2 + frame.arg_count as usize;
+    let floor = frame.floor as usize;
     let value = match op {
         MiniOp::Push(value) => value,
         MiniOp::Constant(_) => {
             constant.ok_or_else(|| ctx.throw_type_error("invalid constant index"))?
         }
-        MiniOp::This => base_value(ctx, base + 1),
+        MiniOp::This => ctx.runtime.vm.stack[base + 1],
         MiniOp::Arg(arg) => {
             if u32::from(arg) < frame.arg_count {
-                base_value(ctx, base + 2 + arg as usize)
+                ctx.runtime.vm.stack[base + 2 + arg as usize]
             } else {
                 Value::UNDEFINED
             }
@@ -363,29 +493,53 @@ fn pop(ctx: &mut ExecCtx<'_, '_>, floor: usize) -> JsResult<Value> {
     Ok(ctx.runtime.vm.stack.pop().unwrap())
 }
 
-fn unwind(ctx: &mut ExecCtx<'_, '_>, depth: usize) -> bool {
+pub(crate) fn unwind(ctx: &mut ExecCtx<'_, '_>, depth: usize) -> JsResult<bool> {
     while ctx.runtime.vm.frames.len() > depth {
-        let i = ctx.runtime.vm.frames.len() - 1;
-        let frame = ctx.runtime.vm.frames[i];
-        let floor = frame.base as usize + 2 + frame.arg_count as usize;
-        if frame.code.is_some()
-            && let Some((offset, target)) = ctx.runtime.vm.stack[floor..]
+        let index = ctx.runtime.vm.frames.len() - 1;
+        let frame = ctx.runtime.vm.frames[index];
+        if let Some(code) = frame.code {
+            let floor = frame.floor as usize;
+            let compiled = ctx.heap().bytecode.get(code).unwrap().compiled.as_ref();
+            let handler = compiled.and_then(|f| {
+                f.handlers
+                    .iter()
+                    .copied()
+                    .filter(|h| h.start_pc <= frame.last_pc && frame.last_pc < h.end_pc)
+                    .min_by_key(|h| h.end_pc - h.start_pc)
+            });
+            let caught = if compiled.is_some() {
+                exec::unwind_frame(ctx, frame, index, handler)?
+            } else if let Some((offset, target)) = ctx.runtime.vm.stack[floor..]
                 .iter()
                 .enumerate()
                 .rev()
-                .find_map(|(i, v)| match v.decode() {
-                    ValueKind::CatchOffset(target) => Some((i, target)),
+                .find_map(|(offset, value)| match value.decode() {
+                    ValueKind::CatchOffset(target) => Some((offset, target)),
                     _ => None,
                 })
-        {
-            let (exception, _) = ctx.take_exception().unwrap_or((Value::UNDEFINED, false));
-            ctx.runtime.vm.stack.truncate(floor + offset);
-            ctx.runtime.vm.stack.push_reserved(exception);
-            ctx.runtime.vm.frames[i].pc = target & !FINALLY;
-            return true;
+            {
+                let (exception, _) = ctx.take_exception().unwrap_or((Value::UNDEFINED, false));
+                ctx.runtime.vm.stack.truncate(floor + offset);
+                ctx.runtime.vm.stack.push_reserved(exception);
+                ctx.runtime.vm.frames[index].pc = target & !FINALLY;
+                true
+            } else {
+                false
+            };
+            if caught {
+                ctx.runtime.vm.frames[index].return_call = false;
+                ctx.runtime.vm.thrown_frames.clear();
+                return Ok(true);
+            }
         }
+        let handled = exec::coroutines::reject_if_async(ctx, frame)?;
         ctx.runtime.vm.frames.pop();
+        exec::coroutines::abort_frame(ctx, frame);
         ctx.runtime.vm.stack.truncate(frame.base as usize);
+        if let Some(result) = handled {
+            ctx.runtime.vm.stack.push_reserved(result);
+            return Ok(true);
+        }
     }
-    false
+    Ok(false)
 }
