@@ -711,6 +711,29 @@ fn proxy_get_trap_receives_the_original_receiver_and_cannot_change_frozen_data()
 }
 
 #[test]
+fn html_dda_is_falsy_and_loosely_equal_to_nullish_values() {
+    use crate::object::ObjectFlags;
+    let mut runtime = Runtime::new(EngineLimits::default()).unwrap();
+    runtime.with_scope(runtime.default_realm(), |ctx| {
+        let object = ctx
+            .make_object(
+                Some(ctx.realm().object_proto),
+                ObjectFlags::IS_HTML_DDA,
+                |_| Ok(ObjectData::Ordinary),
+            )
+            .unwrap();
+        assert!(!convert::to_boolean(ctx, object));
+        assert_eq!(convert::typeof_str(ctx, object), "undefined");
+        for nullish in [Value::NULL, Value::UNDEFINED] {
+            let nullish = ctx.root(nullish).unwrap();
+            assert!(compare::abstract_eq(ctx, object, nullish).unwrap());
+            assert!(compare::abstract_eq(ctx, nullish, object).unwrap());
+            assert!(!compare::strict_eq(ctx, object, nullish));
+        }
+    });
+}
+
+#[test]
 fn proxy_handler_lookup_uses_the_reentry_limit() {
     let mut runtime = Runtime::new(EngineLimits::default()).unwrap();
     runtime.with_scope(runtime.default_realm(), |ctx| {
