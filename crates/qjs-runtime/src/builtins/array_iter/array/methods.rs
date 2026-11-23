@@ -1,3 +1,6 @@
+use crate::heap::Heap;
+use crate::object::JsObject;
+
 use super::*;
 
 pub(super) fn at_with<'s>(
@@ -265,31 +268,9 @@ fn fill_dense<'s>(
         return Ok(false);
     }
     let (start, end) = (start as usize, end as usize);
-    // Holes and appends must obey indexed setters on the prototype chain.
-    let mut plain_proto = true;
-    let mut parent = heap.shape(object.shape).proto;
-    while let Some(id) = parent {
-        let proto = heap.object(id);
-        match &proto.data {
-            ObjectData::Array(data) if data.elements.is_empty() => {}
-            ObjectData::Ordinary => {}
-            _ => {
-                plain_proto = false;
-                break;
-            }
-        }
-        let shape = heap.shape(proto.shape);
-        if shape
-            .props
-            .iter()
-            .any(|p| heap.array_index(p.key).is_some())
-        {
-            plain_proto = false;
-            break;
-        }
-        parent = shape.proto;
-    }
-    if !plain_proto || !object.flags.contains(ObjectFlags::EXTENSIBLE) {
+    if !plain_index_prototypes(heap, object, None)
+        || !object.flags.contains(ObjectFlags::EXTENSIBLE)
+    {
         return Ok(false);
     }
     ctx.check_interrupt()?;
@@ -434,11 +415,152 @@ pub(super) fn join<'s>(
     Ok(ctx.get(text))
 }
 
+fn plain_index_prototypes(heap: &Heap, object: &JsObject, index: Option<u32>) -> bool {
+    let mut parent = heap.shape(object.shape).proto;
+    if let ObjectData::Array(array) = &object.data {
+        let realm = heap.realm(array.realm);
+        if realm.std_array_prototype_intact && parent == Some(realm.array_proto) {
+            return true;
+        }
+    }
+    let key = index.and_then(crate::atom::PropKey::index);
+    while let Some(id) = parent {
+        let proto = heap.object(id);
+        match &proto.data {
+            ObjectData::Array(data) => {
+                let absent = index.map_or_else(
+                    || data.elements.is_empty(),
+                    |i| {
+                        data.elements
+                            .get(i as usize)
+                            .is_none_or(|&v| v == Value::EMPTY)
+                    },
+                );
+                if !absent {
+                    return false;
+                }
+            }
+            ObjectData::Ordinary => (),
+            _ => return false,
+        }
+        let shape = heap.shape(proto.shape);
+        let indexed = if let Some(key) = key {
+            shape.find(key).is_some()
+        } else {
+            shape.props.iter().any(|p| {
+                heap.array_index(p.key)
+                    .is_some_and(|i| index.is_none_or(|wanted| wanted == i))
+            })
+        };
+        if indexed {
+            return false;
+        }
+        parent = shape.proto;
+    }
+    true
+}
+
+fn fast_pop(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> Option<Value> {
+    let object = ctx.heap().object(id);
+    let ObjectData::Array(array) = &object.data else {
+        return None;
+    };
+    if !object.flags.contains(ObjectFlags::FAST_ARRAY)
+        || object.flags.contains(ObjectFlags::IS_PROTOTYPE)
+        || !array.length_writable
+    {
+        return None;
+    }
+    if array.length == 0 {
+        return Some(Value::UNDEFINED);
+    }
+    let last = array.length - 1;
+    let value = array
+        .elements
+        .get(last as usize)
+        .copied()
+        .filter(|&v| v != Value::EMPTY);
+    let result = if let Some(value) = value {
+        value
+    } else if plain_index_prototypes(ctx.heap(), object, Some(last)) {
+        Value::UNDEFINED
+    } else {
+        return None;
+    };
+    let ObjectData::Array(array) = &mut ctx.runtime.heap.objects.get_mut(id).unwrap().data else {
+        unreachable!()
+    };
+    array.elements.truncate(last as usize);
+    array.length = last;
+    Some(result)
+}
+
+fn fast_push<'s>(ctx: &mut ExecCtx<'_, 's>, id: ObjId, args: Args<'s>) -> JsResult<Option<Value>> {
+    let object = ctx.heap().object(id);
+    let ObjectData::Array(array) = &object.data else {
+        return Ok(None);
+    };
+    if !object.flags.contains(ObjectFlags::FAST_ARRAY)
+        || object.flags.contains(ObjectFlags::IS_PROTOTYPE)
+        || !array.length_writable
+    {
+        return Ok(None);
+    }
+    if args.is_empty() {
+        return Ok(Some(Value::number(f64::from(array.length))));
+    }
+    let len = array.length as usize;
+    let Some(end) = len
+        .checked_add(args.len())
+        .filter(|&n| n <= crate::atom::INLINE_INDEX_LIMIT as usize)
+    else {
+        return Ok(None);
+    };
+    if !object.flags.contains(ObjectFlags::EXTENSIBLE)
+        || len != array.elements.len()
+        || !plain_index_prototypes(ctx.heap(), object, (args.len() == 1).then_some(len as u32))
+    {
+        return Ok(None);
+    }
+    if end > array.elements.capacity() {
+        // Reserving a batch here would change which earlier writes survive OOM.
+        if args.len() != 1 {
+            return Ok(None);
+        }
+        ctx.check_interrupt()?;
+        let value = ctx.get(args.get(0).unwrap());
+        ctx.allocate(|runtime| {
+            let heap = &mut runtime.heap;
+            let ObjectData::Array(array) = &mut heap.objects.get_mut(id).unwrap().data else {
+                unreachable!()
+            };
+            array.elements.push(&heap.ledger, value)?;
+            array.length += 1;
+            Ok(())
+        })?;
+    } else {
+        for i in 0..args.len() {
+            ctx.check_interrupt()?;
+            let value = ctx.get(args.get(i).unwrap());
+            let ObjectData::Array(array) = &mut ctx.runtime.heap.objects.get_mut(id).unwrap().data
+            else {
+                unreachable!()
+            };
+            array.elements.push_reserved(value);
+            array.length += 1;
+        }
+    }
+    Ok(Some(Value::number(end as f64)))
+}
+
 pub(super) fn remove_end<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     r: Receiver<'s>,
     front: bool,
 ) -> JsResult<Value> {
+    if !front && let Some(value) = fast_pop(ctx, ctx.get(r.object).as_object().unwrap()) {
+        return Ok(value);
+    }
     if r.len == 0 {
         set_len(ctx, r.object, 0)?;
         return Ok(Value::UNDEFINED);
@@ -459,6 +581,9 @@ pub(super) fn insert_end<'s>(
     args: Args<'s>,
     front: bool,
 ) -> JsResult<Value> {
+    if !front && let Some(result) = fast_push(ctx, ctx.get(r.object).as_object().unwrap(), args)? {
+        return Ok(result);
+    }
     let count = args.len() as u64;
     if count > MAX_LENGTH - r.len {
         return Err(ctx.throw_type_error("Array exceeds maximum length"));
@@ -714,4 +839,41 @@ pub(super) fn flat<'s>(
         })?;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::EngineLimits;
+    use crate::api::{EvalOptions, JsEngine};
+
+    #[test]
+    fn push_and_pop_keep_prototype_and_readonly_length_effects() {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        let result = engine
+            .eval_to_string(
+                r#"
+            const dense = [{x: 1}];
+            const length = dense.push({x: 2}, {x: 3});
+            const value = dense.pop();
+            const calls = [];
+            const sparse = [0];
+            const proto = Object.create(Array.prototype, {
+                1: { get() { calls.push('get'); return 8; }, set(x) { calls.push(x); } },
+            });
+            Object.setPrototypeOf(sparse, proto);
+            const pushed = sparse.push(7);
+            const own = Object.hasOwn(sparse, '1');
+            const popped = sparse.pop();
+            const locked = [0, 1];
+            Object.defineProperty(locked, 'length', { writable: false });
+            let error = '';
+            try { locked.pop(); } catch (e) { error = e.name; }
+            [length, value.x, dense.length, pushed, own, popped, sparse.length,
+             calls.join(','), error, locked.length, Object.hasOwn(locked, '1')].join('|');
+        "#,
+                EvalOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(result, "3|3|2|2|false|8|1|7,get|TypeError|2|false");
+    }
 }
