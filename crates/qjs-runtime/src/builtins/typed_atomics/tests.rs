@@ -202,6 +202,93 @@ fn buffer_allocations_obey_the_heap_cap_before_growing() {
 }
 
 #[test]
+fn buffer_size_limit_is_distinct_from_the_heap_cap() {
+    let mut rt = runtime();
+    rt.with_scope(rt.default_realm(), |ctx| {
+        let zero = root(ctx, Value::int32(0));
+        let max = i32::MAX as usize;
+        let excessive = root(ctx, number(max + 1));
+        let options = ctx.new_object().unwrap();
+        put(
+            ctx,
+            options,
+            "maxByteLength",
+            ctx.get(excessive),
+            PropFlags::DEFAULT_DATA,
+        )
+        .unwrap();
+        for name in ["ArrayBuffer", "SharedArrayBuffer", "Uint8Array"] {
+            let ctor = global(ctx, name);
+            let args = ctx.args(&[excessive]).unwrap();
+            let result = call::construct(ctx, ctor, args, ctor);
+            error(ctx, result, ErrorKind::Range);
+            if name != "Uint8Array" {
+                let args = ctx.args(&[zero, options]).unwrap();
+                let result = call::construct(ctx, ctor, args, ctor);
+                error(ctx, result, ErrorKind::Range);
+            }
+        }
+        let buf = buffer(ctx, "ArrayBuffer", 0, max);
+        assert_eq!(number_prop(ctx, buf, "maxByteLength"), max as f64);
+        let result = invoke(ctx, buf, "transferToImmutable", &[excessive]);
+        error(ctx, result, ErrorKind::Range);
+        assert_eq!(named(ctx, buf, "detached").unwrap(), Value::bool(false));
+    });
+}
+
+#[test]
+fn immutable_buffers_are_readable_through_all_views() {
+    let mut rt = runtime();
+    rt.with_scope(rt.default_realm(), |ctx| {
+        let source = buffer(ctx, "ArrayBuffer", 2, 4);
+        let one = root(ctx, Value::int32(1));
+        let nine = root(ctx, Value::int32(9));
+        let view = construct(ctx, "Uint8Array", &[source]);
+        let view_id = ctx.object_id(view).unwrap();
+        assert!(typed_array_set_index(ctx, view_id, Some(1), nine).unwrap());
+        put(
+            ctx,
+            source,
+            "constructor",
+            Value::NULL,
+            PropFlags::DEFAULT_DATA,
+        )
+        .unwrap();
+        let slice = call_method(ctx, source, "sliceToImmutable", &[one]);
+        let three = root(ctx, Value::int32(3));
+        let transfer = call_method(ctx, source, "transferToImmutable", &[three]);
+        assert_eq!(named(ctx, source, "detached").unwrap(), Value::bool(true));
+        for (buf, index, length) in [(slice, 0, 1), (transfer, 1, 3)] {
+            assert_eq!(named(ctx, buf, "immutable").unwrap(), Value::bool(true));
+            assert_eq!(named(ctx, buf, "resizable").unwrap(), Value::bool(false));
+            assert_eq!(number_prop(ctx, buf, "byteLength"), f64::from(length));
+            let typed = construct(ctx, "Uint8Array", &[buf]);
+            let typed_id = ctx.object_id(typed).unwrap();
+            assert_eq!(
+                typed_array_get_index(ctx, typed_id, index).unwrap(),
+                ctx.get(nine)
+            );
+            assert!(!typed_array_set_index(ctx, typed_id, Some(index), one).unwrap());
+            let data = construct(ctx, "DataView", &[buf]);
+            let index = root(ctx, number(index));
+            assert_eq!(
+                invoke(ctx, data, "getUint8", &[index]).unwrap(),
+                ctx.get(nine)
+            );
+            let result = invoke(ctx, data, "setUint8", &[index, one]);
+            error(ctx, result, ErrorKind::Type);
+            let atomics = global(ctx, "Atomics");
+            assert_eq!(
+                invoke(ctx, atomics, "load", &[typed, index]).unwrap(),
+                ctx.get(nine)
+            );
+            let result = invoke(ctx, atomics, "store", &[typed, index, one]);
+            error(ctx, result, ErrorKind::Type);
+        }
+    });
+}
+
+#[test]
 fn concrete_arrays_use_their_intrinsics_and_numeric_conversions() {
     let mut rt = runtime();
     rt.with_scope(rt.default_realm(), |ctx| {

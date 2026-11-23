@@ -56,6 +56,9 @@ pub(super) fn dispatch<'s>(
         None
     };
     let writing_string = matches!(op, 2 | 3);
+    if !writing_string && let Some(view) = view {
+        buffer::require_mutable(ctx, view.buffer)?;
+    }
     let input = if writing_string {
         None
     } else {

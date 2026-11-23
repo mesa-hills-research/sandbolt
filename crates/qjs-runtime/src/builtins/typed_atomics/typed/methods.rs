@@ -7,10 +7,10 @@ use crate::object::ArrayIteratorKind;
 use crate::ops::compare;
 
 const AT: u16 = 0;
-const COPY_WITHIN: u16 = 1;
+pub(super) const COPY_WITHIN: u16 = 1;
 const ENTRIES: u16 = 2;
 const EVERY: u16 = 3;
-const FILL: u16 = 4;
+pub(super) const FILL: u16 = 4;
 const FILTER: u16 = 5;
 const FIND: u16 = 6;
 const FIND_INDEX: u16 = 7;
@@ -25,7 +25,7 @@ const LAST_INDEX_OF: u16 = 15;
 const MAP: u16 = 16;
 const REDUCE: u16 = 17;
 const REDUCE_RIGHT: u16 = 18;
-const REVERSE: u16 = 19;
+pub(super) const REVERSE: u16 = 19;
 pub(super) const SET: u16 = 20;
 const SLICE: u16 = 21;
 const SOME: u16 = 22;
@@ -97,20 +97,20 @@ pub(super) fn dispatch<'s>(
             let to = position(ctx, args, 0, len, 0)?;
             let from = position(ctx, args, 1, len, 0)?;
             let end = position(ctx, args, 2, len, len)?;
-            let count = end.saturating_sub(from).min(len - to);
-            if count != 0 {
-                let current = length(ctx.heap(), view).ok_or_else(|| oob(ctx))?;
-                let count = count.min(current.saturating_sub(to.max(from)));
-                let size = view.kind.size();
-                buffer::copy(
-                    ctx,
-                    view.buffer,
-                    view.byte_offset + from * size,
-                    view.buffer,
-                    view.byte_offset + to * size,
-                    count * size,
-                );
-            }
+            let current = length(ctx.heap(), view).ok_or_else(|| oob(ctx))?;
+            let count = end
+                .saturating_sub(from)
+                .min(len - to)
+                .min(current.saturating_sub(to.max(from)));
+            let size = view.kind.size();
+            buffer::copy(
+                ctx,
+                view.buffer,
+                view.byte_offset + from * size,
+                view.buffer,
+                view.byte_offset + to * size,
+                count * size,
+            );
             Ok(ctx.get(this))
         }
         ENTRIES | KEYS | VALUES => {
@@ -169,7 +169,7 @@ pub(super) fn dispatch<'s>(
             };
             let val = item(ctx, args, 1)?;
             let bits = elements::encode(ctx, view.kind, val)?;
-            let current = length(ctx.heap(), view).unwrap_or(0);
+            let current = length(ctx.heap(), view).ok_or_else(|| oob(ctx))?;
             if index < 0.0 || index >= current as f64 {
                 return Err(ctx.throw_range_error("TypedArray index is out of bounds"));
             }

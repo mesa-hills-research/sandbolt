@@ -223,12 +223,18 @@ pub(super) fn construct<'s>(
     args: Args<'s>,
     kind: TypedArrayKind,
 ) -> JsResult<Value> {
+    let first = item(ctx, args, 0)?;
+    let object = ctx.get(first).as_object();
+    let primitive_len = if object.is_none() {
+        index_arg(ctx, first)?
+    } else {
+        0
+    };
     let proto = proto_from_target(ctx, target, |realm| {
         realm.typed_array_concrete[kind as usize].unwrap().1
     })?;
     let proto = ctx.object_id(proto)?;
-    let first = item(ctx, args, 0)?;
-    let result = if let Some(obj) = ctx.get(first).as_object() {
+    let result = if let Some(obj) = object {
         if let Some(src) = data(ctx.heap(), obj) {
             let len = length(ctx.heap(), src).ok_or_else(|| oob(ctx))?;
             if src.kind.is_bigint() != kind.is_bigint() {
@@ -258,8 +264,7 @@ pub(super) fn construct<'s>(
             result
         }
     } else {
-        let len = index_arg(ctx, first)?;
-        allocate_length(ctx, proto, kind, len)?
+        allocate_length(ctx, proto, kind, primitive_len)?
     };
     Ok(ctx.get(result))
 }
@@ -424,9 +429,12 @@ fn create<'s>(
     let result = call::construct(ctx, ctor, args, ctor)?;
     let handle = ctx.root(result)?;
     let id = ctx.object_id(handle)?;
-    let (_, length) = validate(ctx, id)?;
-    if min_len.is_some_and(|n| length < n) {
-        return Err(ctx.throw_type_error("TypedArray result is too short"));
+    let (view, length) = validate(ctx, id)?;
+    if let Some(min_len) = min_len {
+        buffer::require_mutable(ctx, view.buffer)?;
+        if length < min_len {
+            return Err(ctx.throw_type_error("TypedArray result is too short"));
+        }
     }
     Ok(handle)
 }
@@ -509,6 +517,12 @@ pub(super) fn dispatch<'s>(
         });
     }
     let operation = op - METHODS;
+    if matches!(
+        operation,
+        methods::COPY_WITHIN | methods::FILL | methods::REVERSE | methods::SET | methods::SORT
+    ) {
+        buffer::require_mutable(ctx, view.buffer)?;
+    }
     if len.is_none()
         && !matches!(
             operation,

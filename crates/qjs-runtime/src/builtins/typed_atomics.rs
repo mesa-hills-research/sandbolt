@@ -311,6 +311,13 @@ pub fn typed_array_length(heap: &Heap, obj: ObjId) -> Option<usize> {
     typed::data(heap, obj).and_then(|view| typed::length(heap, view))
 }
 
+pub(crate) fn typed_array_can_prevent_extensions(heap: &Heap, obj: ObjId) -> bool {
+    typed::data(heap, obj).is_none_or(|view| {
+        let info = buffer::info(heap, view.buffer).unwrap();
+        view.length.is_some() && (info.shared || info.max.is_none())
+    })
+}
+
 pub fn typed_array_get_index(
     ctx: &mut ExecCtx<'_, '_>,
     obj: ObjId,
@@ -328,13 +335,16 @@ pub fn typed_array_set_index<'s>(
     obj: ObjId,
     index: Option<usize>,
     value: Handle<'s>,
-) -> JsResult<()> {
+) -> JsResult<bool> {
     let Some(view) = typed::data(ctx.heap(), obj) else {
         return Err(ctx.throw_type_error("Expected a TypedArray"));
     };
     let bits = elements::encode(ctx, view.kind, value)?;
-    if let Some(index) = index {
-        typed::put_element(ctx, view, index, bits);
+    if let Some(index) = index.filter(|&i| i < typed::length(ctx.heap(), view).unwrap_or(0)) {
+        if buffer::info(ctx.heap(), view.buffer).unwrap().immutable {
+            return Ok(false);
+        }
+        typed::write_raw(ctx, view, index, bits);
     }
-    Ok(())
+    Ok(true)
 }
