@@ -2,6 +2,8 @@ use crate::gc::{Trace, Tracer};
 use crate::ledger::TrackedVec;
 use crate::value::{ObjId, RealmId, SymId, Value};
 
+payloads!(SymbolObjectData { value: Value });
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WeakKey {
     Object(ObjId),
