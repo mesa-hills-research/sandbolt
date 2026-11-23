@@ -9,6 +9,7 @@ use crate::value::{JsResult, Value};
 
 mod errors;
 mod function;
+pub(crate) use function::THROW_TYPE_ERROR;
 mod object;
 mod proxy;
 mod reflect;

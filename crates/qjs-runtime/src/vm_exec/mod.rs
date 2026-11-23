@@ -584,9 +584,11 @@ pub(crate) fn step(
         CheckCtorReturn => {
             let raw = value(ctx, 1);
             if raw != Value::UNDEFINED && raw.as_object().is_none() {
-                return Err(ctx.throw_type_error(
-                    "derived class constructor must return an object or undefined",
-                ));
+                return Err(ctx.with_realm(frame.caller_realm, |ctx| {
+                    ctx.throw_type_error(
+                        "derived class constructor must return an object or undefined",
+                    )
+                }));
             }
             replace(ctx, 0, &[Value::bool(raw == Value::UNDEFINED)]);
         }
@@ -661,16 +663,20 @@ pub(crate) fn step(
             let current = ctx.runtime.vm.stack[slot];
             match op {
                 GetLoc | GetLoc8 | GetLoc0 | GetLoc1 | GetLoc2 | GetLoc3 | GetLocCheck => {
-                    if op == GetLocCheck {
-                        bindings::check_initialized(ctx, current)?;
+                    if op == GetLocCheck && current == Value::UNINITIALIZED {
+                        ctx.with_realm(frame.caller_realm, |ctx| {
+                            bindings::check_initialized(ctx, current)
+                        })?;
                     }
                     replace(ctx, 0, &[current]);
                 }
                 CloseLoc => bindings::close_local(ctx, frame, slot),
                 SetLocUninitialized => ctx.runtime.vm.stack[slot] = Value::UNINITIALIZED,
                 _ => {
-                    if op == PutLocCheck {
-                        bindings::check_initialized(ctx, current)?;
+                    if op == PutLocCheck && current == Value::UNINITIALIZED {
+                        ctx.with_realm(frame.caller_realm, |ctx| {
+                            bindings::check_initialized(ctx, current)
+                        })?;
                     }
                     if op == PutLocCheckInit && current != Value::UNINITIALIZED {
                         return Err(

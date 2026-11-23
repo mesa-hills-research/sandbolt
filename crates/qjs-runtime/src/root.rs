@@ -176,8 +176,7 @@ impl<'s> ExecCtx<'_, 's> {
         let proto_id = if let Some(obj) = proto.as_object() {
             obj
         } else {
-            let realm_id =
-                crate::ops::call::function_realm(self.heap(), new_target).unwrap_or(self.realm);
+            let realm_id = crate::ops::call::get_function_realm(self, new_target)?;
             default_proto(self.heap().realm(realm_id))
         };
         let rooted_proto = self.root(Value::object(proto_id))?;

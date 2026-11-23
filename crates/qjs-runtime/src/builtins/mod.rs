@@ -37,6 +37,22 @@ pub const TYPED_ATOMICS_BASE: u16 = 0x1A00;
 pub const PROMISE_JSON_EXTRAS_BASE: u16 = 0x1C00;
 pub const VM_INTERNAL_BASE: u16 = 0x1E00;
 
+const INSERTION_SORT_LIMIT: usize = 6;
+
+fn stable_insertion_sort<T: Copy>(
+    values: &mut [T],
+    mut compare: impl FnMut(T, T) -> JsResult<std::cmp::Ordering>,
+) -> JsResult<()> {
+    for i in 1..values.len() {
+        let mut j = i;
+        while j > 0 && compare(values[j - 1], values[j])?.is_gt() {
+            values.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    Ok(())
+}
+
 /// Installs all ECMAScript built-in constructors, prototypes, methods, and global
 /// properties onto `ctx.realm_id()`.
 pub fn install_all(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {

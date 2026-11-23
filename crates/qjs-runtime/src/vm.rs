@@ -152,6 +152,7 @@ impl Trace for BytecodeFunc {
 pub struct CallFrame {
     pub callee: ObjId,
     pub realm: RealmId,
+    pub(crate) caller_realm: RealmId,
     pub code: Option<BcId>,
     pub new_target: Option<ObjId>,
     pub pc: u32,
@@ -169,6 +170,7 @@ impl Trace for CallFrame {
     fn trace(&self, tracer: &Tracer<'_>) {
         self.callee.trace(tracer);
         self.realm.trace(tracer);
+        self.caller_realm.trace(tracer);
         self.code.trace(tracer);
         self.new_target.trace(tracer);
         self.coroutine.trace(tracer);

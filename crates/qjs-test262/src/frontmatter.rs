@@ -43,7 +43,9 @@ impl Metadata {
             return Ok(Self::default());
         };
         let (body, _) = body.split_once("---*/").ok_or("unclosed test metadata")?;
-        let lines: Vec<_> = body.trim_end_matches([' ', '\t']).lines().collect();
+        let body = body.trim_end_matches([' ', '\t']);
+        let body = body.strip_suffix('\r').unwrap_or(body);
+        let lines: Vec<_> = body.lines().flat_map(|line| line.split('\r')).collect();
         let fields = fields(&lines)?;
         let mut result = Self::default();
         for field in fields {
@@ -414,6 +416,17 @@ fn negative(head: &str, rest: &[&str]) -> Result<Negative, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontmatter_accepts_cr_line_endings() {
+        let source =
+            "/*---\ndescription: |+\n  line endings\n\nincludes: [helper.js]\n---*/\nhelper();";
+        for ending in ["\r\n", "\r"] {
+            let metadata = Metadata::parse(&source.replace('\n', ending)).unwrap();
+            assert_eq!(metadata.description.as_deref(), Some("line endings\n\n"));
+            assert_eq!(metadata.includes, ["helper.js"]);
+        }
+    }
 
     #[test]
     fn block_and_flow_lists() {

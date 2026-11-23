@@ -31,7 +31,6 @@ const ASYNC_FROM_SYNC_THROW: NativeFnId = NativeFnId(BASE + 16);
 const FOR_IN_NEXT: NativeFnId = NativeFnId(BASE + 17);
 const HOST: NativeFnId = NativeFnId(BASE + 18);
 const PRINT: NativeFnId = NativeFnId(BASE + 19);
-pub(crate) const THROW_TYPE_ERROR: NativeFnId = NativeFnId(BASE + 20);
 pub(crate) const AWAIT_FULFILLED: NativeFnId = NativeFnId(BASE + 21);
 pub(crate) const AWAIT_REJECTED: NativeFnId = NativeFnId(BASE + 22);
 pub(crate) const ASYNC_UNWRAP: NativeFnId = NativeFnId(BASE + 23);
@@ -310,7 +309,6 @@ pub fn dispatch<'s>(
             Ok(Value::UNDEFINED)
         }
         SELF => Ok(ctx.get(this)),
-        THROW_TYPE_ERROR => Err(ctx.throw_type_error("restricted arguments property")),
         _ => Err(ctx.throw_type_error("unknown runtime builtin")),
     }
 }
@@ -382,11 +380,12 @@ fn function_constructor<'s>(
     if let Some(new_target) = new_target {
         let target = ctx.root(Value::object(new_target))?;
         let prototype = property::get_property(ctx, target, Atom::get("prototype"))?;
-        let prototype = prototype.as_object().unwrap_or_else(|| {
-            let realm =
-                crate::ops::call::function_realm(ctx.heap(), new_target).unwrap_or(ctx.realm_id());
+        let prototype = if let Some(prototype) = prototype.as_object() {
+            prototype
+        } else {
+            let realm = crate::ops::call::get_function_realm(ctx, new_target)?;
             function_prototype_for(ctx, realm, kind)
-        });
+        };
         let prototype = ctx.root(Value::object(prototype))?;
         property::set_prototype_of(ctx, function, Some(prototype))?;
     }

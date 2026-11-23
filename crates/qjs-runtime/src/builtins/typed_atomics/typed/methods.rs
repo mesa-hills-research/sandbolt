@@ -610,36 +610,45 @@ fn sort<'s>(
     };
     let n = length(ctx.heap(), view).ok_or_else(|| oob(ctx))?;
     let mut values = TrackedVec::new();
-    let mut scratch = TrackedVec::new();
     ctx.allocate(|rt| values.try_reserve_exact(&rt.heap.ledger, n))?;
-    ctx.allocate(|rt| scratch.try_reserve_exact(&rt.heap.ledger, n))?;
     for i in 0..n {
         values.push_reserved(raw(ctx.heap(), view, i));
-        scratch.push_reserved(0);
     }
-    let mut width = 1usize;
-    while width < n {
-        let mut start = 0;
-        while start < n {
-            let mid = (start + width).min(n);
-            let end = (mid + width).min(n);
-            let (mut i, mut j) = (start, mid);
-            for out in &mut scratch[start..end] {
-                let from_left = j == end
-                    || (i < mid
-                        && cmp(ctx, view.kind, func, values[i], values[j])? != Ordering::Greater);
-                if from_left {
-                    *out = values[i];
-                    i += 1;
-                } else {
-                    *out = values[j];
-                    j += 1;
-                }
-            }
-            start = end;
+    if n <= crate::builtins::INSERTION_SORT_LIMIT {
+        crate::builtins::stable_insertion_sort(&mut values, |left, right| {
+            cmp(ctx, view.kind, func, left, right)
+        })?;
+    } else {
+        let mut scratch = TrackedVec::new();
+        ctx.allocate(|rt| scratch.try_reserve_exact(&rt.heap.ledger, n))?;
+        for _ in 0..n {
+            scratch.push_reserved(0);
         }
-        std::mem::swap(&mut values, &mut scratch);
-        width *= 2;
+        let mut width = 1usize;
+        while width < n {
+            let mut start = 0;
+            while start < n {
+                let mid = (start + width).min(n);
+                let end = (mid + width).min(n);
+                let (mut i, mut j) = (start, mid);
+                for out in &mut scratch[start..end] {
+                    let from_left = j == end
+                        || (i < mid
+                            && cmp(ctx, view.kind, func, values[i], values[j])?
+                                != Ordering::Greater);
+                    if from_left {
+                        *out = values[i];
+                        i += 1;
+                    } else {
+                        *out = values[j];
+                        j += 1;
+                    }
+                }
+                start = end;
+            }
+            std::mem::swap(&mut values, &mut scratch);
+            width *= 2;
+        }
     }
     let dest = if copy {
         intrinsic(ctx, view.kind, n)?

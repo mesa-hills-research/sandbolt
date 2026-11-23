@@ -650,7 +650,7 @@ fn arguments(
         let callee = ctx.root(Value::object(frame.callee))?;
         define_flags(ctx, object, Atom::get("callee"), callee, flags)?;
     } else {
-        let poison = ctx.new_native(crate::builtins::vm_internal::THROW_TYPE_ERROR, false)?;
+        let poison = ctx.root(Value::object(ctx.realm().throw_type_error))?;
         property::define_own_property(
             ctx,
             object,
