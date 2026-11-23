@@ -251,20 +251,15 @@ fn constructor<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>) -> JsResult<Value>
     Ok(ctx.get(obj))
 }
 
-pub(super) fn create<'s>(
+pub(crate) fn create<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     pattern: Handle<'s>,
-    global_flag: bool,
-) -> JsResult<Handle<'s>> {
-    let flags = if global_flag {
-        ctx.new_string("g")?
-    } else {
-        ctx.root(Value::UNDEFINED)?
-    };
+    flags: Handle<'s>,
+) -> JsResult<Value> {
     let proto = ctx.root(Value::object(ctx.realm().regexp_proto))?;
     let obj = ctx.new_object_with_proto(Some(proto))?;
     initialize(ctx, obj, pattern, flags, None)?;
-    Ok(obj)
+    Ok(ctx.get(obj))
 }
 
 fn initialize<'s>(

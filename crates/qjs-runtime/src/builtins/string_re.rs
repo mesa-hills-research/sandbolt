@@ -2,6 +2,8 @@ mod regexp;
 mod strings;
 mod uri;
 
+pub(crate) use regexp::create as regexp_literal;
+
 #[cfg(test)]
 mod tests;
 

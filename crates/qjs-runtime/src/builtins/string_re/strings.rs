@@ -816,7 +816,13 @@ fn pattern_method<'s>(
         21 | 22 => replace_string(ctx, string, pattern, extra, op == 22),
         25 => split_string(ctx, string, pattern, extra),
         _ => {
-            let re = regexp::create(ctx, pattern, op == 16)?;
+            let flags = if op == 16 {
+                ctx.new_string("g")?
+            } else {
+                ctx.root(Value::UNDEFINED)?
+            };
+            let re = regexp_literal(ctx, pattern, flags)?;
+            let re = ctx.root(re)?;
             let method = get(ctx, re, key)?;
             call_with(ctx, method, re, &[string])
         }
