@@ -4,7 +4,7 @@ mod math;
 #[cfg(test)]
 mod tests;
 
-use qjs_dtoa::{AtodFlags, DtoaExp, DtoaFormat, DtoaOptions, atod, dtoa, dtoa_max_len};
+use qjs_dtoa::{AtodFlags, DtoaExp, DtoaFormat, DtoaOptions, atod};
 
 use crate::atom::PropKey;
 use crate::builtins::{NUM_DATE_BASE, configure_ctor, define_data, install_method, make_native_fn};
@@ -572,26 +572,6 @@ fn render_number(
     digits: usize,
     options: DtoaOptions,
 ) -> JsResult<Value> {
-    let bytes = dtoa_max_len(n, radix, digits, options);
-    let _charge = ctx.allocate(|rt| {
-        rt.heap.ledger.charge_bytes(bytes)?;
-        Ok(FormatCharge {
-            ledger: rt.heap.ledger.clone(),
-            bytes,
-        })
-    })?;
-    let text = dtoa(n, radix, digits, options);
-    let string = ctx.new_string(&text)?;
+    let string = crate::ops::convert::format_number(ctx, n, radix, digits, options)?;
     Ok(ctx.get(string))
-}
-
-struct FormatCharge {
-    ledger: HeapLedger,
-    bytes: usize,
-}
-
-impl Drop for FormatCharge {
-    fn drop(&mut self) {
-        self.ledger.release_bytes(self.bytes);
-    }
 }

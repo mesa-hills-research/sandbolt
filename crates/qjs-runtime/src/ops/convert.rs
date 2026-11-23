@@ -151,6 +151,28 @@ pub(crate) fn space(unit: u16) -> bool {
 }
 
 pub(crate) fn string_to_number(ctx: &mut ExecCtx<'_, '_>, id: StrId) -> JsResult<f64> {
+    if let Some(mut bytes) = ctx.heap().string(id).as_latin1() {
+        let is_space = |byte| space(u16::from(byte));
+        while let Some((&byte, rest)) = bytes.split_first() {
+            if !is_space(byte) {
+                break;
+            }
+            bytes = rest;
+        }
+        while let Some((&byte, rest)) = bytes.split_last() {
+            if !is_space(byte) {
+                break;
+            }
+            bytes = rest;
+        }
+        if bytes.len() <= 128 {
+            return Ok(if bytes.is_empty() {
+                0.0
+            } else {
+                parse_number(bytes)
+            });
+        }
+    }
     let mut first = None;
     let mut end = 0;
     for (i, unit) in ctx.heap().string_units(id).enumerate() {
@@ -200,11 +222,10 @@ fn parse_number(bytes: &[u8]) -> f64 {
         accept_bin_oct: prefixed,
         ..Default::default()
     };
-    let (number, consumed) = qjs_dtoa::atod(
-        std::str::from_utf8(bytes).unwrap(),
-        if prefixed { 0 } else { 10 },
-        flags,
-    );
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return f64::NAN;
+    };
+    let (number, consumed) = qjs_dtoa::atod(text, if prefixed { 0 } else { 10 }, flags);
     if consumed == bytes.len() {
         number
     } else {
@@ -293,13 +314,28 @@ fn number_text<'s>(ctx: &mut ExecCtx<'_, 's>, n: f64) -> JsResult<Handle<'s>> {
     if n == f64::from(i) {
         return integer_text(ctx, i64::from(i));
     }
-    let options = qjs_dtoa::DtoaOptions::default();
-    let bytes = qjs_dtoa::dtoa_max_len(n, 10, 0, options);
+    format_number(ctx, n, 10, 0, qjs_dtoa::DtoaOptions::default())
+}
+
+pub(crate) fn format_number<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    n: f64,
+    radix: u32,
+    digits: usize,
+    options: qjs_dtoa::DtoaOptions,
+) -> JsResult<Handle<'s>> {
+    let bytes = qjs_dtoa::dtoa_max_len(n, radix, digits, options);
     let ledger = ctx.heap().ledger.clone();
     ctx.allocate(|_| ledger.charge_bytes(bytes))?;
-    let text = qjs_dtoa::dtoa(n, 10, 0, options);
-    let result = ctx.new_string(&text);
-    drop(text);
+    // Keep the scratch charge through allocation of the JS string.
+    let result = if bytes <= 128 {
+        let mut buf = [0; 128];
+        let len = qjs_dtoa::dtoa_into(&mut buf, n, radix, digits, options);
+        ctx.new_latin1(&buf[..len])
+    } else {
+        let text = qjs_dtoa::dtoa(n, radix, digits, options);
+        ctx.new_latin1(text.as_bytes())
+    };
     ledger.release_bytes(bytes);
     result
 }
@@ -499,4 +535,29 @@ fn wrapper_to_string<'s>(
     }
     let text = to_string(ctx, value)?;
     Ok(ctx.get(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::EngineLimits;
+    use crate::api::{EvalOptions, JsEngine};
+
+    #[test]
+    fn string_to_number_keeps_whitespace_and_prefix_rules() {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        let result = engine
+            .eval_to_string(
+                r#"
+            const values = ['\v\xA0-42.25\r', '\uFEFF+42.25', ' -0 ',
+                            '\xA0', '0x3f', '-0x3f', '.125', '12.e', '1\xE9', '\xC2\xA0'];
+            values.map(s => String(1 / +s)).join('|');
+        "#,
+                EvalOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            "-0.023668639053254437|0.023668639053254437|-Infinity|Infinity|0.015873015873015872|NaN|8|NaN|NaN|NaN"
+        );
+    }
 }

@@ -104,26 +104,54 @@ fn max_len(d: f64, radix: Radix, n_digits: i32, opts: DtoaOptions) -> usize {
 pub fn dtoa(d: f64, radix: u32, n_digits: usize, opts: DtoaOptions) -> String {
     let radix = Radix::new(radix);
     let n_digits = requested_digits(n_digits, opts.format);
+    let mut bytes = vec![0; max_len(d, radix, n_digits, opts)];
+    let len = format_into(&mut bytes, d, radix, n_digits, opts);
+    bytes.truncate(len);
+    String::from_utf8(bytes).expect("number formatting writes only ASCII")
+}
+
+/// Writes the same ASCII as [`dtoa`] and returns the byte count.
+/// The buffer must have room for [`dtoa_max_len`] bytes. No NUL is written.
+pub fn dtoa_into(buf: &mut [u8], d: f64, radix: u32, n_digits: usize, opts: DtoaOptions) -> usize {
+    format_into(
+        buf,
+        d,
+        Radix::new(radix),
+        requested_digits(n_digits, opts.format),
+        opts,
+    )
+}
+
+fn format_into(bytes: &mut [u8], d: f64, radix: Radix, n_digits: i32, opts: DtoaOptions) -> usize {
     let bits = d.to_bits();
     let negative = bits >> 63 != 0;
     let mut exponent = exponent_field(bits);
     let mut mantissa = bits & FRACTION_MASK;
+    let mut buf = Output { bytes, len: 0 };
 
     if exponent == 0x7ff {
-        return if mantissa != 0 {
-            "NaN"
+        buf.extend(if mantissa != 0 {
+            b"NaN"
         } else if negative {
-            "-Infinity"
+            b"-Infinity"
         } else {
-            "Infinity"
-        }
-        .to_owned();
+            b"Infinity"
+        });
+        return buf.len;
     }
-
-    let mut buf = Vec::with_capacity(max_len(d, radix, n_digits, opts));
     let zero = d == 0.0;
     if negative && (!zero || opts.minus_zero) {
         buf.push(b'-');
+    }
+
+    let integer_exponent = exponent - 1022;
+    if opts.format == DtoaFormat::Free
+        && opts.exp != DtoaExp::Enabled
+        && (1..=53).contains(&integer_exponent)
+        && mantissa.trailing_zeros() as i32 >= 53 - integer_exponent
+    {
+        let magnitude = (mantissa | FRACTION_BIT) >> (53 - integer_exponent);
+        return buf.len + u64toa_radix(&mut buf.bytes[buf.len..], magnitude, radix.value);
     }
 
     let mut scaled = Limbs::new(0);
@@ -144,17 +172,6 @@ pub fn dtoa(d: f64, radix: u32, n_digits: usize, opts: DtoaOptions) -> String {
         }
         exponent -= 1022;
 
-        if opts.format == DtoaFormat::Free
-            && opts.exp != DtoaExp::Enabled
-            && (1..=53).contains(&exponent)
-            && mantissa.trailing_zeros() as i32 >= 53 - exponent
-        {
-            let mut digits = [0; 64];
-            let len = u64toa_radix(&mut digits, mantissa >> (53 - exponent), radix.value);
-            buf.extend_from_slice(&digits[..len]);
-            return ascii(buf);
-        }
-
         let mut point = 1 + radix_exponent(exponent - 1, radix);
         match opts.format {
             DtoaFormat::Free => shortest(&mut scaled, radix, mantissa, exponent, point),
@@ -168,13 +185,14 @@ pub fn dtoa(d: f64, radix: u32, n_digits: usize, opts: DtoaOptions) -> String {
                     Round::Away,
                 );
                 let point = (point + 1).max(1);
-                let start = buf.len();
+                let start = buf.len;
                 output_digits(&mut buf, &mut scaled, radix, point + n_digits, point);
                 // Leave room for a rounding carry, then drop the extra zero if unused.
-                if buf[start] == b'0' && buf.len() > start + 1 && buf[start + 1] != b'.' {
-                    buf.remove(start);
+                if buf.bytes[start] == b'0' && buf.len > start + 1 && buf.bytes[start + 1] != b'.' {
+                    buf.bytes.copy_within(start + 1..buf.len, start);
+                    buf.len -= 1;
                 }
-                return ascii(buf);
+                return buf.len;
             }
             DtoaFormat::Fixed => {
                 let mut limit = Limbs::new(1);
@@ -218,22 +236,38 @@ pub fn dtoa(d: f64, radix: u32, n_digits: usize, opts: DtoaOptions) -> String {
             b'@'
         });
         buf.push(if exp < 0 { b'-' } else { b'+' });
-        let mut digits = [0; 10];
-        let len = u32toa(&mut digits, exp.unsigned_abs());
-        buf.extend_from_slice(&digits[..len]);
+        buf.len += u32toa(&mut buf.bytes[buf.len..], exp.unsigned_abs());
     } else if point <= 0 {
-        buf.extend_from_slice(b"0.");
-        buf.resize(buf.len() + (-point) as usize, b'0');
+        buf.extend(b"0.");
+        buf.zeros((-point) as usize);
         output_digits(&mut buf, &mut scaled, radix, digits, digits);
     } else {
         output_digits(&mut buf, &mut scaled, radix, digits, digits.min(point));
-        buf.resize(buf.len() + (point - digits).max(0) as usize, b'0');
+        buf.zeros((point - digits).max(0) as usize);
     }
-    ascii(buf)
+    buf.len
 }
 
-fn ascii(buf: Vec<u8>) -> String {
-    String::from_utf8(buf).expect("number formatting writes only ASCII")
+struct Output<'a> {
+    bytes: &'a mut [u8],
+    len: usize,
+}
+
+impl Output<'_> {
+    fn push(&mut self, byte: u8) {
+        self.bytes[self.len] = byte;
+        self.len += 1;
+    }
+
+    fn extend(&mut self, bytes: &[u8]) {
+        self.bytes[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+    }
+
+    fn zeros(&mut self, count: usize) {
+        self.bytes[self.len..self.len + count].fill(b'0');
+        self.len += count;
+    }
 }
 
 fn round_scaled(
@@ -300,11 +334,11 @@ fn shortest(
     }
 }
 
-fn output_digits(buf: &mut Vec<u8>, value: &mut Limbs, radix: Radix, digits: i32, point: i32) {
-    let start = buf.len();
+fn output_digits(buf: &mut Output<'_>, value: &mut Limbs, radix: Radix, digits: i32, point: i32) {
+    let start = buf.len;
     let digits = digits as usize;
     let point = point as usize;
-    buf.resize(start + digits, b'0');
+    buf.zeros(digits);
 
     let group = DIGITS_PER_LIMB[radix.index] as usize;
     let shift = if radix.odd == 1 {
@@ -323,7 +357,7 @@ fn output_digits(buf: &mut Vec<u8>, value: &mut Limbs, radix: Radix, digits: i32
             value.div_rem(LIMB_BASES[radix.index] as u32)
         };
         write_limb(
-            &mut buf[start + head..start + tail],
+            &mut buf.bytes[start + head..start + tail],
             limb,
             radix.value,
             shift,
@@ -331,6 +365,9 @@ fn output_digits(buf: &mut Vec<u8>, value: &mut Limbs, radix: Radix, digits: i32
         tail = head;
     }
     if point != digits {
-        buf.insert(start + point, b'.');
+        let point = start + point;
+        buf.bytes.copy_within(point..buf.len, point + 1);
+        buf.bytes[point] = b'.';
+        buf.len += 1;
     }
 }

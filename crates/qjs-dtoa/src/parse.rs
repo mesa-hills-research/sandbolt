@@ -71,6 +71,13 @@ pub fn atod(input: &str, mut radix: u32, flags: AtodFlags) -> (f64, usize) {
         return (f64::from_bits(INFINITY | sign), p + 8);
     }
 
+    if matches!(radix, 0 | 10)
+        && !separators
+        && let Some((value, end)) = simple_decimal(input, p, flags.int_only)
+    {
+        return (f64::from_bits(value.to_bits() | sign), end);
+    }
+
     let radix = Radix::new(if radix == 0 { 10 } else { radix });
     let may_read_point =
         |p| !flags.int_only && byte(p) == b'.' && (p > start || digit(byte(p + 1)) < radix.value);
@@ -201,6 +208,56 @@ pub fn atod(input: &str, mut radix: u32, flags: AtodFlags) -> (f64, usize) {
         )
     };
     (f64::from_bits(bits | sign), p)
+}
+
+const POW10: [f64; 16] = {
+    let mut powers = [1.0; 16];
+    let mut i = 1;
+    while i < powers.len() {
+        powers[i] = powers[i - 1] * 10.0;
+        i += 1;
+    }
+    powers
+};
+
+// Both operands of the division are exact, so it rounds just once.
+fn simple_decimal(input: &[u8], mut pos: usize, int_only: bool) -> Option<(f64, usize)> {
+    let start = pos;
+    let mut mantissa = 0u64;
+    while let Some(&byte @ b'0'..=b'9') = input.get(pos) {
+        if pos - start == 15 {
+            return None;
+        }
+        mantissa = mantissa * 10 + u64::from(byte - b'0');
+        pos += 1;
+    }
+    let mut frac = 0;
+    if !int_only && input.get(pos) == Some(&b'.') {
+        pos += 1;
+        while let Some(&byte @ b'0'..=b'9') = input.get(pos) {
+            if pos - start > 15 {
+                return None;
+            }
+            mantissa = mantissa * 10 + u64::from(byte - b'0');
+            frac += 1;
+            pos += 1;
+        }
+        if pos - start == 1 {
+            return None;
+        }
+    }
+    if pos == start || (!int_only && matches!(input.get(pos), Some(b'e' | b'E'))) {
+        return None;
+    }
+    let value = mantissa as f64;
+    Some((
+        if frac == 0 {
+            value
+        } else {
+            value / POW10[frac]
+        },
+        pos,
+    ))
 }
 
 fn to_bits(

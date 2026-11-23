@@ -10,7 +10,7 @@ mod parse;
 #[cfg(test)]
 mod tests;
 
-pub use format::{dtoa, dtoa_max_len};
+pub use format::{dtoa, dtoa_into, dtoa_max_len};
 pub use integer::{i32toa, i64toa, i64toa_radix, u32toa, u64toa, u64toa_radix};
 pub use parse::atod;
 
