@@ -225,7 +225,7 @@ fn sort_is_stable_and_uses_snapshot_after_comparator_changes_length() {
 #[test]
 fn huge_fill_charges_dense_storage_before_writing() {
     let mut rt = setup(EngineLimits {
-        heap_bytes: 256 * 1024,
+        heap_bytes: 4 * 1024 * 1024,
         ..EngineLimits::default()
     });
     rt.with_scope(rt.default_realm(), |ctx| {
