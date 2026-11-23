@@ -130,6 +130,7 @@ impl Emitter<'_> {
     }
 
     fn hoist(&mut self, body: &[StmtId], top: bool) -> Result {
+        let mut initialized = std::collections::HashSet::new();
         for &id in body {
             let node = self.ast().stmt(id);
             let node = match node.kind {
@@ -177,7 +178,11 @@ impl Emitter<'_> {
                     }
                 } else {
                     let name = ScopedName { name, scope };
-                    self.ir(IrOp::ScopePutVarInit(name));
+                    if top || initialized.insert(name.name) {
+                        self.ir(IrOp::ScopePutVarInit(name));
+                    } else {
+                        self.ir(IrOp::ScopePutVar(name));
+                    }
                 }
             }
         }
@@ -799,7 +804,12 @@ impl Emitter<'_> {
             self.completion_reset();
             let scope = self.start_scope(Some(self.f().scope))?;
             if let Some(p) = catch.binding {
-                self.bind_pattern(p, VarKind::Catch, scope)?;
+                let kind = if matches!(self.ast().pattern(p).kind, Pattern::Identifier(_)) {
+                    VarKind::Catch
+                } else {
+                    VarKind::Let
+                };
+                self.bind_pattern(p, kind, scope)?;
                 self.bind_value(p, true)?;
             } else {
                 self.plain(Drop);

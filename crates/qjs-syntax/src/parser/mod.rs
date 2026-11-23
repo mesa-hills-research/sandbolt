@@ -21,7 +21,7 @@ struct Context {
 
 pub(crate) struct Parser<'a> {
     source: &'a SourceText,
-    opts: ParseOptions,
+    opts: ParseOptions<'a>,
     lexer: Lexer<'a>,
     current: Token,
     end: u32,
@@ -33,7 +33,7 @@ pub(crate) struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub(crate) fn new(source: &'a SourceText, opts: ParseOptions) -> Result<Self> {
+    pub(crate) fn new(source: &'a SourceText, opts: ParseOptions<'a>) -> Result<Self> {
         let module = opts.goal == ParseGoal::Module;
         let script = matches!(opts.goal, ParseGoal::Script | ParseGoal::DirectEval { .. });
         let remaining = opts
@@ -48,11 +48,7 @@ impl<'a> Parser<'a> {
                     "Source exceeds the parse byte limit",
                 )
             })?;
-        let mut lexer = Lexer::new(
-            source,
-            script && opts.annex_b,
-            matches!(opts.goal, ParseGoal::Script | ParseGoal::Module),
-        );
+        let mut lexer = Lexer::new(source, script && opts.annex_b, script || module);
         let current = lexer.next(LexicalGoal::Div)?;
         Ok(Self {
             source,

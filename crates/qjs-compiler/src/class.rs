@@ -89,12 +89,17 @@ impl Emitter<'_> {
                 None => PrivateMember::Field,
                 Some(MethodKind::Getter | MethodKind::Setter) => {
                     let setter = self.atom(&format!("<private-setter:{}>", id.name))?;
-                    self.private_symbol(setter, scope)?;
+                    self.private_symbol(setter, scope, VarKind::Const)?;
                     PrivateMember::Accessor { setter }
                 }
                 _ => PrivateMember::Method,
             };
-            self.private_symbol(key, scope)?;
+            let kind = match member {
+                PrivateMember::Field => VarKind::PrivateField,
+                PrivateMember::Method => VarKind::PrivateMethod,
+                PrivateMember::Accessor { .. } => VarKind::PrivateGetterSetter,
+            };
+            self.private_symbol(key, scope, kind)?;
             self.fm().private_members.insert((scope, key), member);
         }
         let instance = BuiltinAtom::ClassFieldsInit.id();
@@ -277,10 +282,26 @@ impl Emitter<'_> {
         Ok(())
     }
 
-    fn private_symbol(&mut self, name: UnitAtom, scope: u16) -> Result {
-        self.bind(name, VarKind::Const, scope)?;
+    fn private_symbol(&mut self, name: UnitAtom, scope: u16, kind: VarKind) -> Result {
+        self.bind(name, kind, scope)?;
         self.named(Opcode::PrivateSymbol, name);
         self.ir(IrOp::ScopePutVarInit(self.scoped(name)));
+        Ok(())
+    }
+
+    pub(crate) fn inherit_private_names(&mut self) -> Result {
+        for (name, kind) in self.options.enclosing_private_names.iter().rev() {
+            let key = self.atom(&format!("#{name}"))?;
+            let member = match kind {
+                PrivateNameKind::Field => PrivateMember::Field,
+                PrivateNameKind::Method => PrivateMember::Method,
+                PrivateNameKind::Accessor => PrivateMember::Accessor {
+                    setter: self.atom(&format!("<private-setter:{name}>"))?,
+                },
+            };
+            self.charge(std::mem::size_of::<(UnitAtom, PrivateMember)>())?;
+            self.fm().private_members.insert((0, key), member);
+        }
         Ok(())
     }
 

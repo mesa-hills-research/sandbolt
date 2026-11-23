@@ -79,7 +79,7 @@ impl Draft {
 pub(crate) struct Emitter<'a> {
     pub(crate) source: &'a SourceText,
     pub(crate) program: &'a ParsedProgram,
-    pub(crate) options: ParseOptions,
+    pub(crate) options: ParseOptions<'a>,
     pub(crate) atoms: Vec<ConstString>,
     atom_ids: HashMap<ConstString, UnitAtom>,
     pub(crate) functions: Vec<Draft>,
@@ -348,7 +348,13 @@ impl<'a> Emitter<'a> {
         f.bytecode.var_count = slot.checked_add(1).ok_or(CompileError::OutOfMemory)?;
         let is_const = matches!(
             kind,
-            VarKind::Const | VarKind::Using | VarKind::AwaitUsing | VarKind::FunctionName
+            VarKind::Const
+                | VarKind::Using
+                | VarKind::AwaitUsing
+                | VarKind::FunctionName
+                | VarKind::PrivateField
+                | VarKind::PrivateMethod
+                | VarKind::PrivateGetterSetter
         );
         f.bytecode.vars.push(VarDef {
             name,
@@ -445,6 +451,7 @@ impl<'a> Emitter<'a> {
             });
         }
         self.start_scope(None)?;
+        self.inherit_private_names()?;
         if !matches!(self.options.goal, ParseGoal::FunctionBody { .. }) {
             let opcode = if self.f().module.is_some() {
                 Opcode::Undefined

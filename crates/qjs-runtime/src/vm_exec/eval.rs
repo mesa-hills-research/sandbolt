@@ -1,8 +1,8 @@
-use qjs_bytecode::{BuiltinAtom, Opcode, ScopeLink, UnitAtom, VarDef};
-use qjs_syntax::{ParseGoal, ParseOptions, SourceText};
+use qjs_bytecode::{BuiltinAtom, Opcode, ScopeLink, UnitAtom, VarDef, VarKind};
+use qjs_syntax::{ParseGoal, ParseOptions, PrivateNameKind, SourceText};
 
 use crate::api::{EvalOptions, parse_options};
-use crate::atom::PropKey;
+use crate::atom::{AtomTable, KeyKind, PropKey};
 use crate::builtins::vm_internal::EVAL;
 use crate::ledger::TrackedVec;
 use crate::object::{ErrorKind, ObjectData};
@@ -78,22 +78,25 @@ pub(super) fn execute(
         ..Default::default()
     };
     let field_context = f.class_field_context;
-    let parse = ParseOptions {
-        goal: ParseGoal::DirectEval {
-            allow_new_target: f.flags.new_target_allowed || field_context,
-            allow_super_property: f.flags.super_allowed,
-            allow_super_call: f.flags.super_call_allowed,
-            in_class_field_init: field_context,
-        },
+    let goal = ParseGoal::DirectEval {
+        allow_new_target: f.flags.new_target_allowed || field_context,
+        allow_super_property: f.flags.super_allowed,
+        allow_super_call: f.flags.super_call_allowed,
+        in_class_field_init: field_context,
+    };
+    let environment = environment(ctx, caller, scope)?;
+    let mut parse = ParseOptions {
+        goal,
         ..parse_options(ctx.runtime, &options)
     };
+    let private_names = private_names(ctx, &environment, &mut parse.max_bytes)?;
+    parse.enclosing_private_names = &private_names;
     if (ctx.heap().string(string).len() as usize).saturating_mul(3) > parse.max_bytes {
         return Err(ctx.throw_oom());
     }
     let units = ctx.heap().string_units(string).collect();
     let source = SourceText::from_utf16(options.filename, units);
     let image = crate::api::compile_text(ctx, &source, parse)?;
-    let environment = environment(ctx, caller, scope)?;
     let this_key = ctx.intern_str("<this>")?;
     let this = find_cell(ctx, &environment, this_key)
         .unwrap_or(ctx.runtime.vm.stack[caller.base as usize + 1]);
@@ -177,28 +180,50 @@ fn environment(
         u16::MAX => ScopeLink::ParameterEnd,
         n => ScopeLink::Local(n - 1),
     };
+    let mut variable_scope = None;
+    let mut parameter_scope = None;
     while let ScopeLink::Local(index) = next {
         let index = index as usize;
         let Some(var) = compiled(ctx, code).vars.get(args + index).cloned() else {
             break;
         };
         next = var.scope_next;
+        if matches!(
+            var.name.builtin(),
+            Some(BuiltinAtom::InternalVar | BuiltinAtom::InternalArgVar)
+        ) {
+            variable_scope.get_or_insert(var.name);
+        }
+        if next == ScopeLink::ParameterEnd {
+            parameter_scope = Some(var.scope_level);
+        }
         add_local(ctx, &mut env, frame, code, var_base + index, &var)?;
     }
-    for index in (0..args).rev() {
-        if let Some(var) = compiled(ctx, code).vars.get(index).cloned() {
-            add_local(ctx, &mut env, frame, code, arg_base + index, &var)?;
-        }
-    }
-    if next == ScopeLink::End {
-        for index in 0..locals {
-            let Some(var) = compiled(ctx, code).vars.get(args + index).cloned() else {
-                continue;
-            };
-            if !var.lexical_tdz && !has_env_object(var.name) {
-                add_local(ctx, &mut env, frame, code, var_base + index, &var)?;
+    let in_parameters =
+        next == ScopeLink::ParameterEnd && variable_scope != Some(BuiltinAtom::InternalVar.id());
+    if !in_parameters {
+        for index in (0..args).rev() {
+            if let Some(var) = compiled(ctx, code).vars.get(index).cloned() {
+                add_local(ctx, &mut env, frame, code, arg_base + index, &var)?;
             }
         }
+    }
+    for index in 0..locals {
+        let Some(mut var) = compiled(ctx, code).vars.get(args + index).cloned() else {
+            continue;
+        };
+        if var.lexical_tdz || has_env_object(var.name) {
+            continue;
+        }
+        if in_parameters {
+            if var.scope_level > parameter_scope.unwrap_or(0) {
+                continue;
+            }
+            // Parameter eval may read the implicit arguments binding but cannot redeclare it.
+            var.lexical_tdz = var.name == BuiltinAtom::ArgumentsName.id()
+                && parameter_scope == Some(var.scope_level);
+        }
+        add_local(ctx, &mut env, frame, code, var_base + index, &var)?;
     }
     for index in 0..compiled(ctx, code).closures.len() {
         let def = compiled(ctx, code).closures[index].clone();
@@ -210,8 +235,7 @@ fn environment(
                 code,
                 def.name,
                 id,
-                def.lexical_tdz,
-                !def.is_const,
+                (def.var_kind, def.lexical_tdz, !def.is_const),
             )?;
         }
     }
@@ -248,7 +272,14 @@ fn add_local(
     let ValueKind::VarRef(id) = value.decode() else {
         unreachable!()
     };
-    append(ctx, env, code, var.name, id, var.lexical_tdz, !var.is_const)
+    append(
+        ctx,
+        env,
+        code,
+        var.name,
+        id,
+        (var.kind, var.lexical_tdz, !var.is_const),
+    )
 }
 
 fn append(
@@ -257,8 +288,7 @@ fn append(
     code: BcId,
     name: UnitAtom,
     id: VarRefId,
-    lexical: bool,
-    writable: bool,
+    (kind, lexical, writable): (VarKind, bool, bool),
 ) -> JsResult<()> {
     let binding = if has_env_object(name) {
         let with = name == BuiltinAtom::InternalWith.id();
@@ -273,6 +303,7 @@ fn append(
         EvalBinding::Cell {
             name: key(ctx, code, name),
             id,
+            kind,
             lexical,
             writable,
         }
@@ -281,22 +312,75 @@ fn append(
     Ok(())
 }
 
+fn private_names(
+    ctx: &mut ExecCtx<'_, '_>,
+    env: &EvalEnvironment,
+    budget: &mut usize,
+) -> JsResult<TrackedVec<(String, PrivateNameKind)>> {
+    let mut names = TrackedVec::new();
+    for binding in env.bindings.iter() {
+        let EvalBinding::Cell { name, kind, .. } = *binding else {
+            continue;
+        };
+        let kind = match kind {
+            VarKind::PrivateField => PrivateNameKind::Field,
+            VarKind::PrivateMethod => PrivateNameKind::Method,
+            VarKind::PrivateGetter | VarKind::PrivateSetter | VarKind::PrivateGetterSetter => {
+                PrivateNameKind::Accessor
+            }
+            _ => continue,
+        };
+        let KeyKind::String(atom) = name.decode() else {
+            continue;
+        };
+        let Some(string) = ctx.heap().atoms.dynamic_string(atom) else {
+            continue;
+        };
+        let bytes = (ctx.heap().string(string).len() as usize).saturating_mul(3);
+        *budget = budget
+            .checked_sub(bytes + std::mem::size_of::<(String, PrivateNameKind)>())
+            .ok_or_else(|| ctx.throw_oom())?;
+        let mut name = String::new();
+        name.try_reserve_exact(bytes).map_err(|_| ctx.throw_oom())?;
+        name.extend(
+            char::decode_utf16(ctx.heap().string_units(string).skip(1))
+                .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)),
+        );
+        ctx.allocate(|rt| names.try_reserve(&rt.heap.ledger, 1))?;
+        names.push_reserved((name, kind));
+    }
+    Ok(names)
+}
+
 pub(super) fn lookup(
     ctx: &mut ExecCtx<'_, '_>,
     code: BcId,
     name: PropKey,
 ) -> JsResult<Option<Value>> {
-    let len = compiled(ctx, code)
-        .eval
-        .as_ref()
-        .map_or(0, |env| env.bindings.len());
+    let Some(env) = compiled(ctx, code).eval.as_ref() else {
+        return Ok(None);
+    };
+    let len = env.bindings.len();
+    let internal = match name.decode() {
+        KeyKind::String(atom) => AtomTable::builtin(atom)
+            .map(|s| s.starts_with(['#', '<']))
+            .or_else(|| {
+                let string = ctx.heap().atoms.dynamic_string(atom)?;
+                Some(matches!(
+                    ctx.heap().string_units(string).next(),
+                    Some(35 | 60)
+                ))
+            })
+            .unwrap_or(false),
+        _ => false,
+    };
     for index in 0..len {
         let binding = compiled(ctx, code).eval.as_ref().unwrap().bindings[index];
         match binding {
             EvalBinding::Cell { name: key, id, .. } if key == name => {
                 return Ok(Some(Value::var_ref(id)));
             }
-            EvalBinding::Object { id, with } => {
+            EvalBinding::Object { id, with } if !internal => {
                 let found = ctx.with_scope(|ctx| {
                     let object = ctx.root(Value::object(id))?;
                     if !property::has_property(ctx, object, name)? {
@@ -328,15 +412,22 @@ pub(super) fn lookup(
     Ok(None)
 }
 
-pub(super) fn writable(ctx: &ExecCtx<'_, '_>, id: VarRefId) -> bool {
-    let Some(code) = ctx.runtime.vm.frames.last().and_then(|frame| frame.code) else {
-        return true;
-    };
-    compiled(ctx, code).eval.as_ref().is_none_or(|env| {
-        !env.bindings.iter().any(
-            |b| matches!(*b, EvalBinding::Cell { id: other, writable: false, .. } if other == id),
-        )
-    })
+pub(super) fn immutable_kind(ctx: &ExecCtx<'_, '_>, id: VarRefId) -> Option<VarKind> {
+    let code = ctx.runtime.vm.frames.last()?.code?;
+    compiled(ctx, code)
+        .eval
+        .as_ref()?
+        .bindings
+        .iter()
+        .find_map(|binding| match *binding {
+            EvalBinding::Cell {
+                id: other,
+                writable: false,
+                kind,
+                ..
+            } if other == id => Some(kind),
+            _ => None,
+        })
 }
 
 pub(super) fn declaration<'s>(
