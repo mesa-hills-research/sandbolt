@@ -4,5 +4,5 @@ payloads!(
     NumberObjectData { value: Value },
     BooleanObjectData { value: Value },
     BigIntObjectData { value: Value },
-    DateData {},
+    DateData { time: Value },
 );
