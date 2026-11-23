@@ -2,6 +2,7 @@ mod bindings;
 pub(crate) mod coroutines;
 mod iterators;
 mod load;
+pub(crate) mod modules;
 pub(crate) mod numeric;
 mod objects;
 
@@ -197,6 +198,14 @@ pub(crate) fn step(
 ) -> JsResult<Option<Value>> {
     use Opcode::*;
     let function = compiled(ctx, code);
+    if let Ok(i) = function
+        .hoisted
+        .binary_search_by_key(&frame.pc, |&(pc, _)| pc)
+    {
+        let next = function.hoisted[i].1;
+        ctx.runtime.vm.frames[index].pc = next;
+        return Ok(None);
+    }
     let strict = function.strict;
     let inst = Instruction::decode(&function.code, frame.pc as usize)
         .map_err(|_| ctx.throw_type_error("invalid bytecode offset"))?;
@@ -663,10 +672,10 @@ pub(crate) fn step(
             return coroutines::suspend(ctx, index, op).map(Some);
         }
         Import => {
-            return Err(ctx.throw_error(
-                ErrorKind::Internal,
-                &format!("opcode {} is not implemented", op.info().name),
-            ));
+            let resolution = ctx.with_scope(|ctx| {
+                modules::dynamic_import(ctx, code, Handle::at(tail - 2), Handle::at(tail - 1))
+            })?;
+            replace(ctx, 2, &[resolution]);
         }
     }
     Ok(None)
@@ -840,6 +849,9 @@ pub(crate) fn execute_image(
     image: &qjs_bytecode::ProgramImage,
     source: Option<&SourceText>,
 ) -> JsResult<Value> {
+    if !image.modules.is_empty() {
+        return modules::evaluate_image(ctx, image, source);
+    }
     let entry = load::load(ctx, image, source)?;
     let this = ctx.root(Value::object(ctx.realm().global_object))?;
     call::call(ctx, entry, this, Args::empty())

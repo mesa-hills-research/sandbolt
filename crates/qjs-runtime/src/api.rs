@@ -175,7 +175,12 @@ impl JsEngine {
             finish(ctx, value)
         });
         self.runtime.clear_kept_objects();
-        result.map_err(|e| failure(&mut self.runtime, e, EvalPhase::Runtime))
+        let phase = if self.runtime.vm.resolution_failed {
+            EvalPhase::Resolution
+        } else {
+            EvalPhase::Runtime
+        };
+        result.map_err(|e| failure(&mut self.runtime, e, phase))
     }
 
     pub fn execute_image(
@@ -198,6 +203,7 @@ impl JsEngine {
         self.runtime.vm.exception = None;
         self.runtime.vm.oom_thrown = false;
         self.runtime.vm.thrown_frames.clear();
+        self.runtime.vm.resolution_failed = false;
         if self.runtime.vm.print_callback.is_some() && !self.print_installed {
             let realm = self.default_realm();
             self.runtime
@@ -237,6 +243,10 @@ impl JsEngine {
         self.begin_eval()?;
         self.runtime
             .run_jobs()
+            .map_err(|e| failure(&mut self.runtime, e, EvalPhase::Runtime))?;
+        let realm = self.default_realm();
+        self.runtime
+            .with_scope(realm, exec::modules::check_host_modules)
             .map_err(|e| failure(&mut self.runtime, e, EvalPhase::Runtime))
     }
 

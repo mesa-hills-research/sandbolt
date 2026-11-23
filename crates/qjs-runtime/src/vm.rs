@@ -70,6 +70,8 @@ pub(crate) struct CompiledFunc {
     pub source: Option<StrId>,
     pub source_start: u32,
     pub regex_flags: TrackedVec<(u32, u16)>,
+    pub module: Option<ModId>,
+    pub hoisted: TrackedVec<(u32, u32)>,
 }
 
 impl CompiledFunc {
@@ -87,6 +89,7 @@ impl Trace for CompiledFunc {
         self.atoms.trace(tracer);
         self.name.trace(tracer);
         self.source.trace(tracer);
+        self.module.trace(tracer);
     }
 }
 impl ArenaItem for BytecodeFunc {
@@ -189,6 +192,88 @@ pub struct ModuleRecord {
     pub exports: TrackedVec<Value>,
     pub(crate) lexical: TrackedVec<(PropKey, (VarRefId, bool))>,
     pub(crate) global_scope: bool,
+    pub(crate) name: Option<PropKey>,
+    pub(crate) module_type: u8,
+    pub(crate) code: Option<BcId>,
+    pub(crate) requests: TrackedVec<ModuleRequest>,
+    pub(crate) imports: TrackedVec<ModuleImport>,
+    pub(crate) export_bindings: TrackedVec<ModuleExport>,
+    pub(crate) namespace_bindings: TrackedVec<(PropKey, VarRefId)>,
+    pub(crate) namespace_ref: Option<VarRefId>,
+    pub(crate) meta: Option<ObjId>,
+    pub(crate) status: ModuleStatus,
+    pub(crate) has_await: bool,
+    pub(crate) capability: Option<(Value, (Value, Value))>,
+    pub(crate) evaluation_error: Option<Value>,
+    pub(crate) pending_dependencies: usize,
+    pub(crate) waiting_host: bool,
+    pub(crate) eval_index: Option<usize>,
+    pub(crate) eval_ancestor: usize,
+    pub(crate) cycle_root: Option<ModId>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModuleStatus {
+    #[default]
+    Unlinked,
+    Linking,
+    Linked,
+    Visiting,
+    Waiting,
+    Async,
+    Evaluated,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ModuleRequest {
+    pub name: PropKey,
+    pub module_type: u8,
+}
+impl Trace for ModuleRequest {
+    fn trace(&self, tracer: &Tracer<'_>) {
+        self.name.trace(tracer);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ModuleImport {
+    pub name: Option<PropKey>,
+    pub dependency: usize,
+    pub slot: usize,
+}
+impl Trace for ModuleImport {
+    fn trace(&self, tracer: &Tracer<'_>) {
+        self.name.trace(tracer);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ModuleExport {
+    Local {
+        name: PropKey,
+        slot: usize,
+    },
+    Indirect {
+        name: PropKey,
+        dependency: usize,
+        import_name: Option<PropKey>,
+    },
+    Star(usize),
+}
+impl Trace for ModuleExport {
+    fn trace(&self, tracer: &Tracer<'_>) {
+        match *self {
+            Self::Local { name, .. } => name.trace(tracer),
+            Self::Indirect {
+                name, import_name, ..
+            } => {
+                name.trace(tracer);
+                import_name.trace(tracer);
+            }
+            Self::Star(_) => {}
+        }
+    }
 }
 impl ArenaItem for ModuleRecord {
     type Id = ModId;
@@ -199,6 +284,17 @@ impl Trace for ModuleRecord {
         self.namespace.trace(tracer);
         self.dependencies.trace(tracer);
         self.exports.trace(tracer);
+        self.name.trace(tracer);
+        self.code.trace(tracer);
+        self.requests.trace(tracer);
+        self.imports.trace(tracer);
+        self.export_bindings.trace(tracer);
+        self.namespace_bindings.trace(tracer);
+        self.namespace_ref.trace(tracer);
+        self.meta.trace(tracer);
+        self.capability.trace(tracer);
+        self.evaluation_error.trace(tracer);
+        self.cycle_root.trace(tracer);
         for (key, (reference, _)) in self.lexical.iter() {
             key.trace(tracer);
             reference.trace(tracer);
@@ -257,6 +353,7 @@ pub struct VmState {
     pub(crate) host_callback: Option<crate::api::HostCallback>,
     pub(crate) print_callback: Option<crate::api::PrintCallback>,
     pub(crate) module_loader: Option<Box<dyn crate::api::ModuleLoader>>,
+    pub(crate) resolution_failed: bool,
 }
 
 impl VmState {
@@ -274,6 +371,7 @@ impl VmState {
             host_callback: None,
             print_callback: None,
             module_loader: None,
+            resolution_failed: false,
         }
     }
 

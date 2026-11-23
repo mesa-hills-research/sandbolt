@@ -532,7 +532,7 @@ pub(super) fn special_object(
             let object = ctx.new_object_with_proto(None)?;
             ctx.get(object)
         }
-        6 => return Err(ctx.throw_error(ErrorKind::Internal, "import.meta outside module")),
+        6 => return super::modules::import_meta(ctx, code),
         7 => {
             let object = ctx.new_object_with_proto(None)?;
             ctx.get(object)

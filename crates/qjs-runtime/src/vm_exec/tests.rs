@@ -297,6 +297,80 @@ fn promise_jobs_resume_async_functions_and_generators() {
 }
 
 #[test]
+fn module_graph_links_live_bindings_and_waits_for_cycle_roots() {
+    use crate::api::{ModuleLoader, ResolvedModule};
+    struct Loader;
+    impl ModuleLoader for Loader {
+        fn resolve(
+            &mut self,
+            _referrer: &str,
+            specifier: &str,
+            module_type: Option<&str>,
+        ) -> Result<ResolvedModule, String> {
+            let source = match (specifier, module_type) {
+                ("a", None) => {
+                    "import 'b'; export function f() { return 7 } globalThis.events.push('a'); await 1; globalThis.events.push('a end')"
+                }
+                ("b", None) => {
+                    "import {f} from 'a'; globalThis.events.push(f()); await 1; globalThis.events.push('b')"
+                }
+                ("c", None) => "import 'b'; globalThis.events.push('c')",
+                ("data", Some("json")) => {
+                    return Ok(ResolvedModule::Json {
+                        name: "data".into(),
+                        source: "{\"n\":42}".into(),
+                    });
+                }
+                ("text", Some("text")) => {
+                    return Ok(ResolvedModule::Text {
+                        name: "text".into(),
+                        text: "text".into(),
+                    });
+                }
+                ("bytes", Some("bytes")) => {
+                    return Ok(ResolvedModule::Bytes {
+                        name: "bytes".into(),
+                        bytes: vec![255],
+                    });
+                }
+                _ => return Err(format!("unknown module {specifier}")),
+            };
+            Ok(ResolvedModule::Source {
+                name: specifier.into(),
+                source: source.into(),
+            })
+        }
+    }
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let script = EvalOptions::default();
+    engine.eval("var events = []", script.clone()).unwrap();
+    engine.set_module_loader(Box::new(Loader));
+    let module = EvalOptions {
+        filename: "main.js".into(),
+        module: true,
+        ..Default::default()
+    };
+    engine
+        .eval(
+            r#"
+        import 'a'; import 'c';
+        import data from 'data' with { type: 'json' };
+        import text from 'text' with { type: 'text' };
+        import bytes from 'bytes' with { type: 'bytes' };
+        events.push(data.n, text, bytes[0]);
+        (await import('a')).f && events.push(import.meta.url);
+    "#,
+            module,
+        )
+        .unwrap();
+    engine.run_jobs().unwrap();
+    assert_eq!(
+        engine.eval_to_string("events.join(',')", script).unwrap(),
+        "7,b,a,a end,c,42,text,255,main.js"
+    );
+}
+
+#[test]
 fn host_bridge_and_print_are_opt_in() {
     let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
     let opts = EvalOptions::default();

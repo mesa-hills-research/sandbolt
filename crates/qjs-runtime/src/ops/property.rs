@@ -186,11 +186,43 @@ fn typed_has(heap: &Heap, id: ObjId, index: Option<usize>) -> bool {
     })
 }
 
+fn module_namespace(heap: &Heap, id: ObjId) -> Option<&crate::vm::ModuleRecord> {
+    let ObjectData::ModuleNamespace(data) = &heap.object(id).data else {
+        return None;
+    };
+    data.module.and_then(|id| heap.modules.get(id))
+}
+
+fn namespace_binding(heap: &Heap, id: ObjId, key: PropKey) -> Option<VarRefId> {
+    module_namespace(heap, id)?
+        .namespace_bindings
+        .iter()
+        .find_map(|&(name, cell)| (name == key).then_some(cell))
+}
+
+fn namespace_value(ctx: &mut ExecCtx<'_, '_>, cell: VarRefId) -> JsResult<Value> {
+    let value = crate::vm::exec::read_ref(ctx, cell);
+    if value == Value::UNINITIALIZED {
+        return Err(ctx.throw_error(
+            crate::object::ErrorKind::Reference,
+            "module binding is not initialized",
+        ));
+    }
+    Ok(value)
+}
+
 fn own_descriptor(
     ctx: &mut ExecCtx<'_, '_>,
     id: ObjId,
     key: PropKey,
 ) -> JsResult<Option<PropertyDescriptor>> {
+    if let Some(cell) = namespace_binding(ctx.heap(), id, key) {
+        let value = namespace_value(ctx, cell)?;
+        return Ok(Some(PropertyDescriptor {
+            configurable: Some(false),
+            ..PropertyDescriptor::data(value)
+        }));
+    }
     if let Some(index) = typed_index(ctx.heap(), id, key) {
         if !typed_has(ctx.heap(), id, index) {
             return Ok(None);
@@ -389,6 +421,9 @@ fn get_from<'s>(
             id = target;
             continue;
         }
+        if let Some(cell) = namespace_binding(ctx.heap(), id, key) {
+            return namespace_value(ctx, cell);
+        }
         if let Some(index) = typed_index(ctx.heap(), id, key) {
             return if let Some(index) = index {
                 crate::builtins::typed_atomics::typed_array_get_index(ctx, id, index)
@@ -452,7 +487,10 @@ pub fn has_property<'s>(
         if let Some(index) = typed_index(ctx.heap(), id, key) {
             return Ok(typed_has(ctx.heap(), id, index));
         }
-        if own(ctx.heap(), id, key).is_some() || string_property(ctx.heap(), id, key).is_some() {
+        if own(ctx.heap(), id, key).is_some()
+            || namespace_binding(ctx.heap(), id, key).is_some()
+            || string_property(ctx.heap(), id, key).is_some()
+        {
             return Ok(true);
         }
         let Some(proto) = ctx.heap().shape(ctx.heap().object(id).shape).proto else {
@@ -518,6 +556,9 @@ fn set_from<'s>(
             }
             id = target;
             continue;
+        }
+        if module_namespace(ctx.heap(), id).is_some() {
+            return Ok(false);
         }
         if let Some(index) = typed_index(ctx.heap(), id, key) {
             let same_receiver = ctx.get(receiver) == Value::object(id);
@@ -941,6 +982,16 @@ fn define_raw(
     if is_proxy(ctx, id) && !is_private(ctx.heap(), key) {
         return proxy_define(ctx, id, key, desc);
     }
+    if let Some(cell) = namespace_binding(ctx.heap(), id, key) {
+        let value = namespace_value(ctx, cell)?;
+        return Ok(!desc.is_accessor()
+            && desc.configurable != Some(true)
+            && desc.enumerable != Some(false)
+            && desc.writable != Some(false)
+            && desc
+                .value
+                .is_none_or(|other| super::compare::same_value_raw(ctx.heap(), value, other)));
+    }
     if let Some(index) = typed_index(ctx.heap(), id, key) {
         if !typed_has(ctx.heap(), id, index)
             || desc.is_accessor()
@@ -1326,6 +1377,9 @@ pub fn delete_property<'s>(
             Ok(true)
         });
     }
+    if namespace_binding(ctx.heap(), id, key).is_some() {
+        return Ok(false);
+    }
     if let Some(index) = typed_index(ctx.heap(), id, key) {
         return Ok(!typed_has(ctx.heap(), id, index));
     }
@@ -1390,6 +1444,15 @@ pub fn own_property_keys<'s>(
         let object = heap.object(id);
         let shape = heap.shape(object.shape);
         let mut keys = TrackedVec::new();
+        if let Some(module) = module_namespace(heap, id) {
+            for &(key, _) in module.namespace_bindings.iter() {
+                keys.push(&heap.ledger, key)?;
+            }
+            for prop in shape.props.iter() {
+                keys.push(&heap.ledger, prop.key)?;
+            }
+            return Ok(keys);
+        }
         let entries = || {
             shape
                 .props

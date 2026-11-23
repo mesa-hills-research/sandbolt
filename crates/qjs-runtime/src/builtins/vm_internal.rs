@@ -34,6 +34,12 @@ pub(crate) const AWAIT_REJECTED: NativeFnId = NativeFnId(BASE + 22);
 pub(crate) const ASYNC_UNWRAP: NativeFnId = NativeFnId(BASE + 23);
 pub(crate) const ASYNC_CLOSE_REJECT: NativeFnId = NativeFnId(BASE + 24);
 pub(crate) const SYNC_DISPOSER: NativeFnId = NativeFnId(BASE + 25);
+pub(crate) const DYNAMIC_IMPORT_JOB: NativeFnId = NativeFnId(BASE + 26);
+pub(crate) const MODULE_DONE: NativeFnId = NativeFnId(BASE + 27);
+pub(crate) const MODULE_READY: NativeFnId = NativeFnId(BASE + 28);
+pub(crate) const MODULE_FAILED: NativeFnId = NativeFnId(BASE + 29);
+pub(crate) const MODULE_IMPORT_DONE: NativeFnId = NativeFnId(BASE + 30);
+pub(crate) const MODULE_IMPORT_FAILED: NativeFnId = NativeFnId(BASE + 31);
 
 pub fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
     let global = ctx.root(Value::object(ctx.realm().global_object))?;
@@ -146,6 +152,11 @@ pub fn dispatch<'s>(
                 Err(error) => Err(error),
             }
         }
+        DYNAMIC_IMPORT_JOB => exec::modules::dynamic_job(ctx, args),
+        MODULE_DONE | MODULE_READY | MODULE_FAILED => {
+            exec::modules::module_job(ctx, id, this, args)
+        }
+        MODULE_IMPORT_DONE | MODULE_IMPORT_FAILED => exec::modules::finish_import(ctx, this, args),
         FOR_IN_NEXT => {
             let [value, done] = exec::for_in_next(ctx, this)?;
             let value = ctx.root(value)?;

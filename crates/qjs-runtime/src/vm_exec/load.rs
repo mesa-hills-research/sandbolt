@@ -15,118 +15,128 @@ pub(super) fn load<'s>(
     image: &ProgramImage,
     source: Option<&SourceText>,
 ) -> JsResult<Handle<'s>> {
-    qjs_bytecode::verify_image(image)
-        .map_err(|error| ctx.throw_error(ErrorKind::Syntax, &error.to_string()))?;
     let entry = ctx.with_scope(|ctx| {
-        let mut atoms = TrackedVec::new();
-        ctx.allocate(|rt| atoms.try_reserve_exact(&rt.heap.ledger, image.atoms.len()))?;
-        for text in &image.atoms {
-            let string = constant_string(ctx, text)?;
-            atoms.push_reserved(ctx.intern(string)?);
-        }
-        let mut functions = TrackedVec::new();
-        ctx.allocate(|rt| functions.try_reserve_exact(&rt.heap.ledger, image.functions.len()))?;
-        for function in &image.functions {
-            let atom = function.name;
-            let name = if atom.is_none() {
-                None
-            } else if let Some(index) = atom.dynamic_index() {
-                Some(atoms[index as usize])
-            } else {
-                Some(PropKey::atom(Atom(atom.raw())))
-            };
-            let debug = &function.debug;
-            let source_id = match source {
-                Some(source)
-                    if debug.source_start <= debug.source_end
-                        && debug.source_end as usize <= source.as_bytes().len() =>
-                {
-                    let text = ctx.new_utf16(
-                        &source.slice_utf16(Span::new(debug.source_start, debug.source_end)),
-                    )?;
-                    let ValueKind::String(id) = ctx.get(text).decode() else {
-                        unreachable!()
-                    };
-                    Some(id)
-                }
-                _ => None,
-            };
-            let filename = if debug.filename.is_empty() {
-                source.map_or("<bytecode>", |source| source.filename.as_str())
-            } else {
-                &debug.filename
-            };
-            let id = ctx.allocate(|rt| {
-                let heap = &mut rt.heap;
-                let ledger = &heap.ledger;
-                let mut constants = TrackedVec::new();
-                constants.try_reserve_exact(ledger, function.constants.len())?;
-                let mut regex_flags = TrackedVec::new();
-                regex_flags.try_reserve_exact(
-                    ledger,
-                    function
-                        .constants
-                        .iter()
-                        .filter(|c| matches!(c, ConstEntry::RegExp { .. }))
-                        .count(),
-                )?;
-                for (index, constant) in function.constants.iter().enumerate() {
-                    if let ConstEntry::RegExp { flags, .. } = constant {
-                        regex_flags.push_reserved((index as u32, *flags));
-                    }
-                }
-                heap.bytecode.insert(
-                    ledger,
-                    BytecodeFunc {
-                        code: TrackedVec::new(),
-                        constants,
-                        compiled: Some(CompiledFunc {
-                            code: TrackedVec::from_slice(ledger, &function.code)?,
-                            atoms: TrackedVec::from_slice(ledger, &atoms)?,
-                            name,
-                            flags: function.flags,
-                            kind: function.kind.unwrap_or_default(),
-                            strict: function.strict,
-                            arg_count: function.arg_count,
-                            var_count: function.var_count,
-                            defined_arg_count: function.defined_arg_count,
-                            stack_size: function.stack_size,
-                            vars: clone_items(ledger, &function.vars)?,
-                            closures: clone_items(ledger, &function.closure_vars)?,
-                            handlers: TrackedVec::from_slice(ledger, &function.exception_handlers)?,
-                            filename: TrackedVec::from_slice(ledger, filename.as_bytes())?,
-                            line_starts: TrackedVec::from_slice(
-                                ledger,
-                                source.map_or(&[0][..], |source| &source.line_starts),
-                            )?,
-                            pc_map: TrackedVec::from_slice(ledger, &debug.pc_map)?,
-                            regex_flags,
-                            source: source_id,
-                            source_start: debug.source_start,
-                        }),
-                    },
-                )
-            })?;
-            ctx.root(Value::bytecode(id))?;
-            functions.push_reserved(id);
-        }
-        for (index, function) in image.functions.iter().enumerate() {
-            let id = functions[index];
-            for constant in &function.constants {
-                let value = ctx.with_scope(|ctx| materialize(ctx, constant, &functions))?;
-                ctx.runtime
-                    .heap
-                    .bytecode
-                    .get_mut(id)
-                    .unwrap()
-                    .constants
-                    .push_reserved(value);
-            }
-        }
-        let id = functions[image.entry_function as usize];
-        make_function(ctx, id, &[]).map(|handle| ctx.get(handle))
+        let functions = load_functions(ctx, image, source)?;
+        make_function(ctx, functions[image.entry_function as usize], &[]).map(|h| ctx.get(h))
     })?;
     ctx.root(entry)
+}
+
+pub(super) fn load_functions(
+    ctx: &mut ExecCtx<'_, '_>,
+    image: &ProgramImage,
+    source: Option<&SourceText>,
+) -> JsResult<TrackedVec<BcId>> {
+    qjs_bytecode::verify_image(image)
+        .map_err(|error| ctx.throw_error(ErrorKind::Syntax, &error.to_string()))?;
+    let mut atoms = TrackedVec::new();
+    ctx.allocate(|rt| atoms.try_reserve_exact(&rt.heap.ledger, image.atoms.len()))?;
+    for text in &image.atoms {
+        let string = constant_string(ctx, text)?;
+        atoms.push_reserved(ctx.intern(string)?);
+    }
+    let mut functions = TrackedVec::new();
+    ctx.allocate(|rt| functions.try_reserve_exact(&rt.heap.ledger, image.functions.len()))?;
+    for function in &image.functions {
+        let atom = function.name;
+        let name = if atom.is_none() {
+            None
+        } else if let Some(index) = atom.dynamic_index() {
+            Some(atoms[index as usize])
+        } else {
+            Some(PropKey::atom(Atom(atom.raw())))
+        };
+        let debug = &function.debug;
+        let source_id = match source {
+            Some(source)
+                if debug.source_start <= debug.source_end
+                    && debug.source_end as usize <= source.as_bytes().len() =>
+            {
+                let text = ctx.new_utf16(
+                    &source.slice_utf16(Span::new(debug.source_start, debug.source_end)),
+                )?;
+                let ValueKind::String(id) = ctx.get(text).decode() else {
+                    unreachable!()
+                };
+                Some(id)
+            }
+            _ => None,
+        };
+        let filename = if debug.filename.is_empty() {
+            source.map_or("<bytecode>", |source| source.filename.as_str())
+        } else {
+            &debug.filename
+        };
+        let id = ctx.allocate(|rt| {
+            let heap = &mut rt.heap;
+            let ledger = &heap.ledger;
+            let mut constants = TrackedVec::new();
+            constants.try_reserve_exact(ledger, function.constants.len())?;
+            let mut regex_flags = TrackedVec::new();
+            regex_flags.try_reserve_exact(
+                ledger,
+                function
+                    .constants
+                    .iter()
+                    .filter(|c| matches!(c, ConstEntry::RegExp { .. }))
+                    .count(),
+            )?;
+            for (index, constant) in function.constants.iter().enumerate() {
+                if let ConstEntry::RegExp { flags, .. } = constant {
+                    regex_flags.push_reserved((index as u32, *flags));
+                }
+            }
+            heap.bytecode.insert(
+                ledger,
+                BytecodeFunc {
+                    code: TrackedVec::new(),
+                    constants,
+                    compiled: Some(CompiledFunc {
+                        code: TrackedVec::from_slice(ledger, &function.code)?,
+                        atoms: TrackedVec::from_slice(ledger, &atoms)?,
+                        name,
+                        flags: function.flags,
+                        kind: function.kind.unwrap_or_default(),
+                        strict: function.strict,
+                        arg_count: function.arg_count,
+                        var_count: function.var_count,
+                        defined_arg_count: function.defined_arg_count,
+                        stack_size: function.stack_size,
+                        vars: clone_items(ledger, &function.vars)?,
+                        closures: clone_items(ledger, &function.closure_vars)?,
+                        handlers: TrackedVec::from_slice(ledger, &function.exception_handlers)?,
+                        filename: TrackedVec::from_slice(ledger, filename.as_bytes())?,
+                        line_starts: TrackedVec::from_slice(
+                            ledger,
+                            source.map_or(&[0][..], |source| &source.line_starts),
+                        )?,
+                        pc_map: TrackedVec::from_slice(ledger, &debug.pc_map)?,
+                        regex_flags,
+                        module: None,
+                        hoisted: TrackedVec::new(),
+                        source: source_id,
+                        source_start: debug.source_start,
+                    }),
+                },
+            )
+        })?;
+        ctx.root(Value::bytecode(id))?;
+        functions.push_reserved(id);
+    }
+    for (index, function) in image.functions.iter().enumerate() {
+        let id = functions[index];
+        for constant in &function.constants {
+            let value = ctx.with_scope(|ctx| materialize(ctx, constant, &functions))?;
+            ctx.runtime
+                .heap
+                .bytecode
+                .get_mut(id)
+                .unwrap()
+                .constants
+                .push_reserved(value);
+        }
+    }
+    Ok(functions)
 }
 
 fn clone_items<T: Clone>(
