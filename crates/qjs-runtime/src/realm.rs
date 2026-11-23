@@ -43,12 +43,15 @@ impl EmergencyError {
 
     pub(crate) fn prepare(self, heap: &mut Heap) -> Value {
         let object = heap.objects.get_mut(self.object).unwrap();
-        let ObjectData::Error(error) = &object.data else {
+        let ObjectData::Error(error) = &mut object.data else {
             unreachable!()
         };
+        let message = error.message;
+        error.stack = Value::UNDEFINED;
+        error.frames = TrackedVec::new();
         // Each realm retains one emergency object with its original shape and message.
         object.props.clear();
-        object.props.push_reserved(error.message);
+        object.props.push_reserved(message);
         object.shape = self.shape;
         object.flags = ObjectFlags::EXTENSIBLE;
         Value::object(self.object)
@@ -404,6 +407,7 @@ pub(crate) fn bootstrap_error(
             kind,
             message,
             stack: Value::UNDEFINED,
+            frames: TrackedVec::new(),
         },
     )?;
     let object = heap.insert_object(

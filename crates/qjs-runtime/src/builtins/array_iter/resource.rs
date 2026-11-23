@@ -311,6 +311,7 @@ fn record_error(
                     kind: ErrorKind::Suppressed,
                     message: Value::UNDEFINED,
                     stack: Value::UNDEFINED,
+                    frames: crate::ledger::TrackedVec::new(),
                 },
             )?))
         },

@@ -410,7 +410,7 @@ impl VmState {
             exception: None,
             oom_thrown: false,
             interrupt_handler: None,
-            can_block: true,
+            can_block: false,
             limits,
             thrown_frames: Vec::new(),
             host_callback: None,

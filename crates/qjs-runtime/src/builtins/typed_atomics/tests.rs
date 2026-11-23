@@ -629,6 +629,7 @@ fn shared_growth_and_waiters_are_visible_across_runtimes() {
             let done_tx = done_tx.clone();
             children.push(std::thread::spawn(move || {
                 let mut worker = runtime();
+                worker.set_can_block(true);
                 worker.with_scope(worker.default_realm(), |ctx| {
                     let shared = create_shared_array_buffer_from_arc(ctx, backing).unwrap();
                     let typed = construct(ctx, "Int32Array", &[shared]);

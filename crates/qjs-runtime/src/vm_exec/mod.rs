@@ -27,6 +27,29 @@ pub(crate) use iterators::{async_from_sync_call, close_original, for_in_next, it
 pub(crate) use coroutines::resume_generator;
 pub(crate) use objects::brand_key;
 
+fn format_stack(ctx: &ExecCtx<'_, '_>, skip: usize) -> String {
+    use std::fmt::Write;
+    let mut text = String::new();
+    for frame in stack_frames(ctx, true, skip) {
+        let name = if frame.function.is_empty() || frame.function == "<eval>" {
+            "<anonymous>"
+        } else {
+            &frame.function
+        };
+        if frame.line == 0 {
+            writeln!(text, "    at {name} (native)").unwrap();
+        } else {
+            writeln!(
+                text,
+                "    at {name} ({}:{}:{})",
+                frame.file, frame.line, frame.column
+            )
+            .unwrap();
+        }
+    }
+    text
+}
+
 impl<'s> ExecCtx<'_, 's> {
     pub fn function_source(&mut self, function: Handle<'s>) -> JsResult<Option<Handle<'s>>> {
         let id = self.object_id(function)?;
@@ -45,25 +68,7 @@ impl<'s> ExecCtx<'_, 's> {
     }
 
     pub fn capture_stack(&mut self, skip: usize) -> JsResult<Handle<'s>> {
-        use std::fmt::Write;
-        let mut text = String::new();
-        for frame in stack_frames(self, true, skip) {
-            let name = if frame.function.is_empty() || frame.function == "<eval>" {
-                "<anonymous>"
-            } else {
-                &frame.function
-            };
-            if frame.line == 0 {
-                writeln!(text, "    at {name} (native)").unwrap();
-            } else {
-                writeln!(
-                    text,
-                    "    at {name} ({}:{}:{})",
-                    frame.file, frame.line, frame.column
-                )
-                .unwrap();
-            }
-        }
+        let text = format_stack(self, skip);
         self.new_string(&text)
     }
 
@@ -72,82 +77,83 @@ impl<'s> ExecCtx<'_, 's> {
     }
 }
 
+fn collect_error_frames(ctx: &ExecCtx<'_, '_>, skip: usize) -> Vec<crate::object::ErrorFrame> {
+    let heap = ctx.heap();
+    let mut frames = Vec::new();
+    for frame in ctx.runtime.vm.frames.iter().rev().skip(skip) {
+        let Some(code) = frame.code else {
+            continue;
+        };
+        let Some(f) = &heap.bytecode.get(code).unwrap().compiled else {
+            continue;
+        };
+        frames.push(crate::object::ErrorFrame {
+            code,
+            pc: frame.last_pc,
+        });
+        if f.flags.backtrace_barrier {
+            break;
+        }
+    }
+    frames
+}
+
+/// Captures frames and formatted stack onto an already-rooted `Error` object
+/// without consuming VM stack slots, so stack-overflow errors keep their frames.
+fn save_error_data(ctx: &mut ExecCtx<'_, '_>, id: ObjId, skip: usize) -> JsResult<()> {
+    let needs_stack = matches!(
+        &ctx.heap().object(id).data,
+        ObjectData::Error(data) if data.stack == Value::UNDEFINED
+    );
+    if !needs_stack {
+        return Ok(());
+    }
+    let raw_frames = collect_error_frames(ctx, skip);
+    let text = format_stack(ctx, skip);
+    ctx.allocate(|rt| {
+        let heap = &mut rt.heap;
+        let frames = crate::ledger::TrackedVec::from_slice(&heap.ledger, &raw_frames)?;
+        let stack_str = crate::string::JsString::from_str(&heap.ledger, &text)?;
+        let stack_id = heap.strings.insert(&heap.ledger, stack_str)?;
+        let ObjectData::Error(data) = &mut heap.objects.get_mut(id).unwrap().data else {
+            unreachable!()
+        };
+        data.frames = frames;
+        data.stack = Value::string(stack_id);
+        Ok(())
+    })
+}
+
 fn save_error_stack<'s>(ctx: &mut ExecCtx<'_, 's>, error: Handle<'s>, skip: usize) -> JsResult<()> {
     let id = ctx.object_id(error)?;
     match &ctx.heap().object(id).data {
-        ObjectData::Error(data) if data.stack == Value::UNDEFINED => {
-            let stack = ctx.capture_stack(skip)?;
-            let frames = store_frames(ctx)?;
-            property::private_define(ctx, id, brand_key(), frames)?;
-            let stack = ctx.get(stack);
-            let ObjectData::Error(data) = &mut ctx.runtime.heap.objects.get_mut(id).unwrap().data
-            else {
-                unreachable!()
-            };
-            data.stack = stack;
-        }
+        ObjectData::Error(_) => save_error_data(ctx, id, skip),
         ObjectData::DomException(_) => {
             let current = property::get_own_property_descriptor(ctx, error, Atom::get("stack"))?;
             if current.is_some_and(|d| matches!(d.value.map(Value::decode), Some(ValueKind::String(s)) if ctx.heap().string(s).is_empty())) {
                 let stack = ctx.capture_stack(skip)?;
                 property::define_own_property(ctx, error, Atom::get("stack"), property::PropertyDescriptor { value: Some(stack), ..Default::default() })?;
             }
+            Ok(())
         }
-        _ => {}
+        _ => Ok(()),
     }
-    Ok(())
-}
-
-fn store_frames(ctx: &mut ExecCtx<'_, '_>) -> JsResult<Value> {
-    let frames = capture_frames(ctx);
-    let list = ctx.new_array()?;
-    let list_value = ctx.get(list);
-    for (i, frame) in frames.into_iter().enumerate() {
-        ctx.with_scope(|ctx| {
-            let list = ctx.root(list_value)?;
-            let entry = ctx.new_array()?;
-            let file = ctx.new_string(&frame.file)?;
-            let function = ctx.new_string(&frame.function)?;
-            let line = ctx.root(Value::number(f64::from(frame.line)))?;
-            let column = ctx.root(Value::number(f64::from(frame.column)))?;
-            for (i, value) in [file, function, line, column].into_iter().enumerate() {
-                define_default(ctx, entry, PropKey::index(i as u32).unwrap(), value)?;
-            }
-            let key = load::index_key(ctx, i as u64)?;
-            define_default(ctx, list, key, entry)
-        })?;
-    }
-    Ok(list_value)
 }
 
 pub(crate) fn saved_frames(ctx: &ExecCtx<'_, '_>, error: Value) -> Option<Vec<crate::Frame>> {
     let id = error.as_object()?;
-    if !matches!(ctx.heap().object(id).data, ObjectData::Error(_)) {
-        return None;
-    }
-    let list = property::private_own(ctx, id, brand_key())?.as_object()?;
-    let ObjectData::Array(list) = &ctx.heap().object(list).data else {
+    let ObjectData::Error(data) = &ctx.heap().object(id).data else {
         return None;
     };
-    let mut frames = Vec::with_capacity(list.elements.len());
-    for value in list.elements.iter() {
-        let ObjectData::Array(entry) = &ctx.heap().object(value.as_object()?).data else {
-            return None;
-        };
-        let [file, function, line, column] = &entry.elements[..] else {
-            return None;
-        };
-        let (ValueKind::String(file), ValueKind::String(function)) =
-            (file.decode(), function.decode())
-        else {
-            return None;
-        };
-        frames.push(crate::Frame {
-            file: utf16_lossy(ctx.heap(), file),
-            function: utf16_lossy(ctx.heap(), function),
-            line: line.as_number()? as u32,
-            column: column.as_number()? as u32,
-        });
+    if data.frames.is_empty() {
+        return None;
+    }
+    let heap = ctx.heap();
+    let mut frames = Vec::with_capacity(data.frames.len());
+    for frame in data.frames.iter() {
+        if let Some(resolved) = resolve_frame(heap, frame.code, frame.pc) {
+            frames.push(resolved);
+        }
     }
     Some(frames)
 }
@@ -174,27 +180,64 @@ pub(crate) fn capture_throw(ctx: &mut ExecCtx<'_, '_>) {
     let Some(value) = ctx.pending_exception() else {
         return;
     };
-    if ctx.is_oom()
-        || !value.as_object().is_some_and(|id| {
-            matches!(
-                ctx.heap().object(id).data,
-                ObjectData::Error(_) | ObjectData::DomException(_)
-            )
-        })
-    {
+    if ctx.is_oom() {
         return;
     }
-    let _ = ctx.with_scope(|ctx| {
-        let root = ctx.root(value)?;
-        let _ = save_error_stack(ctx, root, 0);
-        ctx.throw_value(value, false);
-        Ok::<_, Abrupt>(())
-    });
-    ctx.throw_value(value, false);
+    let Some(id) = value.as_object() else {
+        return;
+    };
+    match &ctx.heap().object(id).data {
+        ObjectData::Error(_) => {
+            // `value` is rooted in `vm.exception`; capture directly without
+            // pushing onto `vm.stack` so stack-overflow errors keep their origin.
+            let _ = save_error_data(ctx, id, 0);
+            ctx.throw_value(value, false);
+        }
+        ObjectData::DomException(_) => {
+            let _ = ctx.with_scope(|ctx| {
+                let root = ctx.root(value)?;
+                let _ = save_error_stack(ctx, root, 0);
+                ctx.throw_value(value, false);
+                Ok::<_, Abrupt>(())
+            });
+            ctx.throw_value(value, false);
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn capture_frames(ctx: &ExecCtx<'_, '_>) -> Vec<crate::Frame> {
     stack_frames(ctx, false, 0)
+}
+
+fn resolve_frame(heap: &crate::heap::Heap, code: BcId, pc: u32) -> Option<crate::Frame> {
+    let f = heap.bytecode.get(code)?.compiled.as_ref()?;
+    let end = f.pc_map.partition_point(|p| p.pc <= pc);
+    let byte = f.pc_map[..end]
+        .last()
+        .map_or(f.source_start, |p| p.byte_offset);
+    let line = f
+        .line_starts
+        .partition_point(|&start| start <= byte)
+        .saturating_sub(1);
+    let column = byte.saturating_sub(f.line_starts[line]) + 1;
+    Some(crate::Frame {
+        file: String::from_utf8_lossy(&f.filename).into_owned(),
+        function: f.name.map_or_else(String::new, |key| match key.decode() {
+            KeyKind::Index(i) => i.to_string(),
+            KeyKind::String(atom) => AtomTable::builtin(atom)
+                .map(str::to_owned)
+                .or_else(|| {
+                    heap.atoms
+                        .dynamic_string(atom)
+                        .map(|id| utf16_lossy(heap, id))
+                })
+                .unwrap_or_default(),
+            KeyKind::Symbol(_) => String::new(),
+        }),
+        line: line as u32 + 1,
+        column,
+    })
 }
 
 fn stack_frames(ctx: &ExecCtx<'_, '_>, natives: bool, skip: usize) -> Vec<crate::Frame> {
@@ -225,32 +268,9 @@ fn stack_frames(ctx: &ExecCtx<'_, '_>, natives: bool, skip: usize) -> Vec<crate:
         let Some(f) = &heap.bytecode.get(code).unwrap().compiled else {
             continue;
         };
-        let end = f.pc_map.partition_point(|p| p.pc <= frame.last_pc);
-        let byte = f.pc_map[..end]
-            .last()
-            .map_or(f.source_start, |p| p.byte_offset);
-        let line = f
-            .line_starts
-            .partition_point(|&start| start <= byte)
-            .saturating_sub(1);
-        let column = byte.saturating_sub(f.line_starts[line]) + 1;
-        frames.push(crate::Frame {
-            file: String::from_utf8_lossy(&f.filename).into_owned(),
-            function: f.name.map_or_else(String::new, |key| match key.decode() {
-                KeyKind::Index(i) => i.to_string(),
-                KeyKind::String(atom) => AtomTable::builtin(atom)
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        heap.atoms
-                            .dynamic_string(atom)
-                            .map(|id| utf16_lossy(heap, id))
-                    })
-                    .unwrap_or_default(),
-                KeyKind::Symbol(_) => String::new(),
-            }),
-            line: line as u32 + 1,
-            column,
-        });
+        if let Some(resolved) = resolve_frame(heap, code, frame.last_pc) {
+            frames.push(resolved);
+        }
         if f.flags.backtrace_barrier {
             break;
         }

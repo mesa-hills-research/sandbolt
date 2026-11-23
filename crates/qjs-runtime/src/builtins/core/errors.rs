@@ -131,6 +131,7 @@ fn error_constructor<'s>(
                     kind,
                     message: Value::UNDEFINED,
                     stack: Value::UNDEFINED,
+                    frames: crate::ledger::TrackedVec::new(),
                 },
             )?))
         },

@@ -928,6 +928,7 @@ fn aggregate_error<'s>(ctx: &mut ExecCtx<'_, 's>, errors: Handle<'s>) -> JsResul
                 kind: ErrorKind::Aggregate,
                 message: Value::UNDEFINED,
                 stack: Value::UNDEFINED,
+                frames: TrackedVec::new(),
             },
         )?))
     })?;
