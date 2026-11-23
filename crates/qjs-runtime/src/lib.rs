@@ -8,6 +8,31 @@
 //! - Explicit heap-backed VM operand/call stacks with deterministic `stack_bytes`,
 //!   unified coroutines, catchable OOM, and uncatchable host `Interrupted`.
 
+#![deny(unsafe_code)]
+
+pub mod arena;
+pub mod atom;
+pub mod gc;
+pub mod heap;
+pub mod ledger;
+pub mod object;
+pub mod ops;
+mod payloads;
+pub mod realm;
+pub mod root;
+pub mod shape;
+pub mod string;
+pub mod symbol;
+pub mod value;
+pub mod vm;
+
+pub use realm::{NativeFnId, Runtime};
+pub use root::{Args, ExecCtx, Handle, MutRoot, Persistent};
+pub use value::{Abrupt, JsResult, Value, ValueKind};
+
+#[cfg(test)]
+mod tests;
+
 /// Resource limits configured before any script executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineLimits {
