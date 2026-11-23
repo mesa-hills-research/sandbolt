@@ -1,10 +1,21 @@
-//! Pure-Rust port of QuickJS-ng v0.17.0 `JSBigInt` (arbitrary-precision
-//! integers with resource charging and interrupt polling).
+//! BigInt arithmetic and conversions for QuickJS-ng values.
 
+#![deny(unsafe_code)]
+
+mod arithmetic;
+mod convert;
+mod storage;
+#[cfg(test)]
+mod tests;
+
+use crate::storage::{Buffer, Scope};
 use std::cmp::Ordering;
 
-/// Matches QuickJS-ng `JS_BIGINT_MAX_SIZE` (1,048,576 bits).
+/// Maximum bit length of a BigInt's magnitude.
 pub const MAX_BITS: usize = 1 << 20;
+const WORD_BITS: usize = u64::BITS as usize;
+const MAX_LIMBS: usize = MAX_BITS / WORD_BITS;
+const TOO_LARGE: BigIntError = BigIntError::RangeError("BigInt is too large");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BigIntError {
@@ -16,14 +27,21 @@ pub enum BigIntError {
     InvalidString,
 }
 
-/// Host accounting and interrupt interface for BigInt operations.
+/// Accounts for storage and lets long operations be interrupted.
+///
+/// A failed charge must leave the balance unchanged. Operations release scratch
+/// storage on success or failure. The caller owns the charge for returned
+/// storage (`BigInt::byte_size()` for an integer or `String::capacity()` for
+/// a string) and releases it when that storage is freed.
+///
+/// Constructors without a host and `Clone` do not charge storage.
 pub trait BigIntHost {
     fn charge(&mut self, bytes: usize) -> Result<(), BigIntError>;
     fn release(&mut self, bytes: usize);
     fn poll_interrupt(&mut self) -> bool;
 }
 
-/// Default unlimited host for standalone tests.
+/// Host with no memory or interrupt limits.
 #[derive(Default)]
 pub struct UnlimitedBigIntHost;
 
@@ -37,16 +55,16 @@ impl BigIntHost for UnlimitedBigIntHost {
     }
 }
 
-/// Two's-complement limb representation matching QuickJS-ng's `JSBigInt`.
+/// Arbitrary-precision signed integer in two's-complement form.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BigInt {
-    /// Two's-complement little-endian 64-bit limbs, always normalized to minimum length >= 1.
+    // Little-endian with the fewest limbs needed to preserve the sign.
     limbs: Vec<u64>,
 }
 
 impl BigInt {
     pub fn zero() -> Self {
-        Self { limbs: vec![0] }
+        Self::from_i64(0)
     }
 
     pub fn from_i64(v: i64) -> Self {
@@ -68,115 +86,52 @@ impl BigInt {
     }
 
     pub fn byte_size(&self) -> usize {
-        self.limbs.capacity() * std::mem::size_of::<u64>()
+        self.limbs.capacity() * size_of::<u64>()
     }
 
     pub fn is_zero(&self) -> bool {
-        self.limbs.len() == 1 && self.limbs[0] == 0
+        self.limbs == [0]
     }
 
     pub fn is_negative(&self) -> bool {
-        (*self.limbs.last().unwrap_or(&0) as i64) < 0
+        negative(&self.limbs)
     }
 
-    pub fn to_i64_exact(&self) -> Option<i64> {
-        if self.limbs.len() == 1 {
-            Some(self.limbs[0] as i64)
+    pub fn signum(&self) -> i8 {
+        if self.is_negative() {
+            -1
         } else {
-            None
+            i8::from(!self.is_zero())
         }
     }
 
-    pub fn from_f64_trunc(_v: f64, _host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
+    pub fn is_even(&self) -> bool {
+        self.limbs[0] & 1 == 0
     }
 
-    pub fn to_f64(&self) -> f64 {
-        todo!("implemented by qjs-bigint worker")
+    /// Returns the number of bits in the absolute value. Zero has no bits.
+    pub fn bit_len(&self) -> usize {
+        Magnitude::new(&self.limbs).bit_len()
     }
 
-    pub fn cmp_f64(&self, _d: f64) -> Option<Ordering> {
-        todo!("implemented by qjs-bigint worker")
+    pub fn to_i64_exact(&self) -> Option<i64> {
+        (self.limbs.len() == 1).then(|| self.to_i64_wrapping())
     }
 
-    pub fn cmp_bigint(&self, _other: &Self) -> Ordering {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn parse_radix(
-        _s: &str,
-        _radix: u32,
-        _host: &mut dyn BigIntHost,
-    ) -> Result<Self, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn to_string_radix(
-        &self,
-        _radix: u32,
-        _host: &mut dyn BigIntHost,
-    ) -> Result<String, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn neg(&self, _host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn bitnot(&self, _host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn add(&self, _other: &Self, _host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn sub(&self, _other: &Self, _host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn mul(&self, _other: &Self, _host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn divrem(
-        &self,
-        _other: &Self,
-        _host: &mut dyn BigIntHost,
-    ) -> Result<(Self, Self), BigIntError> {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn pow(&self, _exp: &Self, _host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn shl(&self, _shift: &Self, _host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn sar(&self, _shift: &Self, _host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn bitand(&self, _other: &Self, _host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn bitor(&self, _other: &Self, _host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn bitxor(&self, _other: &Self, _host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn as_int_n(&self, _bits: u64, _host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
-    }
-
-    pub fn as_uint_n(&self, _bits: u64, _host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
-        todo!("implemented by qjs-bigint worker")
+    pub fn cmp_bigint(&self, other: &Self) -> Ordering {
+        match self.is_negative().cmp(&other.is_negative()) {
+            Ordering::Equal => {
+                let by_len = self.limbs.len().cmp(&other.limbs.len());
+                if by_len == Ordering::Equal {
+                    self.limbs.iter().rev().cmp(other.limbs.iter().rev())
+                } else if self.is_negative() {
+                    by_len.reverse()
+                } else {
+                    by_len
+                }
+            }
+            by_sign => by_sign.reverse(),
+        }
     }
 
     pub fn to_i64_wrapping(&self) -> i64 {
@@ -185,5 +140,114 @@ impl BigInt {
 
     pub fn to_u64_wrapping(&self) -> u64 {
         self.limbs[0]
+    }
+
+    fn small(v: i64, scope: &Scope<'_>) -> Result<Self, BigIntError> {
+        Ok(Self {
+            limbs: scope.filled(1, v as u64)?.into_vec(),
+        })
+    }
+
+    fn copy(&self, scope: &Scope<'_>) -> Result<Self, BigIntError> {
+        Ok(Self {
+            limbs: scope.copy(&self.limbs)?.into_vec(),
+        })
+    }
+
+    fn finish(mut limbs: Buffer<'_, '_, u64>) -> Result<Self, BigIntError> {
+        normalize(&mut limbs)?;
+        Ok(Self {
+            limbs: limbs.into_vec(),
+        })
+    }
+}
+
+fn negative(limbs: &[u64]) -> bool {
+    (limbs[limbs.len() - 1] as i64) < 0
+}
+
+fn sign_word(limbs: &[u64]) -> u64 {
+    0u64.wrapping_sub(u64::from(negative(limbs)))
+}
+
+fn extend(limbs: &[u64], i: usize) -> u64 {
+    limbs.get(i).copied().unwrap_or_else(|| sign_word(limbs))
+}
+
+fn normalize(limbs: &mut Buffer<'_, '_, u64>) -> Result<(), BigIntError> {
+    let mut len = limbs.len();
+    while len > 1 && limbs[len - 1] == sign_word(&limbs[..len - 1]) {
+        len -= 1;
+    }
+    limbs.truncate(len);
+    if len >= MAX_LIMBS && Magnitude::new(limbs).bit_len() > MAX_BITS {
+        return Err(TOO_LARGE);
+    }
+    Ok(())
+}
+
+/// Views the absolute value without making a copy of the limbs.
+struct Magnitude<'a> {
+    limbs: &'a [u64],
+    negative: bool,
+    first_nonzero: usize,
+}
+
+impl<'a> Magnitude<'a> {
+    fn new(limbs: &'a [u64]) -> Self {
+        let negative = negative(limbs);
+        // In a negative value, zero limbs keep the carry from negation.
+        let first_nonzero = if negative {
+            limbs.iter().take_while(|&&word| word == 0).count()
+        } else {
+            0
+        };
+        Self {
+            limbs,
+            negative,
+            first_nonzero,
+        }
+    }
+
+    fn word(&self, i: usize) -> u64 {
+        let Some(&word) = self.limbs.get(i) else {
+            return 0;
+        };
+        if !self.negative {
+            return word;
+        }
+        match i.cmp(&self.first_nonzero) {
+            Ordering::Less => 0,
+            Ordering::Equal => word.wrapping_neg(),
+            Ordering::Greater => !word,
+        }
+    }
+
+    fn len(&self) -> usize {
+        let n = self.limbs.len();
+        n - usize::from(n > 1 && self.word(n - 1) == 0)
+    }
+
+    fn bit_len(&self) -> usize {
+        let n = self.len();
+        n * WORD_BITS - self.word(n - 1).leading_zeros() as usize
+    }
+
+    fn bits_at(&self, offset: usize) -> u64 {
+        let i = offset / WORD_BITS;
+        let shift = offset % WORD_BITS;
+        let low = self.word(i) >> shift;
+        if shift == 0 {
+            low
+        } else {
+            low | (self.word(i + 1) << (WORD_BITS - shift))
+        }
+    }
+
+    fn any_below(&self, bits: usize) -> bool {
+        let words = bits / WORD_BITS;
+        let tail = bits % WORD_BITS;
+        (0..words).any(|i| self.word(i) != 0)
+            || (tail != 0 && self.word(words) << (WORD_BITS - tail) != 0)
     }
 }
