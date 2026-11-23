@@ -162,20 +162,25 @@ pub(super) fn start<'s>(
     let source = argument(ctx, args, 0)?;
     let source = string_arg(ctx, source)?;
     let (messages, receiver) = mpsc::channel();
-    let worker = Host {
-        budget: host.budget.clone(),
-        capture: host.capture,
-        printed: RefCell::default(),
-        agents: Group::Worker(Worker {
-            messages: receiver,
-            reports: main.reports.clone(),
-            callback: RefCell::default(),
-        }),
-    };
+    let budget = host.budget.clone();
+    let capture = host.capture;
+    let reports = main.reports.clone();
     let cancelled = main.cancelled.clone();
     let thread = thread::Builder::new()
         .name("test262-agent".into())
-        .spawn(move || worker_run(worker, &source, cancelled))
+        .spawn(move || {
+            let worker = Host {
+                budget,
+                capture,
+                printed: RefCell::default(),
+                agents: Group::Worker(Worker {
+                    messages: receiver,
+                    reports,
+                    callback: RefCell::default(),
+                }),
+            };
+            worker_run(worker, &source, cancelled)
+        })
         .map_err(|error| ctx.throw_type_error(&format!("could not start agent: {error}")))?;
     main.children.borrow_mut().push(Child { messages, thread });
     Ok(Value::UNDEFINED)
