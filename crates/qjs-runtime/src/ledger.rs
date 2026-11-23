@@ -18,6 +18,7 @@ struct Account {
     peak_bytes: Cell<usize>,
     limit_bytes: usize,
     gc_threshold: Cell<usize>,
+    gc_allocated: Cell<usize>,
     reserve_bytes: usize,
     failpoint_countdown: Cell<Option<usize>>,
 }
@@ -36,6 +37,7 @@ impl HeapLedger {
             peak_bytes: Cell::new(used_bytes),
             limit_bytes,
             gc_threshold: Cell::new((limit_bytes - reserve_bytes).min(2 * 1024 * 1024)),
+            gc_allocated: Cell::new(used_bytes),
             reserve_bytes,
             failpoint_countdown: Cell::new(None),
         })))
@@ -62,6 +64,20 @@ impl HeapLedger {
     }
     pub fn set_gc_threshold(&self, bytes: usize) {
         self.0.gc_threshold.set(bytes);
+    }
+    #[inline]
+    pub(crate) fn gc_allocated(&self) -> usize {
+        self.0.gc_allocated.get()
+    }
+    #[inline]
+    pub(crate) fn reset_gc_allocated(&self, baseline: usize) {
+        self.0.gc_allocated.set(baseline);
+    }
+    #[inline]
+    pub(crate) fn note_slot_allocation(&self, bytes: usize) {
+        self.0
+            .gc_allocated
+            .set(self.0.gc_allocated.get().saturating_add(bytes));
     }
     pub fn fail_after(&self, successful_charges: Option<usize>) {
         self.0.failpoint_countdown.set(successful_charges);

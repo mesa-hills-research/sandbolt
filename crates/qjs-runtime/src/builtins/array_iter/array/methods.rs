@@ -447,7 +447,7 @@ fn plain_index_prototypes(heap: &Heap, object: &JsObject, index: Option<u32>) ->
         let indexed = if let Some(key) = key {
             shape.find(key).is_some()
         } else {
-            shape.props.iter().any(|p| {
+            shape.live_props().any(|(_, p)| {
                 heap.array_index(p.key)
                     .is_some_and(|i| index.is_none_or(|wanted| wanted == i))
             })

@@ -139,6 +139,13 @@ fn alloc_fn_name(
     name: &str,
     share_atom: bool,
 ) -> crate::ledger::AllocResult<crate::value::StrId> {
+    if share_atom
+        && let Some(key) = heap.atoms.find_str(&heap.strings, name)
+        && let KeyKind::String(atom) = key.decode()
+        && let Some(existing) = heap.atoms.dynamic_string(atom)
+    {
+        return Ok(existing);
+    }
     let name_str = JsString::from_str(&heap.ledger, name)?;
     let name_id = heap.strings.insert(&heap.ledger, name_str)?;
     if share_atom && AtomTable::builtin_key(name).is_none() {

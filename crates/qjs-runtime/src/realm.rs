@@ -712,7 +712,8 @@ impl Runtime {
         let threshold = ledger.gc_threshold();
         let ceiling = ledger.limit_bytes() - ledger.reserve_bytes();
         // At the ceiling, let a failed allocation request a collection.
-        let collect = threshold < ceiling && ledger.used_bytes() >= threshold;
+        let collect = threshold < ceiling
+            && (ledger.used_bytes() >= threshold || ledger.gc_allocated() >= threshold);
         #[cfg(feature = "gc_stress")]
         let collect = {
             self.stress_countdown -= 1;

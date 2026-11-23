@@ -572,7 +572,7 @@ fn dense_for_in(heap: &Heap, target: ObjId) -> Option<DenseForIn> {
     if object.flags.contains(ObjectFlags::FAST_ARRAY)
         && array.elements.len() == array.length as usize
         && array.length <= INLINE_INDEX_LIMIT
-        && heap.shape(object.shape).props.is_empty()
+        && heap.shape(object.shape).live_count() == 0
         && !array.elements.contains(&Value::EMPTY)
     {
         Some(DenseForIn {
@@ -595,9 +595,8 @@ fn might_enumerate(heap: &Heap, mut target: Option<ObjId>) -> bool {
         }
         let shape = heap.shape(object.shape);
         if shape
-            .props
-            .iter()
-            .any(|prop| prop.flags.contains(PropFlags::ENUMERABLE))
+            .live_props()
+            .any(|(_, prop)| prop.flags.contains(PropFlags::ENUMERABLE))
         {
             return true;
         }

@@ -70,6 +70,7 @@ impl<T: ArenaItem> Arena<T> {
             }
             self.slots.try_reserve(ledger, 1)?;
         }
+        ledger.note_slot_allocation(size_of::<Slot<T>>());
         Ok(())
     }
 

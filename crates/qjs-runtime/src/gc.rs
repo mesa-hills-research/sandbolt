@@ -262,6 +262,7 @@ impl Runtime {
         let live = used.saturating_sub(slack);
         heap.ledger
             .set_gc_threshold(used.saturating_add(live.max(512 * 1024)).min(ceiling));
+        heap.ledger.reset_gc_allocated(used);
     }
 
     pub fn clear_kept_objects(&mut self) {
