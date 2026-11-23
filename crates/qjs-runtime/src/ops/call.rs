@@ -233,8 +233,8 @@ pub(crate) fn prepare_plain(
     }
     let layout = FrameLayout::new(base, count, Some(function));
     let needed = layout.needed() + inserted;
-    // A non-method call also needs the spare root slot reserved by reserve_stack(1).
-    if vm.stack.capacity() - tail < needed.max(inserted * 2)
+    // Always preserve the spare root slot required by ExecCtx::root at peak operand height.
+    if vm.stack.capacity() - tail < needed + 1
         || (!method && tail + 1 >= u32::MAX as usize)
         || !vm.check_budget(needed, 1, 0)
     {
@@ -380,7 +380,7 @@ fn enter_call(
     } else {
         ctx.runtime.vm.stack[base + 1]
     };
-    if ctx.runtime.vm.stack.capacity() - ctx.runtime.vm.stack.len() < needed {
+    if ctx.runtime.vm.stack.capacity() - ctx.runtime.vm.stack.len() < needed + 1 {
         ctx.root(this)?;
         ctx.reserve_stack(needed)?;
         ctx.runtime.vm.stack.pop();
