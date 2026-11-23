@@ -332,6 +332,15 @@ impl Emitter<'_> {
     pub(crate) fn declaration_value(&mut self, decl: &Declaration) -> Result {
         for entry in &decl.entries {
             let name = self.pattern_atom(entry.binding)?;
+            let reference = if decl.kind == DeclKind::Var && entry.initializer.is_some() {
+                if let Pattern::Identifier(id) = &self.ast().pattern(entry.binding).kind {
+                    Some(self.reference_name(id, false)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             if let Some(initializer) = entry.initializer {
                 self.expression_named(initializer, name)?;
             } else if decl.kind == DeclKind::Var {
@@ -342,10 +351,8 @@ impl Emitter<'_> {
             if matches!(decl.kind, DeclKind::Using | DeclKind::AwaitUsing) {
                 self.dispose_resource(entry.binding)?;
             }
-            if decl.kind == DeclKind::Var
-                && let Some(name) = name
-            {
-                self.ir(IrOp::ScopePutVar(self.scoped(name)));
+            if let Some(reference) = reference {
+                self.store_reference(reference, false, false);
             } else {
                 self.bind_value(entry.binding, decl.kind != DeclKind::Var)?;
             }

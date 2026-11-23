@@ -339,7 +339,7 @@ pub(crate) fn compile_text(
     })
 }
 
-pub(crate) fn parse_options(runtime: &Runtime, options: &EvalOptions) -> ParseOptions {
+pub(crate) fn parse_options(runtime: &Runtime, options: &EvalOptions) -> ParseOptions<'static> {
     ParseOptions {
         goal: if options.module {
             ParseGoal::Module
@@ -348,6 +348,7 @@ pub(crate) fn parse_options(runtime: &Runtime, options: &EvalOptions) -> ParseOp
         },
         strict: options.strict,
         annex_b: options.annex_b,
+        enclosing_private_names: &[],
         max_depth: (runtime.vm.limits.stack_bytes / 1024).clamp(1, 512),
         max_bytes: runtime
             .heap()

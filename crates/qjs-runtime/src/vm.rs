@@ -118,6 +118,7 @@ pub(crate) enum EvalBinding {
     Cell {
         name: PropKey,
         id: VarRefId,
+        kind: qjs_bytecode::VarKind,
         lexical: bool,
         writable: bool,
     },

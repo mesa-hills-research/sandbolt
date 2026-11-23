@@ -62,7 +62,7 @@ enum Binding {
 struct Validator<'a> {
     source: &'a SourceText,
     arena: &'a Arena,
-    opts: ParseOptions,
+    opts: ParseOptions<'a>,
     ctx: Context,
     depth: usize,
     scopes: Vec<Scope<'a>>,
@@ -840,6 +840,11 @@ impl<'a> Validator<'a> {
             .iter()
             .rev()
             .any(|scope| scope.contains_key(id.name.as_str()))
+            && !self
+                .opts
+                .enclosing_private_names
+                .iter()
+                .any(|(name, _)| name == &id.name)
         {
             return Err(self.error(
                 id.span,

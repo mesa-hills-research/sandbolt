@@ -270,7 +270,13 @@ fn write_binding<'s>(
         ValueKind::VarRef(id) => {
             if !initialize {
                 check_initialized(ctx, read_ref(ctx, id))?;
-                if lexical(ctx, key) == Some((id, false)) || !super::eval::writable(ctx, id) {
+                if let Some(kind) = super::eval::immutable_kind(ctx, id) {
+                    if kind == qjs_bytecode::VarKind::FunctionName && !strict {
+                        return Ok(());
+                    }
+                    return Err(ctx.throw_type_error("assignment to constant binding"));
+                }
+                if lexical(ctx, key) == Some((id, false)) {
                     return Err(ctx.throw_type_error("assignment to constant binding"));
                 }
             }
@@ -333,15 +339,19 @@ pub(super) fn binding_op(
             }
             CheckDefineVar | DefineVar | DefineFunc | DeleteVar => {
                 let key = atom.unwrap();
-                if op != DeleteVar
-                    && super::eval::declaration(
-                        ctx,
-                        code,
-                        key,
-                        op,
-                        (op == DefineFunc).then(|| h(1)),
-                    )?
-                {
+                if op == DeleteVar {
+                    let binding = global_ref(ctx, code, key)?;
+                    let deleted = match binding.decode() {
+                        ValueKind::VarRef(_) => false,
+                        ValueKind::Undefined => true,
+                        _ => {
+                            let object = ctx.root(binding)?;
+                            property::delete_property(ctx, object, key)?
+                        }
+                    };
+                    return Ok((0, [Value::bool(deleted), Value::EMPTY], None));
+                }
+                if super::eval::declaration(ctx, code, key, op, (op == DefineFunc).then(|| h(1)))? {
                     return Ok((usize::from(op == DefineFunc), [Value::EMPTY; 2], None));
                 }
                 let global = ctx.root(Value::object(ctx.realm().global_object))?;
@@ -412,19 +422,6 @@ pub(super) fn binding_op(
                             }
                             define_flags(ctx, global, key, value, attrs)?;
                         }
-                    }
-                    DeleteVar => {
-                        return Ok((
-                            0,
-                            [
-                                Value::bool(
-                                    lexical(ctx, key).is_none()
-                                        && property::delete_property(ctx, global, key)?,
-                                ),
-                                Value::EMPTY,
-                            ],
-                            None,
-                        ));
                     }
                     _ => unreachable!(),
                 }

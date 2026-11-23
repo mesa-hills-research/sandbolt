@@ -32,20 +32,30 @@ pub enum ParseGoal {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ParseOptions {
+pub enum PrivateNameKind {
+    Field,
+    Method,
+    Accessor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseOptions<'a> {
     pub goal: ParseGoal,
     pub strict: bool,
     pub annex_b: bool,
+    /// Private names visible to direct eval, innermost first, without the `#` prefix.
+    pub enclosing_private_names: &'a [(String, PrivateNameKind)],
     pub max_depth: usize,
     pub max_bytes: usize,
 }
 
-impl Default for ParseOptions {
+impl Default for ParseOptions<'_> {
     fn default() -> Self {
         Self {
             goal: ParseGoal::Script,
             strict: false,
             annex_b: true,
+            enclosing_private_names: &[],
             max_depth: 512,
             max_bytes: 32 * 1024 * 1024,
         }

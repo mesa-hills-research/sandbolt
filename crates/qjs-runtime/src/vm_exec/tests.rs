@@ -401,6 +401,103 @@ fn direct_eval_shares_lexical_bindings_and_sloppy_variables() {
 }
 
 #[test]
+fn direct_eval_sees_private_names_in_fields_methods_and_nested_eval() {
+    assert_eq!(
+        run(r#"
+        class Outer {
+            #value = 1;
+            #outer = this.#value;
+            read() {
+                const outer = this;
+                class Inner {
+                    #state = eval('outer.#outer');
+                    get #value() { return this.#state; }
+                    set #value(value) { this.#state = value; }
+                    #add(n) { return this.#value + n; }
+                    read() {
+                        eval('this.#value = 4');
+                        return eval('eval("this.#add(3)")');
+                    }
+                }
+                return new Inner().read();
+            }
+        }
+        new Outer().read()
+        "#),
+        "7"
+    );
+    assert_eq!(
+        run(r#"
+        class Example {
+            #value = 1;
+            read() {
+                try { return (0, eval)('this.#value'); }
+                catch (error) { return error.name; }
+            }
+        }
+        new Example().read()
+        "#),
+        "SyntaxError"
+    );
+}
+
+#[test]
+fn private_fields_on_proxies_do_not_query_the_target() {
+    assert_eq!(
+        run(r#"
+        class Base { constructor(object) { return object; } }
+        class Child extends Base {
+            #field = 7;
+            #method() { return this.#field; }
+            static read(object) { return object.#method(); }
+        }
+        const target = Object.preventExtensions({});
+        const proxy = new Proxy(target, {
+            isExtensible() { throw new Error('isExtensible'); },
+            defineProperty() { throw new Error('defineProperty'); },
+        });
+        let failure;
+        try { new Child(target); } catch (error) { failure = error.name; }
+        new Child(proxy);
+        [failure, Child.read(proxy)].join(',')
+        "#),
+        "TypeError,7"
+    );
+}
+
+#[test]
+fn direct_eval_respects_parameter_and_binding_lifetimes() {
+    assert_eq!(
+        run(r#"
+        function invalid(p = eval('var arguments')) {}
+        let failure;
+        try { invalid(); } catch (error) { failure = error.name; }
+        function readArgument(p = eval('arguments[1]')) { return p; }
+        const keepName = function self() { return eval('self = null; self') === keepName; };
+        const removeLocals = () => eval(`
+            var x;
+            function f() {}
+            [delete x, delete f, typeof x, typeof f].join(',');
+        `);
+        [failure, readArgument(undefined, 42), keepName(), removeLocals()].join(',')
+        "#),
+        "SyntaxError,42,true,true,true,undefined,undefined"
+    );
+}
+
+#[test]
+fn eval_accepts_initial_hashbang_comments() {
+    assert_eq!(
+        run(r#"
+        let failure;
+        try { Function('#!example\nreturn 9')(); } catch (error) { failure = error.name; }
+        [eval('#!example\n7'), (0, eval)('#!example\n8'), eval('#!example'), failure].join(',')
+        "#),
+        "7,8,,SyntaxError"
+    );
+}
+
+#[test]
 fn constructs_functions_and_captures_error_stacks() {
     assert_eq!(
         run(r#"
