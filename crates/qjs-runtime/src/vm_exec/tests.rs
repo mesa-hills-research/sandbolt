@@ -538,6 +538,70 @@ fn interrupt_during_async_resume_does_not_run_handlers() {
 }
 
 #[test]
+fn regexp_literals_share_code_but_not_last_index() {
+    assert_eq!(
+        run(
+            "function f() { return /a/g; } const a = f(), b = f(); a.test('a'); [a === b, a.lastIndex, b.lastIndex].join(',')"
+        ),
+        "false,1,0"
+    );
+    let code = [
+        Instruction {
+            opcode: Opcode::PushConst8,
+            operands: Operands::Constant(0),
+        },
+        Instruction {
+            opcode: Opcode::PushConst8,
+            operands: Operands::Constant(1),
+        },
+        Instruction {
+            opcode: Opcode::Regexp,
+            operands: Operands::None,
+        },
+        Instruction {
+            opcode: Opcode::Return,
+            operands: Operands::None,
+        },
+    ]
+    .into_iter()
+    .flat_map(|op| op.encode().unwrap().as_bytes().to_vec())
+    .collect();
+    let compiled = qjs_regexp::compile(
+        b"a",
+        qjs_regexp::RegExpFlags(qjs_regexp::RegExpFlags::IGNORECASE),
+        &mut qjs_regexp::UnlimitedRegExpHost,
+    )
+    .unwrap();
+    let text = |bytes| qjs_bytecode::ConstEntry::String(qjs_bytecode::ConstString::Latin1(bytes));
+    let image = ProgramImage {
+        functions: vec![FunctionBytecode {
+            code,
+            stack_size: 2,
+            constants: vec![text(vec![b'a']), text(compiled.bytecode)],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let realm = engine.default_realm();
+    engine.runtime_mut().with_scope(realm, |ctx| {
+        let object = super::execute_image(ctx, &image, None)
+            .unwrap()
+            .as_object()
+            .unwrap();
+        let crate::object::ObjectData::RegExp(data) = &ctx.heap().object(object).data else {
+            panic!("expected a RegExp");
+        };
+        assert!(
+            data.program
+                .compiled
+                .flags
+                .contains(qjs_regexp::RegExpFlags::IGNORECASE)
+        );
+    });
+}
+
+#[test]
 fn host_bridge_and_print_are_opt_in() {
     let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
     let opts = EvalOptions::default();

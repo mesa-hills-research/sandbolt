@@ -72,8 +72,8 @@ pub(super) fn load_functions(
             let ledger = &heap.ledger;
             let mut constants = TrackedVec::new();
             constants.try_reserve_exact(ledger, function.constants.len())?;
-            let mut regex_flags = TrackedVec::new();
-            regex_flags.try_reserve_exact(
+            let mut regex_constants = TrackedVec::new();
+            regex_constants.try_reserve_exact(
                 ledger,
                 function
                     .constants
@@ -82,8 +82,8 @@ pub(super) fn load_functions(
                     .count(),
             )?;
             for (index, constant) in function.constants.iter().enumerate() {
-                if let ConstEntry::RegExp { flags, .. } = constant {
-                    regex_flags.push_reserved((index as u32, *flags));
+                if matches!(constant, ConstEntry::RegExp { .. }) {
+                    regex_constants.push_reserved(index as u32);
                 }
             }
             heap.bytecode.insert(
@@ -111,7 +111,7 @@ pub(super) fn load_functions(
                             source.map_or(&[0][..], |source| &source.line_starts),
                         )?,
                         pc_map: TrackedVec::from_slice(ledger, &debug.pc_map)?,
-                        regex_flags,
+                        regex_constants,
                         module: None,
                         hoisted: TrackedVec::new(),
                         eval: None,
@@ -176,9 +176,13 @@ fn materialize(
     Ok(match constant {
         ConstEntry::Int(int) => Value::int32(*int),
         ConstEntry::Float(number) => Value::number(*number),
-        ConstEntry::String(text) | ConstEntry::RegExp { pattern: text, .. } => {
+        ConstEntry::String(text) => {
             let text = constant_string(ctx, text)?;
             ctx.get(text)
+        }
+        ConstEntry::RegExp { pattern, flags } => {
+            let pattern = constant_string(ctx, pattern)?;
+            super::objects::regexp_literal(ctx, ctx.get(pattern), *flags)?
         }
         ConstEntry::Function(index) => Value::bytecode(functions[*index as usize]),
         ConstEntry::BigInt(text) => super::numeric::parse_bigint(ctx, text)?,

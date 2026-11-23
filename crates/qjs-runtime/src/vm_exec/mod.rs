@@ -440,16 +440,15 @@ pub(crate) fn step(
                                 unreachable!()
                             };
                             return bindings::closure(ctx, frame, child);
-                        } else if let Some((_, flags)) = function
+                        } else if function
                             .compiled
                             .as_ref()
                             .unwrap()
-                            .regex_flags
-                            .iter()
-                            .find(|&&(i, _)| i == c)
-                            .copied()
+                            .regex_constants
+                            .binary_search(&c)
+                            .is_ok()
                         {
-                            return objects::regexp_literal(ctx, constant, flags);
+                            return objects::clone_regexp(ctx, constant);
                         } else {
                             return Ok(constant);
                         }

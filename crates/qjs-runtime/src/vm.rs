@@ -69,7 +69,7 @@ pub(crate) struct CompiledFunc {
     pub pc_map: TrackedVec<PcSourceMap>,
     pub source: Option<StrId>,
     pub source_start: u32,
-    pub regex_flags: TrackedVec<(u32, u16)>,
+    pub regex_constants: TrackedVec<u32>,
     pub module: Option<ModId>,
     pub hoisted: TrackedVec<(u32, u32)>,
     pub eval: Option<EvalEnvironment>,

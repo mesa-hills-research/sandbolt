@@ -1,13 +1,16 @@
 use qjs_bytecode::{BuiltinAtom, Instruction, Opcode, Operands};
 
 use crate::atom::{Atom, KeyKind, PropKey};
-use crate::object::{ObjectData, ObjectFlags};
+use crate::ledger::TrackedBox;
+use crate::object::{ErrorKind, ObjectData, ObjectFlags, RegExpData, RegExpProgram};
 use crate::ops::{call, convert, property};
 use crate::root::{ExecCtx, Handle};
 use crate::shape::PropFlags;
 use crate::symbol::WellKnown;
 use crate::value::*;
 use crate::vm::CallFrame;
+use qjs_regexp::{CompiledRegExp, RegExpError, RegExpHost};
+use std::rc::Rc;
 
 use super::{bindings, compiled, define_default, define_flags, key, replace, well_known};
 
@@ -36,15 +39,110 @@ pub(super) fn regexp_literal(
         }
     }
     let flags = ctx.new_string(std::str::from_utf8(&text[..length]).unwrap())?;
-    regexp(ctx, pattern, flags)
+    crate::builtins::string_re::regexp_literal(ctx, pattern, flags)
 }
 
-fn regexp<'s>(
+pub(super) fn clone_regexp(ctx: &mut ExecCtx<'_, '_>, literal: Value) -> JsResult<Value> {
+    let id = literal.as_object().unwrap();
+    let ObjectData::RegExp(data) = &ctx.heap().object(id).data else {
+        unreachable!()
+    };
+    make_regexp(ctx, data.source, data.program.clone())
+}
+
+fn make_regexp(
+    ctx: &mut ExecCtx<'_, '_>,
+    source: Value,
+    program: Rc<RegExpProgram>,
+) -> JsResult<Value> {
+    let proto = ctx.realm().regexp_proto;
+    let value = ctx.make_object(Some(proto), ObjectFlags::EXTENSIBLE, |ledger| {
+        Ok(ObjectData::RegExp(TrackedBox::new(
+            ledger,
+            RegExpData {
+                source,
+                program: Rc::clone(&program),
+            },
+        )?))
+    })?;
+    let last_index = ctx.intern_str("lastIndex")?;
+    let zero = ctx.root(Value::int32(0))?;
+    define_flags(ctx, value, last_index, zero, PropFlags::WRITABLE)?;
+    Ok(ctx.get(value))
+}
+
+struct BytecodeRegExpHost<'a, 'rt, 's>(&'a mut ExecCtx<'rt, 's>);
+impl RegExpHost for BytecodeRegExpHost<'_, '_, '_> {
+    fn poll_interrupt(&mut self) -> bool {
+        self.0.check_interrupt().is_err()
+    }
+    fn check_stack(&mut self, bytes: usize) -> bool {
+        self.0
+            .runtime
+            .vm
+            .check_budget(bytes.div_ceil(size_of::<Value>()), 0, 0)
+    }
+    fn charge(&mut self, bytes: usize) -> Result<(), RegExpError> {
+        let ledger = self.0.heap().ledger.clone();
+        self.0
+            .runtime
+            .allocate(|_| ledger.charge_bytes(bytes))
+            .map_err(|_| RegExpError::OutOfMemory)
+    }
+    fn release(&mut self, bytes: usize) {
+        self.0.heap().ledger.release_bytes(bytes);
+    }
+}
+
+fn regexp_opcode<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     pattern: Handle<'s>,
-    flags: Handle<'s>,
+    code: Handle<'s>,
 ) -> JsResult<Value> {
-    crate::builtins::string_re::regexp_literal(ctx, pattern, flags)
+    let pattern = convert::to_string(ctx, pattern)?;
+    let ValueKind::String(code) = ctx.get(code).decode() else {
+        return Err(ctx.throw_type_error("expected RegExp bytecode"));
+    };
+    let bytes = ctx.heap().string(code).len() as usize;
+    let ledger = ctx.heap().ledger.clone();
+    ctx.allocate(|_| ledger.charge_bytes(bytes))?;
+    let result = (|| {
+        let mut input = Vec::new();
+        input
+            .try_reserve_exact(bytes)
+            .map_err(|_| RegExpError::OutOfMemory)?;
+        for unit in ctx.heap().string_units(code) {
+            input.push(u8::try_from(unit).map_err(|_| RegExpError::InvalidBytecode)?);
+        }
+        CompiledRegExp::from_bytecode(input, &mut BytecodeRegExpHost(ctx))
+    })();
+    ledger.release_bytes(bytes);
+    let compiled = result.map_err(|error| match error {
+        RegExpError::OutOfMemory => ctx.throw_oom(),
+        RegExpError::Interrupted => Abrupt::Interrupted,
+        RegExpError::StackOverflow => ctx.stack_overflow(),
+        RegExpError::Syntax(message) => ctx.throw_error(ErrorKind::Syntax, &message),
+        RegExpError::InvalidBytecode => {
+            ctx.throw_error(ErrorKind::Syntax, "invalid RegExp bytecode")
+        }
+    })?;
+    let bytes = compiled.bytecode.capacity()
+        + compiled.group_names.capacity() * size_of::<Option<String>>()
+        + compiled
+            .group_names
+            .iter()
+            .flatten()
+            .map(String::capacity)
+            .sum::<usize>()
+        + size_of::<RegExpProgram>()
+        + 2 * size_of::<usize>();
+    ctx.allocate(|_| ledger.charge_bytes(bytes))?;
+    let program = Rc::new(RegExpProgram {
+        compiled,
+        ledger,
+        bytes,
+    });
+    make_regexp(ctx, ctx.get(pattern), program)
 }
 
 fn strict_set<'s>(
@@ -386,7 +484,7 @@ pub(super) fn object_op(
                 let end = super::iterators::append(ctx, h(3), start, h(1))?;
                 one(2, Value::number(end as f64))
             }
-            Regexp => one(2, regexp(ctx, h(2), h(1))?),
+            Regexp => one(2, regexp_opcode(ctx, h(2), h(1))?),
             _ => unreachable!(),
         })
     })?;
