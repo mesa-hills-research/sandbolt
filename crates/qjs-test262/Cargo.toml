@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+integrated-runtime = []
+
 [dependencies]
 qjs-runtime.workspace = true
 qjs-syntax.workspace = true
