@@ -271,6 +271,28 @@ fn eval_created_variables_participate_in_outer_name_lookup() {
 }
 
 #[test]
+fn scope_reentry_detaches_captures_after_throw() {
+    let image = script(
+        "let saved = []; for (let i = 0; i < 2; i++) { try { let x = i; saved.push(() => x); throw i; } catch {} }",
+    );
+    let entry = instructions(&image, 0);
+    let capture = image.functions[1].closure_vars[0].index;
+    let reset = entry
+        .iter()
+        .position(|i| {
+            i.opcode == Opcode::SetLocUninitialized && i.operands == Operands::Local(capture)
+        })
+        .unwrap();
+    assert_eq!(
+        entry[reset - 1],
+        Instruction {
+            opcode: Opcode::CloseLoc,
+            operands: Operands::Local(capture)
+        }
+    );
+}
+
+#[test]
 fn with_assignment_rechecks_the_chosen_environment() {
     let image = script("with (proxy) { p += f(); }");
     let entry = instructions(&image, 0);

@@ -537,8 +537,26 @@ impl Emitter<'_> {
                 }
             }
             let f = self.fm();
-            out.retain(|op| !matches!(op, IrOp::Resolved(Instruction { opcode: CloseLoc, operands: Operands::Local(n) }) if !f.local(*n).captured));
-            f.ir = out;
+            f.ir = out
+                .into_iter()
+                .flat_map(|op| {
+                    match op {
+                        IrOp::Resolved(Instruction {
+                            opcode: SetLocUninitialized,
+                            operands: Operands::Local(n),
+                        }) if f.local(n).captured => {
+                            // A throw can skip the scope exit. Detach the old cell before resetting its slot.
+                            [Some(resolved(CloseLoc, Operands::Local(n))), Some(op)]
+                        }
+                        IrOp::Resolved(Instruction {
+                            opcode: CloseLoc,
+                            operands: Operands::Local(n),
+                        }) if !f.local(n).captured => [None, None],
+                        _ => [Some(op), None],
+                    }
+                })
+                .flatten()
+                .collect();
         }
         Ok(())
     }
