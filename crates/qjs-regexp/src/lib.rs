@@ -1,5 +1,17 @@
-//! Pure-Rust port of QuickJS-ng v0.17.0 `libregexp` (full ES2025 RegExp
-//! compiler and backtracking bytecode VM with interrupt and limit hooks).
+//! ECMAScript regular expression compiler and backtracking VM.
+//!
+//! The bytecode format follows QuickJS-ng's `libregexp` and uses native byte order.
+
+#![deny(unsafe_code)]
+
+mod alloc;
+mod bytecode;
+mod class;
+mod compiler;
+mod escape;
+mod vm;
+
+pub use escape::{EscapeError, parse_escape};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct RegExpFlags(pub u16);
@@ -29,8 +41,11 @@ pub enum RegExpError {
     InvalidBytecode,
 }
 
-/// Host hooks required by `libregexp` (matching `lre_check_timeout`,
-/// `lre_realloc`, and `lre_check_stack_overflow`).
+/// Resource limits for compilation and execution.
+///
+/// `check_stack` returns `true` if the requested depth is allowed. Each call
+/// releases its charges before returning, including those for its output.
+/// The caller accounts for storage it retains after the call.
 pub trait RegExpHost {
     fn poll_interrupt(&mut self) -> bool;
     fn charge(&mut self, bytes: usize) -> Result<(), RegExpError>;
@@ -80,7 +95,9 @@ impl<'a> RegExpInput<'a> {
 pub struct CompiledRegExp {
     pub bytecode: Vec<u8>,
     pub flags: RegExpFlags,
+    /// Number of captures, including capture zero for the whole match.
     pub capture_count: u16,
+    /// Names indexed by capture number. Capture zero has no name.
     pub group_names: Vec<Option<String>>,
 }
 
@@ -91,21 +108,64 @@ pub struct MatchResult {
 }
 
 /// Compile an ECMAScript regular expression pattern.
-/// Pattern is supplied as UTF-8 or CESU-8/WTF-8 bytes (preserving lone surrogates).
+///
+/// Supply UTF-8 in Unicode mode and CESU-8 in legacy mode. Both modes accept
+/// encoded lone surrogates. The caller parses and checks the flag string.
 pub fn compile(
-    _pattern: &[u8],
-    _flags: RegExpFlags,
-    _host: &mut dyn RegExpHost,
+    pattern: &[u8],
+    flags: RegExpFlags,
+    host: &mut dyn RegExpHost,
 ) -> Result<CompiledRegExp, RegExpError> {
-    todo!("implemented by qjs-regexp worker")
+    compiler::compile(pattern, flags, host)
 }
 
-/// Execute a compiled RegExp starting at code-unit index `start_index`.
+/// Execute a compiled RegExp starting at a code-unit index.
+///
+/// The caller manages `lastIndex`, including advancing after an empty match
+/// when iterating. With `y`, only the given starting position is tried.
 pub fn exec(
-    _re: &CompiledRegExp,
-    _input: RegExpInput<'_>,
-    _start_index: usize,
-    _host: &mut dyn RegExpHost,
+    re: &CompiledRegExp,
+    input: RegExpInput<'_>,
+    start_index: usize,
+    host: &mut dyn RegExpHost,
 ) -> Result<Option<MatchResult>, RegExpError> {
-    todo!("implemented by qjs-regexp worker")
+    vm::exec(re, input, start_index, host)
+}
+
+/// Validate the header, instructions, branch targets and group-name records.
+pub fn check_bytecode(bytecode: &[u8]) -> Result<(), RegExpError> {
+    bytecode::validate(bytecode, &mut alloc::Budget::new(&mut UnlimitedRegExpHost)).map(|_| ())
+}
+
+impl CompiledRegExp {
+    /// Read the captures and flags from previously compiled bytecode.
+    pub fn from_bytecode(
+        bytecode: Vec<u8>,
+        host: &mut dyn RegExpHost,
+    ) -> Result<Self, RegExpError> {
+        let mut budget = alloc::Budget::new(host);
+        let header = bytecode::validate(&bytecode, &mut budget)?;
+        let group_names = compiler::collect_names(&header, &mut budget)?;
+        let flags = header.flags;
+        let capture_count = header.captures as u16;
+        Ok(Self {
+            bytecode,
+            flags,
+            capture_count,
+            group_names,
+        })
+    }
+}
+
+fn canonicalize(c: u32, unicode: bool) -> u32 {
+    if c < 128 {
+        let byte = c as u8;
+        u32::from(if unicode {
+            byte.to_ascii_lowercase()
+        } else {
+            byte.to_ascii_uppercase()
+        })
+    } else {
+        qjs_unicode::canonicalize(c, unicode) as u32
+    }
 }
