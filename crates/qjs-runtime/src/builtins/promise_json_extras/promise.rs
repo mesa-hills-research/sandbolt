@@ -110,6 +110,23 @@ pub(crate) fn new_promise_capability<'s>(
     if !is_constructor(ctx, ctx.get(constructor)) {
         return Err(ctx.throw_type_error("expected a Promise constructor"));
     }
+    // Intrinsic Promise has a non-writable, non-configurable prototype, so we
+    // can allocate it directly without routing through CAPABILITY_EXECUTOR
+    // (which would let an engine OOM during call setup be converted into a
+    // rejected promise and then misreported as a missing-resolver TypeError).
+    if let Some(ctor_id) = ctx.get(constructor).as_object()
+        && let Some(ctor_realm) = function_realm(ctx.heap(), ctor_id)
+        && ctx.heap().realm(ctor_realm).promise_ctor == ctor_id
+    {
+        let proto = ctx.heap().realm(ctor_realm).promise_proto;
+        let promise = ctx.make_object(Some(proto), ObjectFlags::EXTENSIBLE, |ledger| {
+            Ok(ObjectData::Promise(TrackedBox::new(
+                ledger,
+                PromiseData::default(),
+            )?))
+        })?;
+        return resolving_functions(ctx, promise);
+    }
     let state = host(
         ctx,
         HostObjectData::CapabilityExecutor {
@@ -222,12 +239,8 @@ fn constructor<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>) -> JsResult<Value>
     )?;
     let capability = resolving_functions(ctx, promise)?;
     let undefined = ctx.root(Value::UNDEFINED)?;
-    if let Err(error) = call_with(
-        ctx,
-        executor,
-        undefined,
-        &[capability.resolve, capability.reject],
-    ) {
+    let call_args = ctx.args(&[capability.resolve, capability.reject])?;
+    if let Err(error) = crate::ops::call::call(ctx, executor, undefined, call_args) {
         reject_abrupt(ctx, capability.reject, error)?;
     }
     Ok(ctx.get(promise))

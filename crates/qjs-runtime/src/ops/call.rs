@@ -433,7 +433,10 @@ pub(crate) fn drive(ctx: &mut ExecCtx<'_, '_>, depth: usize) -> JsResult<()> {
                 return Err(Abrupt::Interrupted);
             }
             Err(Abrupt::Thrown) => {
-                exec::capture_throw(ctx)?;
+                if let Err(Abrupt::Interrupted) = exec::capture_throw(ctx) {
+                    ctx.take_exception();
+                    return Err(Abrupt::Interrupted);
+                }
                 if !unwind(ctx, depth)? {
                     return Err(Abrupt::Thrown);
                 }

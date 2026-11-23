@@ -74,7 +74,20 @@ pub struct JsEngine {
 
 impl JsEngine {
     pub fn new(limits: EngineLimits) -> Result<Self, EngineError> {
-        let mut runtime = Runtime::new(limits).map_err(|_| EngineError::OutOfMemory)?;
+        let ledger = crate::ledger::HeapLedger::new(
+            limits.heap_bytes,
+            (limits.heap_bytes / 32).min(4096),
+        )
+        .map_err(|_| EngineError::OutOfMemory)?;
+        Self::new_with_ledger(limits, ledger)
+    }
+
+    pub fn new_with_ledger(
+        limits: EngineLimits,
+        ledger: crate::ledger::HeapLedger,
+    ) -> Result<Self, EngineError> {
+        let mut runtime =
+            Runtime::with_ledger(limits, ledger).map_err(|_| EngineError::OutOfMemory)?;
         let realm = runtime.default_realm();
         runtime
             .install_builtins(realm)
@@ -275,10 +288,21 @@ impl JsEngine {
 impl<'s> ExecCtx<'_, 's> {
     pub fn create_realm_with_builtins(&mut self) -> JsResult<RealmId> {
         let realm = self.runtime.create_realm().map_err(|_| self.throw_oom())?;
-        self.runtime.install_builtins(realm)?;
-        if self.runtime.vm.print_callback.is_some() {
-            self.runtime
-                .with_scope(realm, crate::builtins::vm_internal::install_print)?;
+        let setup = (|| {
+            self.runtime.install_builtins(realm)?;
+            if self.runtime.vm.print_callback.is_some() {
+                self.runtime
+                    .with_scope(realm, crate::builtins::vm_internal::install_print)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = setup {
+            let oom = self.is_oom();
+            self.runtime.unroot_realm(realm);
+            if oom {
+                return Err(self.throw_oom());
+            }
+            return Err(error);
         }
         Ok(realm)
     }
@@ -409,6 +433,9 @@ fn failure(runtime: &mut Runtime, error: Abrupt, phase: EvalPhase) -> EvalFailur
         return eval_failure(EngineError::Interrupted, phase, None, None);
     }
     if runtime.is_oom() {
+        runtime.vm.exception = None;
+        runtime.vm.oom_thrown = false;
+        runtime.vm.thrown_frames.clear();
         return eval_failure(
             EngineError::OutOfMemory,
             phase,

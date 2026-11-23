@@ -134,16 +134,19 @@ fn build_stack(
     ctx.runtime.vm.stack_capture = Some((target, pending.map(|(value, _)| value)));
     let thrown_frames = std::mem::take(&mut ctx.runtime.vm.thrown_frames);
     let result = build_stack_inner(ctx, target, skip, parse, save_frames);
+    let oom = result == Err(Abrupt::Thrown) && ctx.is_oom();
     ctx.take_exception();
     if result != Err(Abrupt::Interrupted)
-        && let Some((value, oom)) = pending
+        && !oom
+        && let Some((value, pending_oom)) = pending
     {
-        ctx.throw_value(value, oom);
+        ctx.throw_value(value, pending_oom);
     }
     ctx.runtime.vm.stack_capture = None;
     ctx.runtime.vm.thrown_frames = thrown_frames;
     match result {
         Ok(stack) => Ok(Some(stack)),
+        Err(Abrupt::Thrown) if oom => Err(ctx.throw_oom()),
         Err(Abrupt::Thrown) => Ok(Some(Value::NULL)),
         Err(Abrupt::Interrupted) => Err(Abrupt::Interrupted),
     }
@@ -169,6 +172,9 @@ fn build_stack_inner(
         }) {
             Ok(n) => n,
             Err(Abrupt::Thrown) => {
+                if ctx.is_oom() {
+                    return Err(Abrupt::Thrown);
+                }
                 ctx.take_exception();
                 0.0
             }
@@ -306,6 +312,7 @@ fn active_frame(heap: &Heap, frame: &CallFrame) -> ErrorFrame {
 struct StackText<'a> {
     ledger: &'a HeapLedger,
     units: TrackedVec<u16>,
+    error: Option<AllocError>,
 }
 
 impl StackText<'_> {
@@ -315,11 +322,18 @@ impl StackText<'_> {
         }
         Ok(())
     }
+
+    fn push_str(&mut self, text: &str) -> AllocResult<()> {
+        self.add(text.encode_utf16())
+    }
 }
 
 impl Write for StackText<'_> {
     fn write_str(&mut self, text: &str) -> std::fmt::Result {
-        self.add(text.encode_utf16()).map_err(|_| std::fmt::Error)
+        self.push_str(text).map_err(|error| {
+            self.error = Some(error);
+            std::fmt::Error
+        })
     }
 }
 
@@ -329,44 +343,37 @@ fn formatted_stack(ctx: &mut ExecCtx<'_, '_>, frames: &[ErrorFrame]) -> JsResult
         let mut text = StackText {
             ledger: &heap.ledger,
             units: TrackedVec::new(),
+            error: None,
         };
         for frame in frames {
-            let write = |text: &mut StackText<'_>, s: &str| {
-                text.write_str(s).map_err(|_| AllocError::Limit)
-            };
-            write(&mut text, "    at ")?;
+            text.push_str("    at ")?;
             if !matches!(frame.source, FrameSource::Parse { .. }) {
                 if let Some(name) = frame.name {
                     text.add(name_units(heap, name))?;
                 } else {
-                    write(&mut text, "<anonymous>")?;
+                    text.push_str("<anonymous>")?;
                 }
-                write(&mut text, " (")?;
+                text.push_str(" (")?;
             }
             if let Some((file, line, column)) = frame_location(heap, frame.source) {
                 match file {
-                    FrameFile::Utf8(file) => write(&mut text, file)?,
+                    FrameFile::Utf8(file) => text.push_str(file)?,
                     FrameFile::Js(file) => text.add(heap.string_units(file))?,
                 }
-                write!(&mut text, ":{line}:{column}").map_err(|_| AllocError::Limit)?;
+                write!(&mut text, ":{line}:{column}")
+                    .map_err(|_| text.error.unwrap_or(AllocError::Limit))?;
             } else {
-                write(
-                    &mut text,
-                    if matches!(frame.source, FrameSource::Native) {
-                        "native"
-                    } else {
-                        "missing"
-                    },
-                )?;
-            }
-            write(
-                &mut text,
-                if matches!(frame.source, FrameSource::Parse { .. }) {
-                    "\n"
+                text.push_str(if matches!(frame.source, FrameSource::Native) {
+                    "native"
                 } else {
-                    ")\n"
-                },
-            )?;
+                    "missing"
+                })?;
+            }
+            text.push_str(if matches!(frame.source, FrameSource::Parse { .. }) {
+                "\n"
+            } else {
+                ")\n"
+            })?;
         }
         let string = JsString::from_utf16(&heap.ledger, &text.units)?;
         Ok(Value::string(heap.strings.insert(&heap.ledger, string)?))
@@ -515,11 +522,16 @@ pub(crate) fn capture_throw(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
     match &ctx.heap().object(id).data {
         ObjectData::Error(_) => save_error_data(ctx, value, 0, None)?,
         ObjectData::DomException(_) => {
-            let _ = ctx.with_scope(|ctx| {
+            let result = ctx.with_scope(|ctx| {
                 let root = ctx.root(value)?;
                 save_dom_stack(ctx, root, 0)
             });
-            ctx.throw_value(value, false);
+            match result {
+                Ok(()) => ctx.throw_value(value, false),
+                Err(Abrupt::Interrupted) => return Err(Abrupt::Interrupted),
+                Err(Abrupt::Thrown) if ctx.is_oom() => return Err(Abrupt::Thrown),
+                Err(Abrupt::Thrown) => ctx.throw_value(value, false),
+            };
         }
         _ => {}
     }

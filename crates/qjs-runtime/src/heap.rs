@@ -54,8 +54,13 @@ pub struct Heap {
 
 impl Heap {
     pub fn new(limit: usize) -> AllocResult<Self> {
+        let ledger = HeapLedger::new(limit, (limit / 32).min(4096))?;
+        Self::with_ledger(ledger)
+    }
+
+    pub fn with_ledger(ledger: HeapLedger) -> AllocResult<Self> {
         let mut heap = Self {
-            ledger: HeapLedger::new(limit, (limit / 32).min(4096))?,
+            ledger,
             objects: Arena::new(),
             strings: Arena::new(),
             shapes: Arena::new(),

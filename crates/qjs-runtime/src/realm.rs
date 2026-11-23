@@ -5,7 +5,7 @@ use crate::arena::ArenaItem;
 use crate::atom::{Atom, PropKey};
 use crate::gc::{Trace, Tracer};
 use crate::heap::Heap;
-use crate::ledger::{AllocError, AllocResult, TrackedBox, TrackedVec};
+use crate::ledger::{AllocError, AllocResult, HeapLedger, TrackedBox, TrackedVec};
 use crate::object::{ArrayData, ErrorData, ErrorKind, NativeFunctionData, ObjectData, ObjectFlags};
 use crate::root::{Args, ExecCtx, Handle, RootScope};
 use crate::shape::{PropFlags, Shape, ShapeProp};
@@ -465,8 +465,13 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(limits: EngineLimits) -> AllocResult<Self> {
+        let ledger = HeapLedger::new(limits.heap_bytes, (limits.heap_bytes / 32).min(4096))?;
+        Self::with_ledger(limits, ledger)
+    }
+
+    pub fn with_ledger(limits: EngineLimits, ledger: HeapLedger) -> AllocResult<Self> {
         let mut runtime = Self {
-            heap: Heap::new(limits.heap_bytes)?,
+            heap: Heap::with_ledger(ledger)?,
             vm: VmState::new(limits),
             job_queue: TrackedVec::new(),
             realms: TrackedVec::new(),
@@ -521,6 +526,12 @@ impl Runtime {
             runtime.realms.push_reserved(realm);
             Ok(realm)
         })
+    }
+
+    pub(crate) fn unroot_realm(&mut self, realm: RealmId) {
+        if let Some(pos) = self.realms.iter().position(|&id| id == realm) {
+            self.realms.remove(pos);
+        }
     }
 
     pub fn install_builtins(&mut self, realm: RealmId) -> JsResult<()> {

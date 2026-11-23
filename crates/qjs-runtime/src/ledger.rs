@@ -66,6 +66,9 @@ impl HeapLedger {
     pub fn fail_after(&self, successful_charges: Option<usize>) {
         self.0.failpoint_countdown.set(successful_charges);
     }
+    pub fn failpoint_armed(&self) -> bool {
+        self.0.failpoint_countdown.get().is_some()
+    }
 
     pub fn charge_bytes(&self, bytes: usize) -> AllocResult<()> {
         self.charge(bytes, false)

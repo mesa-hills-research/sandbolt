@@ -166,6 +166,17 @@ pub(super) fn suspend(ctx: &mut ExecCtx<'_, '_>, index: usize, opcode: Opcode) -
         Opcode::Yield => CoroStatus::Yield,
         Opcode::YieldStar | Opcode::AsyncYieldStar => CoroStatus::YieldStar,
         Opcode::Await => {
+            // Reserve coroutine snapshot capacity before enqueuing the await
+            // reaction so an OOM cannot leave an orphaned resume job.
+            let start = frame.base as usize;
+            let len = ctx.runtime.vm.stack.len() - start;
+            ctx.allocate(|rt| {
+                let heap = &mut rt.heap;
+                let state = heap.coroutines.get_mut(id).unwrap();
+                state.stack.try_reserve_exact(&heap.ledger, len)?;
+                state.frames.try_reserve_exact(&heap.ledger, 1)?;
+                Ok(())
+            })?;
             await_value(ctx, id, raw)?;
             CoroStatus::Await
         }
@@ -541,14 +552,19 @@ pub(crate) fn resume_await<'s>(
     let id = owner_id(ctx, owner, kind)
         .ok_or_else(|| ctx.throw_type_error("invalid await continuation"))?;
     if kind == FunctionKind::Async {
+        if state(ctx, id).status != CoroStatus::Await {
+            return Ok(Value::UNDEFINED);
+        }
         resume(ctx, id, if reject { THROW } else { NEXT }, value)?;
     } else {
         if state(ctx, id).status == CoroStatus::AwaitReturn {
             state_mut(ctx, id).status = CoroStatus::Done;
             complete_request(ctx, id, value, true, reject)?;
-        } else {
+        } else if state(ctx, id).status == CoroStatus::Await {
             let result = resume(ctx, id, if reject { THROW } else { NEXT }, value);
             after_resume(ctx, id, result)?;
+        } else {
+            return Ok(Value::UNDEFINED);
         }
         drain(ctx, id)?;
     }

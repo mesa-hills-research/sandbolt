@@ -80,117 +80,124 @@ fn register_image(
     attributes: u8,
 ) -> JsResult<ModId> {
     let functions = load::load_functions(ctx, image, source)?;
-    let mut primary = None;
-    for module in &image.modules {
-        let code = functions[module.function as usize];
-        let name = compiled(ctx, code).key(module.name);
-        let id = if let Some(id) = cached(ctx, name, attributes) {
-            id
-        } else {
-            let id = register(ctx, name, attributes, Some(code), module.has_top_level_await)?;
-            for request in &module.requested_modules {
-                let name = compiled(ctx, code).key(request.name);
-                let mut attributes = NO_ATTRIBUTES;
-                let type_key = ctx.intern_str("type")?;
-                for attr in &request.attributes {
-                    let key = compiled(ctx, code).key(attr.key);
-                    if key != type_key {
-                        return Err(
-                            ctx.throw_error(ErrorKind::Syntax, "unsupported import attribute")
-                        );
+    let saved_modules = ctx.runtime.modules.len();
+    let result = (|| {
+        let mut primary = None;
+        for module in &image.modules {
+            let code = functions[module.function as usize];
+            let name = compiled(ctx, code).key(module.name);
+            let id = if let Some(id) = cached(ctx, name, attributes) {
+                id
+            } else {
+                let id = register(ctx, name, attributes, Some(code), module.has_top_level_await)?;
+                for request in &module.requested_modules {
+                    let name = compiled(ctx, code).key(request.name);
+                    let mut attributes = NO_ATTRIBUTES;
+                    let type_key = ctx.intern_str("type")?;
+                    for attr in &request.attributes {
+                        let key = compiled(ctx, code).key(attr.key);
+                        if key != type_key {
+                            return Err(
+                                ctx.throw_error(ErrorKind::Syntax, "unsupported import attribute")
+                            );
+                        }
+                        let v = compiled(ctx, code).key(attr.value);
+                        let v = atom_text(ctx, v)?;
+                        attributes = parse_type(ctx, &v)?;
                     }
-                    let v = compiled(ctx, code).key(attr.value);
-                    let v = atom_text(ctx, v)?;
-                    attributes = parse_type(ctx, &v)?;
+                    ctx.allocate(|rt| {
+                        rt.heap
+                            .modules
+                            .get_mut(id)
+                            .unwrap()
+                            .requests
+                            .push(&rt.heap.ledger, ModuleRequest { name, attributes })
+                    })?;
                 }
+                for &import in &module.imports {
+                    let name = import.import_name.map(|name| compiled(ctx, code).key(name));
+                    let import = ModuleImport {
+                        name,
+                        dependency: import.requested_module as usize,
+                        slot: import.closure_var as usize,
+                    };
+                    ctx.allocate(|rt| {
+                        rt.heap
+                            .modules
+                            .get_mut(id)
+                            .unwrap()
+                            .imports
+                            .push(&rt.heap.ledger, import)
+                    })?;
+                }
+                for &entry in &module.exports {
+                    let c = compiled(ctx, code);
+                    let entry = match entry {
+                        ExportEntry::Local {
+                            export_name,
+                            closure_var,
+                        } => ModuleExport::Local {
+                            name: c.key(export_name),
+                            slot: closure_var as usize,
+                        },
+                        ExportEntry::Indirect {
+                            export_name,
+                            requested_module,
+                            import_name,
+                        } => ModuleExport::Indirect {
+                            name: c.key(export_name),
+                            dependency: requested_module as usize,
+                            import_name: import_name.map(|name| c.key(name)),
+                        },
+                        ExportEntry::Star { requested_module } => {
+                            ModuleExport::Star(requested_module as usize)
+                        }
+                    };
+                    ctx.allocate(|rt| {
+                        rt.heap
+                            .modules
+                            .get_mut(id)
+                            .unwrap()
+                            .export_bindings
+                            .push(&rt.heap.ledger, entry)
+                    })?;
+                }
+                let count = compiled(ctx, code).closures.len();
                 ctx.allocate(|rt| {
                     rt.heap
                         .modules
                         .get_mut(id)
                         .unwrap()
-                        .requests
-                        .push(&rt.heap.ledger, ModuleRequest { name, attributes })
+                        .exports
+                        .try_reserve_exact(&rt.heap.ledger, count)
                 })?;
-            }
-            for &import in &module.imports {
-                let name = import.import_name.map(|name| compiled(ctx, code).key(name));
-                let import = ModuleImport {
-                    name,
-                    dependency: import.requested_module as usize,
-                    slot: import.closure_var as usize,
-                };
-                ctx.allocate(|rt| {
-                    rt.heap
-                        .modules
-                        .get_mut(id)
-                        .unwrap()
-                        .imports
-                        .push(&rt.heap.ledger, import)
-                })?;
-            }
-            for &entry in &module.exports {
-                let c = compiled(ctx, code);
-                let entry = match entry {
-                    ExportEntry::Local {
-                        export_name,
-                        closure_var,
-                    } => ModuleExport::Local {
-                        name: c.key(export_name),
-                        slot: closure_var as usize,
-                    },
-                    ExportEntry::Indirect {
-                        export_name,
-                        requested_module,
-                        import_name,
-                    } => ModuleExport::Indirect {
-                        name: c.key(export_name),
-                        dependency: requested_module as usize,
-                        import_name: import_name.map(|name| c.key(name)),
-                    },
-                    ExportEntry::Star { requested_module } => {
-                        ModuleExport::Star(requested_module as usize)
-                    }
-                };
-                ctx.allocate(|rt| {
-                    rt.heap
-                        .modules
-                        .get_mut(id)
-                        .unwrap()
-                        .export_bindings
-                        .push(&rt.heap.ledger, entry)
-                })?;
-            }
-            let count = compiled(ctx, code).closures.len();
-            ctx.allocate(|rt| {
-                rt.heap
-                    .modules
-                    .get_mut(id)
-                    .unwrap()
-                    .exports
-                    .try_reserve_exact(&rt.heap.ledger, count)
-            })?;
-            for slot in 0..count {
-                let binding = &compiled(ctx, code).closures[slot];
-                let value = if binding.kind == ClosureKind::ModuleDeclaration {
-                    let initial = if binding.lexical_tdz {
-                        Value::UNINITIALIZED
+                for slot in 0..count {
+                    let binding = &compiled(ctx, code).closures[slot];
+                    let value = if binding.kind == ClosureKind::ModuleDeclaration {
+                        let initial = if binding.lexical_tdz {
+                            Value::UNINITIALIZED
+                        } else {
+                            Value::UNDEFINED
+                        };
+                        Value::var_ref(new_cell(ctx, initial)?)
                     } else {
                         Value::UNDEFINED
                     };
-                    Value::var_ref(new_cell(ctx, initial)?)
-                } else {
-                    Value::UNDEFINED
-                };
-                record_mut(ctx, id).exports.push_reserved(value);
+                    record_mut(ctx, id).exports.push_reserved(value);
+                }
+                mark_unit(ctx, code, id)?;
+                id
+            };
+            if module.function == image.entry_function {
+                primary = Some(id);
             }
-            mark_unit(ctx, code, id)?;
-            id
-        };
-        if module.function == image.entry_function {
-            primary = Some(id);
         }
+        primary.ok_or_else(|| ctx.throw_error(ErrorKind::Syntax, "module entry record is missing"))
+    })();
+    if result.is_err() {
+        ctx.runtime.modules.truncate(saved_modules);
     }
-    primary.ok_or_else(|| ctx.throw_error(ErrorKind::Syntax, "module entry record is missing"))
+    result
 }
 
 fn mark_unit(ctx: &mut ExecCtx<'_, '_>, root: BcId, id: ModId) -> JsResult<()> {
@@ -371,21 +378,28 @@ fn resolve_request(
         ResolvedModule::Source { .. } => unreachable!(),
     };
     ctx.root(value)?;
-    let id = register(ctx, key, request.attributes, None, false)?;
-    let binding = new_cell(ctx, value)?;
-    ctx.root(Value::var_ref(binding))?;
-    ctx.allocate(|rt| {
-        let record = rt.heap.modules.get_mut(id).unwrap();
-        record.exports.try_reserve(&rt.heap.ledger, 1)?;
-        record.export_bindings.try_reserve(&rt.heap.ledger, 1)?;
-        record.exports.push_reserved(Value::var_ref(binding));
-        record.export_bindings.push_reserved(ModuleExport::Local {
-            name: Atom::get("default"),
-            slot: 0,
-        });
-        Ok(())
-    })?;
-    Ok(id)
+    let saved_modules = ctx.runtime.modules.len();
+    let result = (|| {
+        let id = register(ctx, key, request.attributes, None, false)?;
+        let binding = new_cell(ctx, value)?;
+        ctx.root(Value::var_ref(binding))?;
+        ctx.allocate(|rt| {
+            let record = rt.heap.modules.get_mut(id).unwrap();
+            record.exports.try_reserve(&rt.heap.ledger, 1)?;
+            record.export_bindings.try_reserve(&rt.heap.ledger, 1)?;
+            record.exports.push_reserved(Value::var_ref(binding));
+            record.export_bindings.push_reserved(ModuleExport::Local {
+                name: Atom::get("default"),
+                slot: 0,
+            });
+            Ok(())
+        })?;
+        Ok(id)
+    })();
+    if result.is_err() {
+        ctx.runtime.modules.truncate(saved_modules);
+    }
+    result
 }
 
 fn bytes_module(ctx: &mut ExecCtx<'_, '_>, bytes: &[u8]) -> JsResult<Value> {
@@ -448,6 +462,23 @@ fn link(ctx: &mut ExecCtx<'_, '_>, root: ModId) -> JsResult<()> {
         if result.is_err() {
             module.dependencies.clear();
             module.namespace_bindings.clear();
+            let code = module.code;
+            for index in 0..module.imports.len() {
+                let slot = module.imports[index].slot;
+                if let Some(entry) = module.exports.get_mut(slot) {
+                    *entry = Value::UNDEFINED;
+                }
+            }
+            if let Some(code) = code
+                && let Some(compiled) = ctx
+                    .runtime
+                    .heap
+                    .bytecode
+                    .get_mut(code)
+                    .and_then(|entry| entry.compiled.as_mut())
+            {
+                compiled.hoisted.clear();
+            }
         }
     }
     result
@@ -778,7 +809,7 @@ fn evaluate(ctx: &mut ExecCtx<'_, '_>, id: ModId) -> JsResult<Value> {
     let result = evaluate_inner(ctx, id, &mut stack);
     if result == Err(Abrupt::Thrown) {
         while let Some(module) = stack.pop() {
-            fail_pending(ctx, module)?;
+            let _ = fail_pending(ctx, module);
         }
     }
     result
@@ -793,6 +824,7 @@ fn evaluate_inner(
     match record(ctx, id).status {
         ModuleStatus::Evaluated => return Ok(Value::UNDEFINED),
         ModuleStatus::Error => {
+            record_mut(ctx, id).waiting_host = false;
             return Err(ctx.throw_value(record(ctx, id).evaluation_error.unwrap(), false));
         }
         ModuleStatus::Async | ModuleStatus::Waiting => {
@@ -888,11 +920,21 @@ fn execute_body(ctx: &mut ExecCtx<'_, '_>, id: ModId) -> JsResult<Value> {
             if code.is_some_and(|code| compiled(ctx, code).kind == FunctionKind::Async)
                 || record(ctx, id).has_await =>
         {
-            let result = ctx.root(result)?;
-            let cap = ensure_capability(ctx, id)?;
-            record_mut(ctx, id).status = ModuleStatus::Async;
-            then_module(ctx, ctx.get(result), id, MODULE_DONE, MODULE_FAILED)?;
-            Ok(cap.0)
+            let attach = (|| {
+                let result = ctx.root(result)?;
+                let cap = ensure_capability(ctx, id)?;
+                record_mut(ctx, id).status = ModuleStatus::Async;
+                then_module(ctx, ctx.get(result), id, MODULE_DONE, MODULE_FAILED)?;
+                Ok(cap.0)
+            })();
+            match attach {
+                Ok(promise) => Ok(promise),
+                Err(Abrupt::Thrown) => {
+                    let _ = fail_pending(ctx, id);
+                    Err(Abrupt::Thrown)
+                }
+                Err(error) => Err(error),
+            }
         }
         Ok(_) => {
             succeed(ctx, id)?;
@@ -904,12 +946,23 @@ fn execute_body(ctx: &mut ExecCtx<'_, '_>, id: ModId) -> JsResult<Value> {
 fn fail_pending(ctx: &mut ExecCtx<'_, '_>, id: ModId) -> JsResult<()> {
     let reason = ctx.pending_exception().unwrap_or(Value::UNDEFINED);
     let oom = ctx.is_oom();
-    ctx.with_scope(|ctx| {
+    let outcome = ctx.with_scope(|ctx| {
         let root = ctx.root(reason)?;
         fail(ctx, id, reason)?;
         ctx.throw_value(ctx.get(root), oom);
         Ok(())
-    })
+    });
+    if outcome.is_err() {
+        if record(ctx, id).status != ModuleStatus::Error {
+            let module = record_mut(ctx, id);
+            module.status = ModuleStatus::Error;
+            module.evaluation_error = Some(reason);
+        }
+        if !ctx.is_oom() {
+            ctx.throw_value(reason, oom);
+        }
+    }
+    outcome
 }
 
 fn fail(ctx: &mut ExecCtx<'_, '_>, id: ModId, reason: Value) -> JsResult<()> {
@@ -981,7 +1034,7 @@ pub(crate) fn module_job<'s>(
             if *pending == 0
                 && let Err(error) = execute_body(ctx, module)
             {
-                if error == Abrupt::Interrupted {
+                if error == Abrupt::Interrupted || ctx.is_oom() {
                     return Err(error);
                 }
                 ctx.take_exception();

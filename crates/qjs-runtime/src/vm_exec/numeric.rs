@@ -2,7 +2,7 @@ use qjs_bigint::{BigInt, BigIntError, BigIntHost};
 use qjs_bytecode::Opcode;
 
 use crate::heap::{BigIntData, Heap};
-use crate::ledger::{HeapLedger, TrackedVec};
+use crate::ledger::{AllocError, HeapLedger, TrackedVec};
 use crate::object::ErrorKind;
 use crate::ops::convert::{self, PreferredType};
 use crate::root::{ExecCtx, Handle};
@@ -12,13 +12,23 @@ struct Host<'a> {
     ledger: &'a HeapLedger,
     handler: &'a mut Option<Box<dyn FnMut() -> bool>>,
     charged: usize,
+    failpoint: bool,
+}
+
+impl Host<'_> {
+    fn map_alloc(&mut self, error: AllocError) -> BigIntError {
+        if error == AllocError::Failpoint {
+            self.failpoint = true;
+        }
+        BigIntError::OutOfMemory
+    }
 }
 
 impl BigIntHost for Host<'_> {
     fn charge(&mut self, bytes: usize) -> Result<(), BigIntError> {
         self.ledger
             .charge_bytes(bytes)
-            .map_err(|_| BigIntError::OutOfMemory)?;
+            .map_err(|e| self.map_alloc(e))?;
         self.charged += bytes;
         Ok(())
     }
@@ -43,18 +53,20 @@ fn with_host<R>(
 ) -> JsResult<R> {
     ctx.runtime.allocation_point();
     for attempt in 0..2 {
-        let result = {
+        let (result, failpoint) = {
             let ledger = ctx.heap().ledger.clone();
             let mut host = Host {
                 ledger: &ledger,
                 handler: &mut ctx.runtime.vm.interrupt_handler,
                 charged: 0,
+                failpoint: false,
             };
-            run(&mut ctx.runtime.heap, &mut host)
+            let result = run(&mut ctx.runtime.heap, &mut host);
+            (result, host.failpoint)
         };
         match result {
             Ok(value) => return Ok(value),
-            Err(BigIntError::OutOfMemory) if attempt == 0 => ctx.collect(),
+            Err(BigIntError::OutOfMemory) if attempt == 0 && !failpoint => ctx.collect(),
             Err(error) => {
                 return Err(match error {
                     BigIntError::OutOfMemory => ctx.throw_oom(),
@@ -87,7 +99,7 @@ fn read(heap: &Heap, host: &mut Host<'_>, value: Value) -> Result<BigInt, BigInt
     let mut bytes = TrackedVec::new();
     bytes
         .try_reserve_exact(&heap.ledger, data.limbs.len() * 8 + 1)
-        .map_err(|_| BigIntError::OutOfMemory)?;
+        .map_err(|e| host.map_alloc(e))?;
     if data.negative {
         bytes.push_reserved(b'-');
     }
@@ -102,7 +114,7 @@ fn read(heap: &Heap, host: &mut Host<'_>, value: Value) -> Result<BigInt, BigInt
     BigInt::parse_radix(std::str::from_utf8(&bytes).unwrap(), 16, host)
 }
 
-fn store(heap: &mut Heap, bigint: &BigInt) -> Result<Value, BigIntError> {
+fn store(heap: &mut Heap, host: &mut Host<'_>, bigint: &BigInt) -> Result<Value, BigIntError> {
     if let Some(value) = bigint.to_i64_exact().and_then(Value::short_bigint) {
         return Ok(value);
     }
@@ -111,7 +123,7 @@ fn store(heap: &mut Heap, bigint: &BigInt) -> Result<Value, BigIntError> {
     let mut limbs = TrackedVec::new();
     limbs
         .try_reserve_exact(&heap.ledger, bigint.limbs().len() * 2)
-        .map_err(|_| BigIntError::OutOfMemory)?;
+        .map_err(|e| host.map_alloc(e))?;
     for &word in bigint.limbs() {
         let word = if negative {
             let (word, next) = (!word).overflowing_add(u64::from(carry));
@@ -129,14 +141,14 @@ fn store(heap: &mut Heap, bigint: &BigInt) -> Result<Value, BigIntError> {
     let id = heap
         .bigints
         .insert(&heap.ledger, BigIntData { negative, limbs })
-        .map_err(|_| BigIntError::OutOfMemory)?;
+        .map_err(|e| host.map_alloc(e))?;
     Ok(Value::bigint(id))
 }
 
 pub(super) fn parse_bigint(ctx: &mut ExecCtx<'_, '_>, text: &str) -> JsResult<Value> {
     with_host(ctx, |heap, host| {
         let value = BigInt::from_str_js(text, host)?;
-        store(heap, &value)
+        store(heap, host, &value)
     })
 }
 
@@ -272,7 +284,7 @@ pub(super) fn binary<'s>(
                     Xor => a.bitxor(&b, host)?,
                     _ => unreachable!(),
                 };
-                store(heap, &result)
+                store(heap, host, &result)
             });
         }
         _ => return Err(ctx.throw_type_error("cannot mix BigInt and Number")),
@@ -336,7 +348,7 @@ pub(super) fn unary<'s>(
                 }
                 _ => unreachable!(),
             };
-            store(heap, &result)
+            store(heap, host, &result)
         })?;
         Ok((raw, result))
     } else {
