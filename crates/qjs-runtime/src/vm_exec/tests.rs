@@ -291,6 +291,70 @@ fn generator_captures_live_locals_across_suspension() {
 }
 
 #[test]
+fn initial_yield_requires_a_generator_frame() {
+    let image = ProgramImage {
+        functions: vec![FunctionBytecode {
+            code: vec![Opcode::InitialYield as u8, Opcode::ReturnUndef as u8],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    assert!(matches!(
+        engine.execute_image(&image, None),
+        Err(EngineError::Thrown { message, .. }) if message.contains("function cannot suspend")
+    ));
+}
+
+#[test]
+fn generators_read_the_prototype_after_parameter_initialization() {
+    assert_eq!(
+        run(r#"
+        let log = [];
+        function* g(a = (log.push('parameter'), g.prototype = null)) {
+            log.push('body');
+        }
+        async function* ag(a = (log.push('async parameter'), ag.prototype = null)) {}
+        let proto = g.prototype;
+        let asyncProto = ag.prototype;
+        let it = g();
+        let asyncIt = ag();
+        log.push(Object.getPrototypeOf(it) === proto);
+        log.push(Object.getPrototypeOf(asyncIt) === asyncProto);
+        it.next();
+        log.join(',')
+    "#),
+        "parameter,async parameter,false,false,body"
+    );
+}
+
+#[test]
+fn async_generator_bare_return_does_not_await() {
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let opts = EvalOptions::default();
+    engine
+        .eval(
+            r#"
+        var log = [];
+        async function* fallthrough() {}
+        async function* bareReturn() { return; }
+        async function* valueReturn() { return undefined; }
+        Promise.resolve().then(() => log.push('tick 1')).then(() => log.push('tick 2'));
+        fallthrough().next().then(() => log.push('fallthrough'));
+        bareReturn().next().then(() => log.push('bare'));
+        valueReturn().next().then(() => log.push('value'));
+    "#,
+            opts.clone(),
+        )
+        .unwrap();
+    engine.run_jobs().unwrap();
+    assert_eq!(
+        engine.eval_to_string("log.join(',')", opts).unwrap(),
+        "tick 1,fallthrough,bare,tick 2,value"
+    );
+}
+
+#[test]
 fn generator_delegation_and_throw_reenter_the_suspended_frame() {
     assert_eq!(
         run(r#"

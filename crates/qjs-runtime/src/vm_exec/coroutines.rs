@@ -22,9 +22,13 @@ const RETURN: u16 = 1;
 const THROW: u16 = 2;
 
 pub(crate) fn enter(ctx: &mut ExecCtx<'_, '_>, index: usize, kind: FunctionKind) -> JsResult<()> {
-    if kind == FunctionKind::Normal {
-        return Ok(());
+    if kind == FunctionKind::Async {
+        start(ctx, index, kind)?;
     }
+    Ok(())
+}
+
+fn start(ctx: &mut ExecCtx<'_, '_>, index: usize, kind: FunctionKind) -> JsResult<CoroId> {
     let frame = ctx.runtime.vm.frames[index];
     let id = ctx.allocate(|rt| {
         let heap = &mut rt.heap;
@@ -85,7 +89,7 @@ pub(crate) fn enter(ctx: &mut ExecCtx<'_, '_>, index: usize, kind: FunctionKind)
             let capability = capability(ctx)?;
             state_mut(ctx, id).capability = capability;
         }
-        Ok(())
+        Ok(id)
     })
 }
 
@@ -142,9 +146,19 @@ fn scoped_frame(
 
 pub(super) fn suspend(ctx: &mut ExecCtx<'_, '_>, index: usize, opcode: Opcode) -> JsResult<Value> {
     let frame = ctx.runtime.vm.frames[index];
-    let id = frame
-        .coroutine
-        .ok_or_else(|| ctx.throw_type_error("function cannot suspend"))?;
+    let id = match frame.coroutine {
+        Some(id) => id,
+        None if opcode == Opcode::InitialYield => {
+            let kind = compiled(ctx, frame.code.unwrap()).kind;
+            if !matches!(kind, FunctionKind::Generator | FunctionKind::AsyncGenerator) {
+                return Err(ctx.throw_type_error("function cannot suspend"));
+            }
+            // Generators read the prototype after parameter initialization.
+            start(ctx, index, kind)?
+        }
+        None => return Err(ctx.throw_type_error("function cannot suspend")),
+    };
+    let frame = ctx.runtime.vm.frames[index];
     let kind = state(ctx, id).kind;
     let raw = *ctx.runtime.vm.stack.last().unwrap();
     let status = match opcode {

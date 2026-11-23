@@ -1030,6 +1030,9 @@ impl Emitter<'_> {
             self.plain(Yield);
             let done = self.label();
             self.if_false(done);
+            if asynchronous {
+                self.await_value();
+            }
             self.return_value()?;
             self.mark(done);
             return Ok(());
@@ -1088,6 +1091,9 @@ impl Emitter<'_> {
         self.mark(no_return);
         for _ in 0..3 {
             self.plain(Nip);
+        }
+        if asynchronous {
+            self.await_value();
         }
         self.return_value()?;
         self.mark(throwing);
