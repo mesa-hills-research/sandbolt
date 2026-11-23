@@ -36,16 +36,26 @@ pub fn construct<'s>(
     invoke(ctx, ctx.get(callee), ctx.get(new_target), args, Some(id))
 }
 
-pub(crate) fn function_realm(heap: &Heap, mut id: ObjId) -> Option<RealmId> {
+fn lookup_function_realm(heap: &Heap, mut id: ObjId) -> Result<Option<RealmId>, ()> {
     loop {
         match &heap.object(id).data {
-            ObjectData::NativeFunction(f) => return Some(f.realm),
-            ObjectData::BytecodeFunction(f) => return Some(f.realm),
+            ObjectData::NativeFunction(f) => return Ok(Some(f.realm)),
+            ObjectData::BytecodeFunction(f) => return Ok(Some(f.realm)),
             ObjectData::BoundFunction(f) => id = f.target,
-            ObjectData::Proxy(p) => id = p.target?,
-            _ => return None,
+            ObjectData::Proxy(p) => id = p.target.ok_or(())?,
+            _ => return Ok(None),
         }
     }
+}
+
+pub(crate) fn function_realm(heap: &Heap, id: ObjId) -> Option<RealmId> {
+    lookup_function_realm(heap, id).ok().flatten()
+}
+
+pub(crate) fn get_function_realm(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> JsResult<RealmId> {
+    lookup_function_realm(ctx.heap(), id)
+        .map(|realm| realm.unwrap_or(ctx.realm_id()))
+        .map_err(|()| ctx.throw_type_error("Proxy is revoked"))
 }
 
 fn invoke<'s>(
@@ -93,6 +103,18 @@ fn invoke<'s>(
 }
 
 pub(crate) fn enter(
+    ctx: &mut ExecCtx<'_, '_>,
+    base: usize,
+    count: usize,
+    new_target: Option<ObjId>,
+) -> JsResult<()> {
+    let realm = ctx.realm;
+    let result = enter_call(ctx, base, count, new_target);
+    ctx.realm = realm;
+    result
+}
+
+fn enter_call(
     ctx: &mut ExecCtx<'_, '_>,
     base: usize,
     mut count: usize,
@@ -156,7 +178,10 @@ pub(crate) fn enter(
                 }
             }
             ObjectData::NativeFunction(native) if new_target.is_none() => {
+                let caller_realm = ctx.realm;
                 let id = native.function.0;
+                ctx.realm = native.realm;
+                // An inlined call still enters the builtin's realm.
                 if let Some((new_count, target)) =
                     exec::transform_native_call(ctx, id, base, count)?
                 {
@@ -167,6 +192,7 @@ pub(crate) fn enter(
                     new_target = target;
                     ctx.check_interrupt()?;
                 } else {
+                    ctx.realm = caller_realm;
                     break;
                 }
             }
@@ -180,7 +206,10 @@ pub(crate) fn enter(
         }
         ObjectData::BytecodeFunction(f) => {
             if f.is_class_constructor && new_target.is_none() {
-                return Err(ctx.throw_type_error("class constructors must be invoked with 'new'"));
+                let realm = f.realm;
+                return Err(ctx.with_realm(realm, |ctx| {
+                    ctx.throw_type_error("class constructors must be invoked with 'new'")
+                }));
             }
             (f.realm, Some(f.code), !f.is_derived_constructor)
         }
@@ -229,6 +258,7 @@ pub(crate) fn enter(
     let frame = CallFrame {
         callee,
         realm,
+        caller_realm: ctx.realm,
         code,
         new_target,
         pc: 0,

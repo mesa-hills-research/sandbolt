@@ -1266,9 +1266,6 @@ fn downgrade(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> JsResult<()> {
 }
 
 fn set_length(ctx: &mut ExecCtx<'_, '_>, id: ObjId, desc: PropertyDescriptor) -> JsResult<bool> {
-    if desc.configurable == Some(true) || desc.enumerable == Some(true) || desc.is_accessor() {
-        return Ok(false);
-    }
     let length = if let Some(value) = desc.value {
         ctx.root(Value::object(id))?;
         let value = ctx.root(value)?;
@@ -1281,6 +1278,9 @@ fn set_length(ctx: &mut ExecCtx<'_, '_>, id: ObjId, desc: PropertyDescriptor) ->
     } else {
         None
     };
+    if desc.configurable == Some(true) || desc.enumerable == Some(true) || desc.is_accessor() {
+        return Ok(false);
+    }
     let object = ctx.heap().object(id);
     let ObjectData::Array(array) = &object.data else {
         unreachable!()

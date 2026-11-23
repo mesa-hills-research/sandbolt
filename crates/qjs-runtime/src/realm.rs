@@ -74,6 +74,7 @@ macro_rules! intrinsics {
             pub object_ctor: ObjId,
             pub function_proto: ObjId,
             pub function_ctor: ObjId,
+            pub throw_type_error: ObjId,
             $( pub $proto: ObjId, pub $ctor: ObjId, )+
             pub array_iterator_proto: ObjId,
             pub string_iterator_proto: ObjId,
@@ -99,6 +100,7 @@ macro_rules! intrinsics {
                 self.object_ctor.trace(tracer);
                 self.function_proto.trace(tracer);
                 self.function_ctor.trace(tracer);
+                self.throw_type_error.trace(tracer);
                 $( self.$proto.trace(tracer); self.$ctor.trace(tracer); )+
                 self.array_iterator_proto.trace(tracer);
                 self.string_iterator_proto.trace(tracer);
@@ -124,6 +126,7 @@ macro_rules! intrinsics {
             let proto = ordinary | ObjectFlags::IS_PROTOTYPE;
             let $object = heap.insert_object(None, proto | ObjectFlags::IMMUTABLE_PROTO, ObjectData::Ordinary)?;
             let function_proto = heap.insert_object(Some($object), proto, ObjectData::Ordinary)?;
+            let throw_type_error = heap.insert_object(Some(function_proto), ObjectFlags::default(), ObjectData::Ordinary)?;
             let global_object = heap.insert_object(Some($object), ordinary, ObjectData::Ordinary)?;
             $( let $proto = heap.insert_object(Some($parent), proto, ObjectData::Ordinary)?; )+
             let array_iterator_proto = heap.insert_object(Some($iterator), proto, ObjectData::Ordinary)?;
@@ -146,6 +149,7 @@ macro_rules! intrinsics {
             // Constructor identity is installed after the realm has an ID.
             let realm = heap.realms.insert_reserved(Realm {
                 global_object, object_proto: $object, object_ctor: function_proto, function_proto, function_ctor: function_proto,
+                throw_type_error,
                 $( $proto, $ctor: function_proto, )+
                 array_iterator_proto,
                 string_iterator_proto,
@@ -165,6 +169,12 @@ macro_rules! intrinsics {
             let constructors = (|| {
                 let data = native_payload(heap, realm, NativeFnId::EMPTY)?;
                 heap.objects.get_mut(function_proto).unwrap().data = data;
+                let data = native_payload(heap, realm, crate::builtins::core::THROW_TYPE_ERROR)?;
+                heap.objects.get_mut(throw_type_error).unwrap().data = data;
+                let empty = JsString::from_str(&heap.ledger, "")?;
+                let empty = Value::string(heap.strings.insert(&heap.ledger, empty)?);
+                install_property(heap, throw_type_error, PropKey::atom(Atom::LENGTH), PropFlags::default(), Value::int32(0))?;
+                install_property(heap, throw_type_error, PropKey::atom(Atom::NAME), PropFlags::default(), empty)?;
                 let data = TrackedBox::new(&heap.ledger, ArrayData { elements: TrackedVec::new(), length: 0, length_writable: true, realm })?;
                 let array = heap.objects.get_mut($array).unwrap();
                 array.flags |= ObjectFlags::IS_EXOTIC | ObjectFlags::FAST_ARRAY;

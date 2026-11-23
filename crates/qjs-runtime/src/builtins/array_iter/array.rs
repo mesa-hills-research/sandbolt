@@ -4,12 +4,12 @@ use crate::builtins::{
 };
 use crate::ledger::{TrackedBox, TrackedVec};
 use crate::object::ArrayData;
-use crate::ops::call::construct;
+use crate::ops::call::{construct, get_function_realm};
 use crate::ops::compare::{same_value_zero, strict_eq};
 use crate::ops::convert::{to_integer_or_infinity, to_number, to_object, to_string};
 use crate::ops::property::{delete_property, has_property, set_property};
 use crate::shape::PropFlags;
-use crate::value::{ObjId, RealmId, ValueKind};
+use crate::value::{ObjId, ValueKind};
 
 mod from_async;
 mod methods;
@@ -113,14 +113,14 @@ pub(super) fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
     let attrs = PropFlags::WRITABLE | PropFlags::CONFIGURABLE;
     let k = key(ctx, "Array")?;
     define_data(ctx, global, k, ctor, attrs)?;
-    for (name, op) in [
-        ("isArray", IS_ARRAY),
-        ("from", FROM),
-        ("of", OF),
-        ("fromAsync", FROM_ASYNC),
+    for (name, op, length) in [
+        ("isArray", IS_ARRAY, 1),
+        ("from", FROM, 1),
+        ("of", OF, 0),
+        ("fromAsync", FROM_ASYNC, 1),
     ] {
         let k = key(ctx, name)?;
-        install_method(ctx, ctor, k, id(op), name, 1)?;
+        install_method(ctx, ctor, k, id(op), name, length)?;
     }
     install_accessor(
         ctx,
@@ -283,22 +283,6 @@ pub(super) fn is_array(ctx: &mut ExecCtx<'_, '_>, value: Value) -> JsResult<bool
     }
 }
 
-pub(super) fn function_realm(ctx: &mut ExecCtx<'_, '_>, mut id: ObjId) -> JsResult<RealmId> {
-    loop {
-        match &ctx.heap().object(id).data {
-            ObjectData::NativeFunction(data) => return Ok(data.realm),
-            ObjectData::BytecodeFunction(data) => return Ok(data.realm),
-            ObjectData::BoundFunction(data) => id = data.target,
-            ObjectData::Proxy(data) => {
-                id = data
-                    .target
-                    .ok_or_else(|| ctx.throw_type_error("Proxy is revoked"))?
-            }
-            _ => return Ok(ctx.realm_id()),
-        }
-    }
-}
-
 pub(super) fn prototype_from_constructor(
     ctx: &mut ExecCtx<'_, '_>,
     constructor: Value,
@@ -310,7 +294,7 @@ pub(super) fn prototype_from_constructor(
         ctx.root(Value::object(proto))?;
         return Ok(proto);
     }
-    let realm = function_realm(ctx, constructor.as_object().unwrap())?;
+    let realm = get_function_realm(ctx, constructor.as_object().unwrap())?;
     Ok(intrinsic(ctx.heap().realm(realm)))
 }
 
@@ -382,7 +366,7 @@ fn species_create<'s>(
     let mut value = named(ctx, object, "constructor")?;
     let c = ctx.root(value)?;
     if constructor(ctx, value) {
-        let realm = function_realm(ctx, value.as_object().unwrap())?;
+        let realm = get_function_realm(ctx, value.as_object().unwrap())?;
         if realm != ctx.realm_id() && value == Value::object(ctx.heap().realm(realm).array_ctor) {
             value = Value::UNDEFINED;
         }

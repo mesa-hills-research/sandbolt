@@ -13,7 +13,8 @@ const BIND: u16 = 0x42;
 const CALL: u16 = 0x43;
 const TO_STRING: u16 = 0x44;
 const HAS_INSTANCE: u16 = 0x45;
-const THROW_TYPE_ERROR: u16 = 0x46;
+const THROW_TYPE_ERROR_OP: u16 = 0x46;
+pub(crate) const THROW_TYPE_ERROR: NativeFnId = id(THROW_TYPE_ERROR_OP);
 
 const METHODS: &[(u16, &str, u32)] = &[
     (APPLY, "apply", 2),
@@ -38,15 +39,7 @@ pub(super) fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
     let key = symbol_key(ctx, WellKnown::HasInstance);
     let has_instance = make_native_fn(ctx, id(HAS_INSTANCE), "[Symbol.hasInstance]", 1, false)?;
     define_data(ctx, proto, key, has_instance, PropFlags::default())?;
-    let thrower = make_native_fn(ctx, id(THROW_TYPE_ERROR), "", 0, false)?;
-    for key in ["length", "name"] {
-        let desc = PropertyDescriptor {
-            configurable: Some(false),
-            ..PropertyDescriptor::default()
-        };
-        define_or_throw(ctx, thrower, Atom::get(key), desc)?;
-    }
-    property::prevent_extensions(ctx, thrower)?;
+    let thrower = ctx.root(Value::object(ctx.realm().throw_type_error))?;
     for key in ["caller", "arguments"] {
         let desc = PropertyDescriptor {
             get: Some(thrower),
@@ -68,9 +61,7 @@ pub(super) fn dispatch<'s>(
 ) -> JsResult<Value> {
     match op {
         EMPTY => Ok(Value::UNDEFINED),
-        THROW_TYPE_ERROR => {
-            Err(ctx.throw_type_error("access to caller or arguments is restricted"))
-        }
+        THROW_TYPE_ERROR_OP => throw_type_error(ctx, this),
         APPLY => {
             require_callable(ctx, ctx.get(this))?;
             let receiver = arg(ctx, args, 0)?;
@@ -95,6 +86,19 @@ pub(super) fn dispatch<'s>(
         }
         _ => Err(ctx.throw_type_error("unknown Function builtin")),
     }
+}
+
+fn throw_type_error<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>) -> JsResult<Value> {
+    // QuickJS exposes no caller or arguments for sloppy ordinary functions.
+    if let Some(id) = ctx.get(this).as_object()
+        && let ObjectData::BytecodeFunction(data) = &ctx.heap().object(id).data
+        && let Some(code) = &ctx.heap().bytecode.get(data.code).unwrap().compiled
+        && !code.strict
+        && code.flags.has_prototype
+    {
+        return Ok(Value::UNDEFINED);
+    }
+    Err(ctx.throw_type_error("access to caller or arguments is restricted"))
 }
 
 fn rest(args: Args<'_>) -> Args<'_> {

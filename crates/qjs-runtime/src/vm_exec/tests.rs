@@ -98,6 +98,120 @@ fn applies_and_constructs_proxies() {
     );
 }
 
+fn run_with_other_realm(script: &str) -> String {
+    use crate::Value;
+    use crate::builtins::define_data;
+    use crate::shape::PropFlags;
+
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let realm = engine.default_realm();
+    engine
+        .runtime_mut()
+        .with_scope(realm, |ctx| {
+            let other = ctx.create_realm_with_builtins()?;
+            let other = ctx.root(Value::object(ctx.heap().realm(other).global_object))?;
+            let global = ctx.root(Value::object(ctx.realm().global_object))?;
+            let key = ctx.intern_str("other")?;
+            define_data(ctx, global, key, other, PropFlags::DEFAULT_DATA)?;
+            Ok::<_, crate::Abrupt>(())
+        })
+        .unwrap();
+    engine
+        .eval_to_string(script, EvalOptions::default())
+        .unwrap()
+}
+
+#[test]
+fn shares_a_frozen_throw_type_error_within_each_realm() {
+    assert_eq!(
+        run_with_other_realm(
+                r#"
+                const caller = Object.getOwnPropertyDescriptor(Function.prototype, 'caller');
+                const args = Object.getOwnPropertyDescriptor(Function.prototype, 'arguments');
+                const thrower = caller.get;
+                const otherThrower = Object.getOwnPropertyDescriptor(other.Function.prototype, 'caller').get;
+                function strict() { 'use strict'; return arguments; }
+                function nonSimple(x = 0) { return arguments; }
+                function sloppy() {}
+                const callee = o => Object.getOwnPropertyDescriptor(o, 'callee');
+                delete Function.prototype.caller;
+                delete Function.prototype.arguments;
+                [caller.set === thrower, args.get === thrower, args.set === thrower,
+                 callee(strict()).get === thrower, callee(strict()).set === thrower,
+                 callee(nonSimple()).get === thrower, thrower !== otherThrower,
+                 Object.getOwnPropertyNames(thrower).join(','), Object.isFrozen(thrower),
+                 thrower.call(sloppy) === undefined].join(';');
+                "#),
+        "true;true;true;true;true;true;true;length,name;true;true"
+    );
+}
+
+#[test]
+fn call_and_construct_choose_the_error_realm() {
+    assert_eq!(
+        run_with_other_realm(r#"
+            function throws(ctor, run) {
+                try { run(); } catch (e) { return e.constructor === ctor; }
+                return false;
+            }
+            const base = other.eval('(class {})');
+            const derived = other.eval('(class extends Object { constructor() { return null; } })');
+            const uninitialized = other.eval('(class extends Object { constructor() {} })');
+            const tdz = other.eval('(function () { v = 1; let v; })');
+            function revokeDuringPrototypeLookup(ctor) {
+                const handle = Proxy.revocable(ctor, { get() { handle.revoke(); } });
+                return throws(TypeError, () => new handle.proxy());
+            }
+            [throws(other.TypeError, () => base()), throws(TypeError, () => new derived()),
+             throws(ReferenceError, () => new uninitialized()), throws(ReferenceError, () => tdz()),
+             throws(other.TypeError, () => other.Function.prototype.apply.call(() => {}, null, 1)),
+             throws(other.TypeError, () => other.Function.prototype.call.call(0)),
+             throws(other.TypeError, () => other.Reflect.apply(() => {}, null, 1)),
+             revokeDuringPrototypeLookup(function () {}), revokeDuringPrototypeLookup(Function)]
+                 .join(',');
+        "#),
+        "true,true,true,true,true,true,true,true,true"
+    );
+}
+
+#[test]
+fn array_length_coerces_before_rejecting_descriptor_flags() {
+    assert_eq!(
+        run(r#"
+            let calls = 0;
+            const array = [];
+            Object.defineProperty(array, 'length', { writable: false });
+            const value = { valueOf() { calls++; return -1; } };
+            let rangeError = false;
+            try {
+                Reflect.defineProperty(array, 'length', { value, configurable: true });
+            } catch (e) {
+                rangeError = e instanceof RangeError;
+            }
+            [calls, rangeError, array.length, Array.of.length].join(',');
+        "#),
+        "2,true,0,0"
+    );
+}
+
+#[test]
+fn small_array_and_typed_array_sorts_compare_identical_values() {
+    assert_eq!(
+        run(r#"
+            const o = {};
+            function calls(list, method) {
+                let n = 0;
+                list[method]((a, b) => { if (a === b) n++; return 0; });
+                return n;
+            }
+            [calls([o, o, o], 'sort'), calls([o, o, o], 'toSorted'),
+             calls(new Int8Array([1, 1, 1]), 'sort'),
+             calls(new BigInt64Array([1n, 1n, 1n]), 'toSorted')].join(',');
+        "#),
+        "2,2,2,2"
+    );
+}
+
 #[test]
 fn interrupts_backward_branches_without_running_finally() {
     let mut engine = JsEngine::new(EngineLimits::default()).unwrap();

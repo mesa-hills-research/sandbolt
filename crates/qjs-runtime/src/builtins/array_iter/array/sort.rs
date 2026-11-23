@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 
+use crate::builtins::{INSERTION_SORT_LIMIT, stable_insertion_sort};
+
 use super::*;
 
 pub(super) fn sort<'s>(
@@ -50,7 +52,17 @@ pub(super) fn sort<'s>(
         }
     }
     let n = order.len();
-    if n > 1 {
+    if n <= INSERTION_SORT_LIMIT {
+        stable_insertion_sort(&mut order, |left, right| {
+            ctx.check_interrupt()?;
+            compare_items(
+                ctx,
+                comparator,
+                item(ctx, root_id, left),
+                item(ctx, root_id, right),
+            )
+        })?;
+    } else {
         let mut temp = TrackedVec::new();
         ctx.allocate(|runtime| temp.try_reserve_exact(&runtime.heap.ledger, n))?;
         let mut width = 1;
