@@ -5,6 +5,7 @@ use crate::value::StrId;
 
 pub const MAX_ROPE_DEPTH: u8 = 32;
 pub(crate) const INLINE_LATIN1_CAPACITY: usize = 30;
+pub(crate) const INLINE_UTF16_CAPACITY: usize = 15;
 
 #[derive(Debug)]
 pub enum JsString {
@@ -18,6 +19,16 @@ pub enum JsString {
         data: [u8; INLINE_LATIN1_CAPACITY],
     },
     Utf16(TrackedVec<u16>),
+    InlineUtf16 {
+        len: u8,
+        data: [u16; INLINE_UTF16_CAPACITY],
+    },
+    Slice {
+        base: StrId,
+        start: u32,
+        len: u32,
+        is_wide: bool,
+    },
     Rope {
         left: StrId,
         right: StrId,
@@ -38,7 +49,11 @@ impl Trace for JsString {
                 left.trace(tracer);
                 right.trace(tracer);
             }
-            Self::Latin1 { .. } | Self::InlineLatin1 { .. } | Self::Utf16(_) => {}
+            Self::Slice { base, .. } => base.trace(tracer),
+            Self::Latin1 { .. }
+            | Self::InlineLatin1 { .. }
+            | Self::Utf16(_)
+            | Self::InlineUtf16 { .. } => {}
         }
     }
 }
@@ -100,7 +115,16 @@ impl JsString {
         units: impl Iterator<Item = u16>,
     ) -> AllocResult<Self> {
         u32::try_from(len).map_err(|_| AllocError::Limit)?;
-        if wide {
+        if wide && len <= INLINE_UTF16_CAPACITY {
+            let mut data = [0; INLINE_UTF16_CAPACITY];
+            for (i, unit) in units.enumerate() {
+                data[i] = unit;
+            }
+            Ok(Self::InlineUtf16 {
+                len: len as u8,
+                data,
+            })
+        } else if wide {
             let mut data = TrackedVec::new();
             data.try_reserve_exact(ledger, len)?;
             for unit in units {
@@ -147,9 +171,9 @@ impl JsString {
     pub fn len(&self) -> u32 {
         match self {
             Self::Latin1 { data, .. } => data.len() as u32,
-            Self::InlineLatin1 { len, .. } => u32::from(*len),
+            Self::InlineLatin1 { len, .. } | Self::InlineUtf16 { len, .. } => u32::from(*len),
             Self::Utf16(data) => data.len() as u32,
-            Self::Rope { len, .. } => *len,
+            Self::Rope { len, .. } | Self::Slice { len, .. } => *len,
         }
     }
 
@@ -164,10 +188,12 @@ impl JsString {
     pub fn as_utf16(&self) -> Option<&[u16]> {
         match self {
             Self::Utf16(data) => Some(data),
+            Self::InlineUtf16 { len, data } => Some(&data[..usize::from(*len)]),
             _ => None,
         }
     }
 
+    /// Reports whether this is a flat ASCII string stored in Latin-1.
     pub fn is_ascii(&self) -> bool {
         match self {
             Self::Latin1 { is_ascii, .. } | Self::InlineLatin1 { is_ascii, .. } => *is_ascii,
@@ -181,13 +207,14 @@ impl JsString {
     pub fn is_wide(&self) -> bool {
         match self {
             Self::Latin1 { .. } | Self::InlineLatin1 { .. } => false,
-            Self::Utf16(_) => true,
-            Self::Rope { is_wide, .. } => *is_wide,
+            Self::Utf16(_) | Self::InlineUtf16 { .. } => true,
+            Self::Rope { is_wide, .. } | Self::Slice { is_wide, .. } => *is_wide,
         }
     }
     pub fn depth(&self) -> u8 {
         match self {
             Self::Rope { depth, .. } => *depth,
+            Self::Slice { .. } => 1,
             _ => 0,
         }
     }
@@ -205,6 +232,18 @@ impl JsString {
                         .map(u16::from);
                 }
                 Self::Utf16(data) => return data.get(index as usize).copied(),
+                Self::InlineUtf16 { len, data } => {
+                    return data[..usize::from(*len)].get(index as usize).copied();
+                }
+                Self::Slice {
+                    base, start, len, ..
+                } => {
+                    if index >= *len {
+                        return None;
+                    }
+                    id = *base;
+                    index += *start;
+                }
                 Self::Rope { left, right, .. } => {
                     let left_len = arena.get(*left).expect("missing string").len();
                     if index < left_len {
@@ -230,6 +269,17 @@ enum Leaf<'a> {
     Empty,
     Latin1(std::slice::Iter<'a, u8>),
     Utf16(std::slice::Iter<'a, u16>),
+}
+
+impl<'a> Leaf<'a> {
+    fn flat(s: &'a JsString, start: usize, len: usize) -> Self {
+        let range = start..start + len;
+        if let Some(bytes) = s.as_latin1() {
+            Self::Latin1(bytes[range].iter())
+        } else {
+            Self::Utf16(s.as_utf16().unwrap()[range].iter())
+        }
+    }
 }
 
 impl<'a> StringUnits<'a> {
@@ -265,15 +315,17 @@ impl Iterator for StringUnits<'_> {
             self.count = self.count.checked_sub(1)?;
             let id = self.pending[self.count].take().unwrap();
             match self.arena.get(id).expect("missing string") {
-                JsString::Latin1 { data, .. } => self.leaf = Leaf::Latin1(data.iter()),
-                JsString::InlineLatin1 { data, len, .. } => {
-                    self.leaf = Leaf::Latin1(data[..usize::from(*len)].iter());
+                JsString::Slice {
+                    base, start, len, ..
+                } => {
+                    let base = self.arena.get(*base).expect("missing string slice base");
+                    self.leaf = Leaf::flat(base, *start as usize, *len as usize);
                 }
-                JsString::Utf16(data) => self.leaf = Leaf::Utf16(data.iter()),
                 JsString::Rope { left, right, .. } => {
                     self.push(*right);
                     self.push(*left);
                 }
+                flat => self.leaf = Leaf::flat(flat, 0, flat.len() as usize),
             }
         }
     }
@@ -292,6 +344,11 @@ mod tests {
         let string = JsString::from_latin1(&ledger, &small).unwrap();
         assert_eq!(string.as_latin1(), Some(small.as_slice()));
         assert!(!string.is_ascii());
+        assert_eq!(ledger.used_bytes(), baseline);
+
+        let wide = [0xd800; INLINE_UTF16_CAPACITY];
+        let string = JsString::from_utf16(&ledger, &wide).unwrap();
+        assert_eq!(string.as_utf16(), Some(wide.as_slice()));
         assert_eq!(ledger.used_bytes(), baseline);
 
         let large = [b'x'; INLINE_LATIN1_CAPACITY + 1];

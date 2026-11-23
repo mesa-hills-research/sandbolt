@@ -186,6 +186,30 @@ impl AtomTable {
         hasher.finish()
     }
 
+    pub(crate) fn find_str(&self, strings: &Arena<JsString>, text: &str) -> Option<PropKey> {
+        let units = || text.encode_utf16();
+        if let Some(key) =
+            Self::builtin_key(text).or_else(|| parse_index(units()).and_then(PropKey::index))
+        {
+            return Some(key);
+        }
+        let ascii = text.is_ascii();
+        let len = units().count();
+        let hash = self.content_hash(units());
+        let row = self.by_content.find(hash, |row| {
+            let id = self.dynamic[row].id;
+            let s = strings.get(id).unwrap();
+            if s.len() as usize != len {
+                return false;
+            }
+            if ascii && let Some(bytes) = s.as_latin1() {
+                return bytes == text.as_bytes();
+            }
+            units().eq(StringUnits::new(strings, id))
+        })?;
+        Some(PropKey::atom(self.dynamic[row].atom))
+    }
+
     pub(crate) fn find(&self, strings: &Arena<JsString>, id: StrId) -> Option<PropKey> {
         if let Some(bytes) = strings.get(id).unwrap().as_latin1() {
             if !bytes.is_empty()
@@ -632,6 +656,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(atoms.find(&strings, rope), Some(kept));
+        assert_eq!(atoms.find_str(&strings, "α😀"), Some(kept));
+        assert_eq!(atoms.find_str(&strings, "discard"), Some(old));
+        assert_eq!(atoms.find_str(&strings, "123"), PropKey::index(123));
         strings.mark(live);
         atoms.prune(&strings);
         assert_eq!(atoms.find(&strings, rope), Some(kept));

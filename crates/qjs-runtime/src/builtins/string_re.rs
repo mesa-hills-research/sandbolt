@@ -346,7 +346,9 @@ impl Builder {
     }
 
     fn finish<'s>(self, ctx: &mut ExecCtx<'_, 's>) -> JsResult<Handle<'s>> {
-        if self.0.len() <= crate::string::INLINE_LATIN1_CAPACITY && self.0.iter().all(|&u| u <= 255)
+        if self.0.len() <= crate::string::INLINE_UTF16_CAPACITY
+            || (self.0.len() <= crate::string::INLINE_LATIN1_CAPACITY
+                && self.0.iter().all(|&u| u <= 255))
         {
             return ctx.new_utf16(&self.0);
         }

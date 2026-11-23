@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use crate::atom::{AtomTable, PropKey};
+use crate::atom::PropKey;
 use crate::heap::{Heap, PersistentRoot};
 use crate::ledger::{AllocError, AllocResult, HeapLedger, TrackedBox, TrackedVec};
 use crate::object::*;
@@ -439,13 +439,33 @@ impl<'s> ExecCtx<'_, 's> {
             }
             _ => (),
         }
-        self.flatten_string(source)?;
+        if matches!(self.heap().string(id), JsString::Rope { .. }) {
+            self.flatten_string(source)?;
+        }
+        let (base, offset) = match self.heap().string(id) {
+            JsString::Slice { base, start, .. } => (*base, *start as usize),
+            _ => (id, 0),
+        };
+        let len = end - start;
+        let backing = self.heap().string(base);
+        if len >= 4096 && backing.len() as usize <= len.saturating_mul(4) {
+            let is_wide = backing.is_wide();
+            return self.make_string(|_| {
+                Ok(JsString::Slice {
+                    base,
+                    start: (offset + start) as u32,
+                    len: len as u32,
+                    is_wide,
+                })
+            });
+        }
+        let range = offset + start..offset + end;
         self.make_string(|heap| {
-            let s = heap.string(id);
+            let s = heap.string(base);
             if let Some(bytes) = s.as_latin1() {
-                JsString::from_latin1(&heap.ledger, &bytes[start..end])
+                JsString::from_latin1(&heap.ledger, &bytes[range.clone()])
             } else {
-                JsString::from_utf16(&heap.ledger, &s.as_utf16().unwrap()[start..end])
+                JsString::from_utf16(&heap.ledger, &s.as_utf16().unwrap()[range.clone()])
             }
         })
     }
@@ -537,7 +557,11 @@ impl<'s> ExecCtx<'_, 's> {
     }
 
     pub fn intern_str(&mut self, text: &str) -> JsResult<PropKey> {
-        if let Some(key) = AtomTable::builtin_key(text) {
+        let heap = self.heap();
+        if let Some(key) = heap.atoms.find_str(&heap.strings, text) {
+            if let Some(backing) = heap.dynamic_key_value(key) {
+                self.root(backing)?;
+            }
             return Ok(key);
         }
         let string = self.new_string(text)?;
@@ -764,6 +788,48 @@ mod tests {
     #[test]
     fn handles_are_four_bytes() {
         assert_eq!(size_of::<Handle<'_>>(), 4);
+    }
+
+    #[test]
+    fn long_string_slices_share_a_live_flat_base() {
+        let mut runtime = Runtime::new(crate::EngineLimits::default()).unwrap();
+        runtime.with_scope(runtime.default_realm(), |ctx| {
+            let (value, base) = ctx.with_scope(|ctx| {
+                let text = "0123456789".repeat(2048);
+                let source = ctx.new_string(&text).unwrap();
+                let ValueKind::String(base) = ctx.get(source).decode() else { unreachable!() };
+                let first = ctx.string_slice(source, 7, text.len() - 7).unwrap();
+                let second = ctx.string_slice(first, 8, text.len() - 22).unwrap();
+                (ctx.get(second), base)
+            });
+            let result = ctx.root(value).unwrap();
+            ctx.collect();
+            let ValueKind::String(id) = ctx.get(result).decode() else { unreachable!() };
+            assert!(matches!(ctx.heap().string(id), JsString::Slice { base: actual, start: 15, .. } if *actual == base));
+            assert_eq!(JsString::unit_at(&ctx.heap().strings, id, 0), Some(u16::from(b'5')));
+            assert_eq!(JsString::unit_at(&ctx.heap().strings, id, ctx.heap().string(id).len()), None);
+            assert!(ctx.heap().string_units(id).take(4).eq("5678".encode_utf16()));
+            let independent = ctx.string_slice(result, 2, 10).unwrap();
+            let ValueKind::String(id) = ctx.get(independent).decode() else { unreachable!() };
+            assert_eq!(ctx.heap().string(id).as_latin1(), Some(b"78901234".as_slice()));
+        });
+    }
+
+    #[test]
+    fn interning_live_text_does_not_allocate_another_string() {
+        let mut runtime = Runtime::new(crate::EngineLimits::default()).unwrap();
+        runtime.with_scope(runtime.default_realm(), |ctx| {
+            let key = ctx
+                .intern_str("name outside the builtin atom table")
+                .unwrap();
+            let count = ctx.heap().strings.len();
+            assert_eq!(
+                ctx.intern_str("name outside the builtin atom table")
+                    .unwrap(),
+                key
+            );
+            assert_eq!(ctx.heap().strings.len(), count);
+        });
     }
 
     #[test]
