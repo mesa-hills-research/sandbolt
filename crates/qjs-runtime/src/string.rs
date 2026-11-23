@@ -4,12 +4,18 @@ use crate::ledger::{AllocError, AllocResult, HeapLedger, TrackedVec};
 use crate::value::StrId;
 
 pub const MAX_ROPE_DEPTH: u8 = 32;
+pub(crate) const INLINE_LATIN1_CAPACITY: usize = 30;
 
 #[derive(Debug)]
 pub enum JsString {
     Latin1 {
         data: TrackedVec<u8>,
         is_ascii: bool,
+    },
+    InlineLatin1 {
+        len: u8,
+        is_ascii: bool,
+        data: [u8; INLINE_LATIN1_CAPACITY],
     },
     Utf16(TrackedVec<u16>),
     Rope {
@@ -32,7 +38,7 @@ impl Trace for JsString {
                 left.trace(tracer);
                 right.trace(tracer);
             }
-            Self::Latin1 { .. } | Self::Utf16(_) => {}
+            Self::Latin1 { .. } | Self::InlineLatin1 { .. } | Self::Utf16(_) => {}
         }
     }
 }
@@ -61,10 +67,21 @@ impl JsString {
 
     pub fn from_latin1(ledger: &HeapLedger, bytes: &[u8]) -> AllocResult<Self> {
         u32::try_from(bytes.len()).map_err(|_| AllocError::Limit)?;
-        Ok(Self::Latin1 {
-            data: TrackedVec::from_slice(ledger, bytes)?,
-            is_ascii: bytes.is_ascii(),
-        })
+        let is_ascii = bytes.is_ascii();
+        if bytes.len() <= INLINE_LATIN1_CAPACITY {
+            let mut data = [0; INLINE_LATIN1_CAPACITY];
+            data[..bytes.len()].copy_from_slice(bytes);
+            Ok(Self::InlineLatin1 {
+                len: bytes.len() as u8,
+                is_ascii,
+                data,
+            })
+        } else {
+            Ok(Self::Latin1 {
+                data: TrackedVec::from_slice(ledger, bytes)?,
+                is_ascii,
+            })
+        }
     }
 
     pub fn from_utf16(ledger: &HeapLedger, units: &[u16]) -> AllocResult<Self> {
@@ -91,12 +108,37 @@ impl JsString {
             }
             Ok(Self::Utf16(data))
         } else {
+            Self::from_latin1_iter(
+                ledger,
+                len,
+                units.map(|unit| u8::try_from(unit).expect("wide code unit in Latin-1 string")),
+            )
+        }
+    }
+
+    pub(crate) fn from_latin1_iter(
+        ledger: &HeapLedger,
+        len: usize,
+        bytes: impl Iterator<Item = u8>,
+    ) -> AllocResult<Self> {
+        u32::try_from(len).map_err(|_| AllocError::Limit)?;
+        if len <= INLINE_LATIN1_CAPACITY {
+            let mut data = [0; INLINE_LATIN1_CAPACITY];
+            for (i, byte) in bytes.enumerate() {
+                data[i] = byte;
+            }
+            Ok(Self::InlineLatin1 {
+                len: len as u8,
+                is_ascii: data[..len].is_ascii(),
+                data,
+            })
+        } else {
             let mut data = TrackedVec::new();
             data.try_reserve_exact(ledger, len)?;
             let mut is_ascii = true;
-            for unit in units {
-                is_ascii &= unit <= 127;
-                data.push_reserved(u8::try_from(unit).expect("wide code unit in Latin-1 string"));
+            for byte in bytes {
+                is_ascii &= byte.is_ascii();
+                data.push_reserved(byte);
             }
             Ok(Self::Latin1 { data, is_ascii })
         }
@@ -105,8 +147,31 @@ impl JsString {
     pub fn len(&self) -> u32 {
         match self {
             Self::Latin1 { data, .. } => data.len() as u32,
+            Self::InlineLatin1 { len, .. } => u32::from(*len),
             Self::Utf16(data) => data.len() as u32,
             Self::Rope { len, .. } => *len,
+        }
+    }
+
+    pub fn as_latin1(&self) -> Option<&[u8]> {
+        match self {
+            Self::Latin1 { data, .. } => Some(data),
+            Self::InlineLatin1 { len, data, .. } => Some(&data[..usize::from(*len)]),
+            _ => None,
+        }
+    }
+
+    pub fn as_utf16(&self) -> Option<&[u16]> {
+        match self {
+            Self::Utf16(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    pub fn is_ascii(&self) -> bool {
+        match self {
+            Self::Latin1 { is_ascii, .. } | Self::InlineLatin1 { is_ascii, .. } => *is_ascii,
+            _ => false,
         }
     }
 
@@ -115,7 +180,7 @@ impl JsString {
     }
     pub fn is_wide(&self) -> bool {
         match self {
-            Self::Latin1 { .. } => false,
+            Self::Latin1 { .. } | Self::InlineLatin1 { .. } => false,
             Self::Utf16(_) => true,
             Self::Rope { is_wide, .. } => *is_wide,
         }
@@ -130,7 +195,15 @@ impl JsString {
     pub(crate) fn unit_at(arena: &Arena<Self>, mut id: StrId, mut index: u32) -> Option<u16> {
         loop {
             match arena.get(id).expect("missing string") {
-                Self::Latin1 { data, .. } => return data.get(index as usize).copied().map(u16::from),
+                Self::Latin1 { data, .. } => {
+                    return data.get(index as usize).copied().map(u16::from);
+                }
+                Self::InlineLatin1 { data, len, .. } => {
+                    return data[..usize::from(*len)]
+                        .get(index as usize)
+                        .copied()
+                        .map(u16::from);
+                }
                 Self::Utf16(data) => return data.get(index as usize).copied(),
                 Self::Rope { left, right, .. } => {
                     let left_len = arena.get(*left).expect("missing string").len();
@@ -193,6 +266,9 @@ impl Iterator for StringUnits<'_> {
             let id = self.pending[self.count].take().unwrap();
             match self.arena.get(id).expect("missing string") {
                 JsString::Latin1 { data, .. } => self.leaf = Leaf::Latin1(data.iter()),
+                JsString::InlineLatin1 { data, len, .. } => {
+                    self.leaf = Leaf::Latin1(data[..usize::from(*len)].iter());
+                }
                 JsString::Utf16(data) => self.leaf = Leaf::Utf16(data.iter()),
                 JsString::Rope { left, right, .. } => {
                     self.push(*right);
@@ -200,5 +276,30 @@ impl Iterator for StringUnits<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_latin1_fits_without_a_buffer_charge() {
+        assert!(size_of::<JsString>() <= 40);
+        let ledger = HeapLedger::new(4096, 0).unwrap();
+        let baseline = ledger.used_bytes();
+        let small = [0xff; INLINE_LATIN1_CAPACITY];
+        let string = JsString::from_latin1(&ledger, &small).unwrap();
+        assert_eq!(string.as_latin1(), Some(small.as_slice()));
+        assert!(!string.is_ascii());
+        assert_eq!(ledger.used_bytes(), baseline);
+
+        let large = [b'x'; INLINE_LATIN1_CAPACITY + 1];
+        let string = JsString::from_latin1(&ledger, &large).unwrap();
+        assert_eq!(string.as_latin1(), Some(large.as_slice()));
+        assert!(string.is_ascii());
+        assert_eq!(ledger.used_bytes() - baseline, large.len());
+        drop(string);
+        assert_eq!(ledger.used_bytes(), baseline);
     }
 }

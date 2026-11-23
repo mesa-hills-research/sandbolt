@@ -5,6 +5,7 @@ use qjs_unicode::{
 use crate::ledger::TrackedBox;
 use crate::object::{ObjectData, ObjectFlags, StringIteratorData, StringObjectData};
 use crate::ops::convert::{space, to_integer_or_infinity, to_length, to_number, to_uint32};
+use crate::string::JsString;
 use crate::symbol::SymbolDescription;
 use crate::value::ValueKind;
 
@@ -197,41 +198,38 @@ pub(super) fn dispatch<'s>(
     if op == 8 {
         return concat(ctx, s, args);
     }
-    let input = units(ctx, ctx.get(s))?;
-    let a = arg(ctx, args, 0)?;
-    let b = arg(ctx, args, 1)?;
     match op {
-        4..=7 => {
-            let i = to_integer_or_infinity(ctx, a)?;
-            let i = if op == 4 && i < 0.0 {
-                input.len() as f64 + i
-            } else {
-                i
-            };
-            if i < 0.0 || i >= input.len() as f64 {
-                return match op {
-                    5 => ctx.new_string("").map(|s| ctx.get(s)),
-                    6 => Ok(Value::number(f64::NAN)),
-                    _ => Ok(Value::UNDEFINED),
-                };
-            }
-            let i = i as usize;
+        4..=7 => return indexed(op, ctx, s, args.get(0)),
+        9..=11 | 13 | 26 => {
+            let a = arg(ctx, args, 0)?;
+            let b = arg(ctx, args, 1)?;
+            return find(op, ctx, s, a, b);
+        }
+        20 => {
+            let a = arg(ctx, args, 0)?;
+            return repeat(ctx, s, a);
+        }
+        24 | 27 | 38 => return slice(op, ctx, s, args.get(0), args.get(1)),
+        28..=30 | 32 => return case(ctx, s, matches!(op, 28 | 30)),
+        34..=36 => return trim(op, ctx, s),
+        _ => (),
+    }
+    let input = units(ctx, ctx.get(s))?;
+    match op {
+        12 | 33 => well_formed(ctx, s, &input, op == 33),
+        14 | 17 | 39..=51 => {
+            let a = arg(ctx, args, 0)?;
             match op {
-                4 | 5 => ctx.new_utf16(&input[i..=i]).map(|s| ctx.get(s)),
-                6 => Ok(Value::int32(i32::from(input[i]))),
-                _ => Ok(Value::int32(code_point(&input, i).0 as i32)),
+                14 => compare(ctx, &input, a),
+                17 => normalize_string(ctx, s, &input, a),
+                _ => html(op, ctx, &input, a),
             }
         }
-        9..=11 | 13 | 26 => find(op, ctx, &input, a, b),
-        12 | 33 => well_formed(ctx, s, &input, op == 33),
-        14 => compare(ctx, &input, a),
-        17 => normalize_string(ctx, s, &input, a),
-        18 | 19 => pad(ctx, s, &input, a, b, op == 19),
-        20 => repeat(ctx, s, &input, a),
-        24 | 27 | 38 => slice(op, ctx, &input, a, b),
-        28..=30 | 32 => case(ctx, &input, matches!(op, 28 | 30)),
-        34..=36 => trim(op, ctx, &input),
-        39..=51 => html(op, ctx, &input, a),
+        18 | 19 => {
+            let a = arg(ctx, args, 0)?;
+            let b = arg(ctx, args, 1)?;
+            pad(ctx, s, &input, a, b, op == 19)
+        }
         _ => Err(ctx.throw_type_error("unknown String builtin")),
     }
 }
@@ -331,19 +329,58 @@ fn relative(pos: f64, len: usize) -> usize {
     bounded(if pos < 0.0 { pos + len as f64 } else { pos }, len)
 }
 
+fn indexed<'s>(
+    op: u16,
+    ctx: &mut ExecCtx<'_, 's>,
+    s: Handle<'s>,
+    index: Option<Handle<'s>>,
+) -> JsResult<Value> {
+    ctx.check_interrupt()?;
+    let id = string_id(ctx.get(s));
+    let len = ctx.heap().string(id).len() as f64;
+    let mut i = index.map_or(Ok(0.0), |i| to_integer_or_infinity(ctx, i))?;
+    if op == 4 && i < 0.0 {
+        i += len;
+    }
+    if i < 0.0 || i >= len {
+        return match op {
+            5 => ctx.new_latin1(&[]).map(|s| ctx.get(s)),
+            6 => Ok(Value::number(f64::NAN)),
+            _ => Ok(Value::UNDEFINED),
+        };
+    }
+    let i = i as u32;
+    let arena = &ctx.heap().strings;
+    let unit = JsString::unit_at(arena, id, i).unwrap();
+    match op {
+        4 | 5 => ctx.new_utf16(&[unit]).map(|s| ctx.get(s)),
+        6 => Ok(Value::int32(i32::from(unit))),
+        _ => {
+            let point = if is_high(unit)
+                && let Some(low) = JsString::unit_at(arena, id, i + 1).filter(|&u| is_low(u))
+            {
+                0x10000 + ((i32::from(unit) - 0xd800) << 10) + (i32::from(low) - 0xdc00)
+            } else {
+                i32::from(unit)
+            };
+            Ok(Value::int32(point))
+        }
+    }
+}
+
 fn slice<'s>(
     op: u16,
     ctx: &mut ExecCtx<'_, 's>,
-    input: &[u16],
-    a: Handle<'s>,
-    b: Handle<'s>,
+    s: Handle<'s>,
+    a: Option<Handle<'s>>,
+    b: Option<Handle<'s>>,
 ) -> JsResult<Value> {
-    let start = to_integer_or_infinity(ctx, a)?;
-    let n = input.len();
-    let end = if ctx.get(b) == Value::UNDEFINED {
-        n as f64
-    } else {
-        to_integer_or_infinity(ctx, b)?
+    ctx.check_interrupt()?;
+    let start = a.map_or(Ok(0.0), |a| to_integer_or_infinity(ctx, a))?;
+    let n = ctx.heap().string(string_id(ctx.get(s))).len() as usize;
+    let end = match b {
+        Some(b) if ctx.get(b) != Value::UNDEFINED => to_integer_or_infinity(ctx, b)?,
+        _ => n as f64,
     };
     let (start, end) = match op {
         24 => {
@@ -359,34 +396,81 @@ fn slice<'s>(
             (start, start + bounded(end, n - start))
         }
     };
-    let result = ctx.new_utf16(&input[start..end])?;
+    let result = ctx.string_slice(s, start, end)?;
     Ok(ctx.get(result))
 }
 
 fn find<'s>(
     op: u16,
     ctx: &mut ExecCtx<'_, 's>,
-    input: &[u16],
+    source: Handle<'s>,
     search: Handle<'s>,
     pos: Handle<'s>,
 ) -> JsResult<Value> {
+    let hay = ctx.get(source);
+    let hay_id = string_id(hay);
+    let len = ctx.heap().string(hay_id).len() as usize;
+    let poll = ctx.runtime.vm.interrupt_handler.is_some();
+    let input = if poll { Some(units(ctx, hay)?) } else { None };
     if matches!(op, 9 | 10 | 26) && regexp::is_regexp(ctx, search)? {
         return Err(ctx.throw_type_error("expected a string, not a RegExp"));
     }
-    let needle = text(ctx, search)?;
+    let needle = to_string(ctx, search)?;
+    let needle = ctx.get(needle);
+    let needle_id = string_id(needle);
+    let needle_units = if poll {
+        Some(units(ctx, needle)?)
+    } else {
+        None
+    };
     let pos = if op == 13 {
         let pos = to_number(ctx, pos)?;
         if pos.is_nan() {
-            input.len() as f64
+            len as f64
         } else {
             pos.trunc()
         }
     } else if op == 9 && ctx.get(pos) == Value::UNDEFINED {
-        input.len() as f64
+        len as f64
     } else {
         to_integer_or_infinity(ctx, pos)?
     };
-    let pos = bounded(pos, input.len());
+    let pos = bounded(pos, len);
+    let heap = ctx.heap();
+    if !poll
+        && let (Some(input), Some(needle)) = (
+            heap.string(hay_id).as_latin1(),
+            heap.string(needle_id).as_latin1(),
+        )
+    {
+        return Ok(match op {
+            9 => Value::bool(input[..pos].ends_with(needle)),
+            26 => Value::bool(input[pos..].starts_with(needle)),
+            _ => {
+                let found = match (op, needle) {
+                    (_, []) => Some(pos),
+                    (13, [byte]) => input[..pos.saturating_add(1).min(len)]
+                        .iter()
+                        .rposition(|x| x == byte),
+                    (13, _) => input[..pos.saturating_add(needle.len()).min(len)]
+                        .windows(needle.len())
+                        .rposition(|w| w == needle),
+                    (_, [byte]) => input[pos..].iter().position(|x| x == byte).map(|i| i + pos),
+                    _ => input[pos..]
+                        .windows(needle.len())
+                        .position(|w| w == needle)
+                        .map(|i| i + pos),
+                };
+                if op == 10 {
+                    Value::bool(found.is_some())
+                } else {
+                    Value::int32(found.map_or(-1, |i| i as i32))
+                }
+            }
+        });
+    }
+    let input = input.map_or_else(|| units(ctx, hay), Ok)?;
+    let needle = needle_units.map_or_else(|| units(ctx, needle), Ok)?;
     match op {
         9 => Ok(Value::bool(input[..pos].ends_with(&needle))),
         26 => Ok(Value::bool(input[pos..].starts_with(&needle))),
@@ -408,7 +492,7 @@ fn find<'s>(
             Ok(Value::int32(-1))
         }
         _ => {
-            let found = index_of(ctx, input, &needle, pos)?;
+            let found = index_of(ctx, &input, &needle, pos)?;
             Ok(if op == 10 {
                 Value::bool(found.is_some())
             } else {
@@ -438,26 +522,45 @@ pub(super) fn index_of(
     Ok(None)
 }
 
-fn repeat<'s>(
-    ctx: &mut ExecCtx<'_, 's>,
-    s: Handle<'s>,
-    input: &[u16],
-    n: Handle<'s>,
-) -> JsResult<Value> {
+fn repeat<'s>(ctx: &mut ExecCtx<'_, 's>, s: Handle<'s>, n: Handle<'s>) -> JsResult<Value> {
+    ctx.check_interrupt()?;
     let n = to_integer_or_infinity(ctx, n)?;
     if n < 0.0 || !n.is_finite() {
         return Err(ctx.throw_range_error("invalid repeat count"));
     }
-    if input.is_empty() || n == 1.0 {
+    let id = string_id(ctx.get(s));
+    let input_len = ctx.heap().string(id).len();
+    if input_len == 0 || n == 1.0 {
         return Ok(ctx.get(s));
     }
-    let len = n * input.len() as f64;
+    if n == 0.0 {
+        return ctx.new_latin1(&[]).map(|s| ctx.get(s));
+    }
+    let len = n * f64::from(input_len);
     if len > MAX_STRING_LEN as f64 {
         return Err(string_error(ctx));
     }
+    let len = len as usize;
+    if ctx.runtime.vm.interrupt_handler.is_none() && !ctx.heap().string(id).is_wide() {
+        ctx.flatten_string(s)?;
+        let result = ctx.make_string(|heap| {
+            let bytes = heap.string(id).as_latin1().unwrap();
+            if let [byte] = bytes {
+                JsString::from_latin1_iter(&heap.ledger, len, std::iter::repeat_n(*byte, len))
+            } else {
+                JsString::from_latin1_iter(
+                    &heap.ledger,
+                    len,
+                    bytes.iter().copied().cycle().take(len),
+                )
+            }
+        })?;
+        return Ok(ctx.get(result));
+    }
+    let input = units(ctx, ctx.get(s))?;
     let mut out = Builder::new();
-    out.reserve(ctx, len as usize, true)?;
-    append_repeated(ctx, &mut out, input, len as usize)?;
+    out.reserve(ctx, len, true)?;
+    append_repeated(ctx, &mut out, &input, len)?;
     out.value(ctx)
 }
 
@@ -514,10 +617,16 @@ fn pad<'s>(
     out.value(ctx)
 }
 
-fn trim(op: u16, ctx: &mut ExecCtx<'_, '_>, input: &[u16]) -> JsResult<Value> {
-    let (mut start, mut end) = (0, input.len());
+fn trim<'s>(op: u16, ctx: &mut ExecCtx<'_, 's>, s: Handle<'s>) -> JsResult<Value> {
+    ctx.check_interrupt()?;
+    ctx.flatten_string(s)?;
+    let id = string_id(ctx.get(s));
+    let (mut start, mut end) = (0, ctx.heap().string(id).len() as usize);
+    let unit = |ctx: &ExecCtx<'_, '_>, i: usize| {
+        JsString::unit_at(&ctx.heap().strings, id, i as u32).unwrap()
+    };
     if op != 35 {
-        while start < end && space(input[start]) {
+        while start < end && space(unit(ctx, start)) {
             if start & 2047 == 0 {
                 ctx.check_interrupt()?;
             }
@@ -525,14 +634,14 @@ fn trim(op: u16, ctx: &mut ExecCtx<'_, '_>, input: &[u16]) -> JsResult<Value> {
         }
     }
     if op != 36 {
-        while start < end && space(input[end - 1]) {
+        while start < end && space(unit(ctx, end - 1)) {
             if end & 2047 == 0 {
                 ctx.check_interrupt()?;
             }
             end -= 1;
         }
     }
-    let s = ctx.new_utf16(&input[start..end])?;
+    let s = ctx.string_slice(s, start, end)?;
     Ok(ctx.get(s))
 }
 
@@ -572,7 +681,37 @@ fn well_formed<'s>(
     }
 }
 
-fn case(ctx: &mut ExecCtx<'_, '_>, input: &[u16], lower: bool) -> JsResult<Value> {
+fn case<'s>(ctx: &mut ExecCtx<'_, 's>, s: Handle<'s>, lower: bool) -> JsResult<Value> {
+    let id = string_id(ctx.get(s));
+    if ctx.runtime.vm.interrupt_handler.is_none() && !ctx.heap().string(id).is_wide() {
+        ctx.flatten_string(s)?;
+        let string = ctx.heap().string(id);
+        if string.is_ascii() {
+            let bytes = string.as_latin1().unwrap();
+            let change = if lower {
+                u8::is_ascii_uppercase
+            } else {
+                u8::is_ascii_lowercase
+            };
+            if !bytes.iter().any(change) {
+                return Ok(ctx.get(s));
+            }
+            let convert = if lower {
+                u8::to_ascii_lowercase
+            } else {
+                u8::to_ascii_uppercase
+            };
+            if let [byte] = bytes {
+                return ctx.new_latin1(&[convert(byte)]).map(|s| ctx.get(s));
+            }
+            let result = ctx.make_string(|heap| {
+                let bytes = heap.string(id).as_latin1().unwrap();
+                JsString::from_latin1_iter(&heap.ledger, bytes.len(), bytes.iter().map(convert))
+            })?;
+            return Ok(ctx.get(result));
+        }
+    }
+    let input = units(ctx, ctx.get(s))?;
     let mut out = Builder::new();
     out.reserve(ctx, input.len(), true)?;
     let conv = if lower {
@@ -586,7 +725,7 @@ fn case(ctx: &mut ExecCtx<'_, '_>, input: &[u16], lower: bool) -> JsResult<Value
         if i & 2047 < 2 {
             ctx.check_interrupt()?;
         }
-        let (cp, next) = code_point(input, i);
+        let (cp, next) = code_point(&input, i);
         i = next;
         if lower && cp == 0x03a3 && prev_cased {
             let mut j = i;
@@ -595,7 +734,7 @@ fn case(ctx: &mut ExecCtx<'_, '_>, input: &[u16], lower: bool) -> JsResult<Value
                 if (j - i) & 2047 < 2 {
                     ctx.check_interrupt()?;
                 }
-                let (cp, next) = code_point(input, j);
+                let (cp, next) = code_point(&input, j);
                 if !is_case_ignorable(cp) {
                     followed = is_cased(cp);
                     break;
@@ -770,16 +909,13 @@ fn next<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>) -> JsResult<Value> {
     let mut result = [0; 2];
     if let Some(s) = as_string(data.string) {
         let i = data.index;
-        match ctx.heap().string(s) {
-            JsString::Latin1 { data, .. } if i < data.len() => {
-                len = 1;
-                result[0] = data[i].into();
-            }
-            JsString::Utf16(data) if i < data.len() => {
-                len = advance(data, i, true) - i;
-                result[..len].copy_from_slice(&data[i..i + len]);
-            }
-            _ => (),
+        let s = ctx.heap().string(s);
+        if let Some(byte) = s.as_latin1().and_then(|data| data.get(i)) {
+            len = 1;
+            result[0] = (*byte).into();
+        } else if let Some(data) = s.as_utf16().filter(|data| i < data.len()) {
+            len = advance(data, i, true) - i;
+            result[..len].copy_from_slice(&data[i..i + len]);
         }
     }
     let ObjectData::StringIterator(data) = &mut ctx.runtime.heap.objects.get_mut(id).unwrap().data
@@ -958,4 +1094,39 @@ fn replace_string<'s>(
     }
     out.extend(ctx, &input[end..])?;
     out.value(ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::EngineLimits;
+    use crate::api::{EvalOptions, JsEngine};
+
+    #[test]
+    fn string_paths_keep_utf16_indices_and_coercion_order() {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        let result = engine
+            .eval_to_string(
+                r#"
+            const latin = 'x'.repeat(65536);
+            const lead = latin + '\uD83D';
+            const rope = lead + '\uDE00z';
+            const calls = [];
+            const part = rope.slice({ valueOf() { calls.push('start'); return -3; } },
+                                    { valueOf() { calls.push('end'); return -1; } });
+            const search = latin + 'éé';
+            [part, rope.codePointAt(65536), rope.charCodeAt(65537), rope.at(-1),
+             latin.substr(-2), latin.substring(2, 0), search.indexOf('é'),
+             search.lastIndexOf('é', NaN), search.startsWith('é', 65536),
+             search.endsWith('é', 65537), !search.includes('a'),
+             '\u00a0é\u3000'.trim(), 'Az'.toUpperCase(), 'Σ'.toLowerCase(),
+             String(-2147483648), String(-0), calls.join('-')].join('|');
+        "#,
+                EvalOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            "😀|128512|56832|z|xx|xx|65536|65537|true|true|true|é|AZ|σ|-2147483648|0|start-end"
+        );
+    }
 }
