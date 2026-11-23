@@ -36,7 +36,7 @@ impl ModuleLoader for MicrobenchLoader {
         match specifier {
             "qjs:std" => Ok(ResolvedModule::Source {
                 name: "qjs:std".into(),
-                source: "export function open() { return null; } export function gc() {}".into(),
+                source: "export function open(_name, mode) { return mode === 'w' ? { puts() {}, close() {} } : null; } export function gc() {}".into(),
             }),
             "qjs:os" => Ok(ResolvedModule::Source {
                 name: "qjs:os".into(),
@@ -341,8 +341,8 @@ fn bench_microbench(path: &str, filter: &[String]) {
         println!("{line}");
         let _ = std::io::stdout().flush();
     }));
-    let args_json = filter
-        .iter()
+    let args_json = std::iter::once("microbench.js")
+        .chain(filter.iter().map(String::as_str))
         .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
         .collect::<Vec<_>>()
         .join(", ");
