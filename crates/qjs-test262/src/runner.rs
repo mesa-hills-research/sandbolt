@@ -326,7 +326,7 @@ fn execute(test: &Test<'_>, strict: bool, cache: &mut Cache) -> Execution {
             return host_failure(test.name.into(), strict, format!("engine setup: {error:?}"));
         }
     };
-    let session = Session::new(budget.clone(), test.config.verbose > 1);
+    let session = Session::new(budget.clone(), test.config.verbose > 1, test.config.local);
     let countdown = Rc::new(harness::Countdown::default());
     harness::interrupt(&mut engine, budget.clone(), countdown.clone());
     engine.set_can_block(!test.metadata.flag("CanBlockIsFalse"));
