@@ -1,4 +1,5 @@
 mod bindings;
+pub(crate) mod coroutines;
 mod iterators;
 mod load;
 pub(crate) mod numeric;
@@ -18,17 +19,10 @@ use crate::shape::PropFlags;
 use crate::value::*;
 use crate::vm::{CallFrame, CompiledFunc};
 
-pub(crate) use bindings::{close_frame, read_ref, write_ref};
-pub(crate) use iterators::{async_from_sync_call, for_in_next, iterator_result};
+pub(crate) use bindings::{read_ref, write_ref};
+pub(crate) use iterators::{async_from_sync_call, close_original, for_in_next, iterator_result};
 
-pub(crate) fn resume_generator<'s>(
-    ctx: &mut ExecCtx<'_, 's>,
-    _generator: Handle<'s>,
-    _args: Args<'s>,
-    _kind: u16,
-) -> JsResult<Value> {
-    Err(iterators::invalid_resume(ctx))
-}
+pub(crate) use coroutines::resume_generator;
 
 impl<'s> ExecCtx<'_, 's> {
     pub fn function_source(&mut self, function: Handle<'s>) -> JsResult<Option<Handle<'s>>> {
@@ -665,7 +659,10 @@ pub(crate) fn step(
                 call::enter(ctx, start, count, None)?;
             }
         }
-        Import | InitialYield | Yield | YieldStar | AsyncYieldStar | Await => {
+        InitialYield | Yield | YieldStar | AsyncYieldStar | Await => {
+            return coroutines::suspend(ctx, index, op).map(Some);
+        }
+        Import => {
             return Err(ctx.throw_error(
                 ErrorKind::Internal,
                 &format!("opcode {} is not implemented", op.info().name),

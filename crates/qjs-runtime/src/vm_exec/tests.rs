@@ -206,6 +206,97 @@ fn string_typed_array_and_arguments_exotic_properties() {
 }
 
 #[test]
+fn generator_captures_live_locals_across_suspension() {
+    assert_eq!(
+        run(r#"
+        function* g(a) {
+            let x = 2;
+            yield () => ++x;
+            try { yield arguments[0] + x; }
+            finally { yield x; }
+            return 42;
+        }
+        const i = g(10);
+        const f = i.next().value;
+        const first = f();
+        const second = i.next().value;
+        const third = i.return(99).value;
+        const last = i.next();
+        [first, second, third, last.value, last.done, f()].join(',')
+    "#),
+        "3,13,3,99,true,4"
+    );
+}
+
+#[test]
+fn generator_delegation_and_throw_reenter_the_suspended_frame() {
+    assert_eq!(
+        run(r#"
+        function* g() {
+           try { yield* [1,2]; yield 3; }
+           catch(x) { yield x + 1; }
+        }
+        const i = g();
+        [i.next().value, i.next().value, i.next().value, i.throw(9).value, i.next().done].join(',')
+    "#),
+        "1,2,3,10,true"
+    );
+}
+
+#[test]
+fn promise_jobs_resume_async_functions_and_generators() {
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let opts = EvalOptions::default();
+    engine
+        .eval(
+            r#"
+        var log = [];
+        (async () => {
+            log.push('start');
+            try { await Promise.reject(1); }
+            catch(e) { log.push(e); }
+            log.push(await 2);
+            return 3;
+        })().then(v => log.push(v));
+        log.push('sync');
+    "#,
+            opts.clone(),
+        )
+        .unwrap();
+    assert_eq!(
+        engine
+            .eval_to_string("log.join(',')", opts.clone())
+            .unwrap(),
+        "start,sync"
+    );
+    engine.run_jobs().unwrap();
+    assert_eq!(
+        engine
+            .eval_to_string("log.join(',')", opts.clone())
+            .unwrap(),
+        "start,sync,1,2,3"
+    );
+    engine
+        .eval(
+            r#"
+        log = [];
+        async function* g() { yield Promise.resolve(1); yield 2; }
+        let i = g();
+        i.next().then(r => log.push(r.value));
+        i.next().then(r => log.push(r.value));
+        i.return(Promise.resolve(3)).then(r => log.push(r.value, r.done));
+    "#,
+            opts.clone(),
+        )
+        .unwrap();
+    engine.run_jobs().unwrap();
+    assert_eq!(
+        engine.eval_to_string("log.join(',')", opts).unwrap(),
+        "1,2,3,true"
+    );
+}
+
+#[test]
 fn host_bridge_and_print_are_opt_in() {
     let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
     let opts = EvalOptions::default();

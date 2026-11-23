@@ -84,7 +84,7 @@ fn invoke<'s>(
     })();
     while ctx.runtime.vm.frames.len() > depth {
         let frame = ctx.runtime.vm.frames.pop().unwrap();
-        exec::close_frame(ctx, frame);
+        exec::coroutines::abort_frame(ctx, frame);
     }
     ctx.runtime.vm.stack.truncate(base);
     ctx.runtime.vm.reentry_depth -= reentry;
@@ -240,12 +240,19 @@ pub(crate) fn enter(
         last_pc: 0,
         return_call: false,
         require_object,
+        coroutine: None,
     };
     // The original call operands still contain new.target until the frame is live.
     ctx.root(this)?;
     ctx.allocate(|runtime| runtime.vm.frames.push(&runtime.heap.ledger, frame))?;
     ctx.runtime.vm.stack.pop();
     ctx.runtime.vm.stack[base + 1] = this;
+    let kind = code
+        .and_then(|code| ctx.heap().bytecode.get(code).unwrap().compiled.as_ref())
+        .map(|function| function.kind);
+    if let Some(kind) = kind {
+        exec::coroutines::enter(ctx, ctx.runtime.vm.frames.len() - 1, kind)?;
+    }
     Ok(())
 }
 
@@ -330,12 +337,13 @@ pub(crate) fn drive(ctx: &mut ExecCtx<'_, '_>, depth: usize) -> JsResult<()> {
                     }
                 }
             }
-            Ok(result)
+            result
+                .map(|value| exec::coroutines::finish(ctx, frame, value))
+                .transpose()
         });
         match step {
             Ok(Some(value)) => {
                 ctx.runtime.vm.frames.pop();
-                exec::close_frame(ctx, frame);
                 ctx.runtime.vm.stack.truncate(frame.base as usize);
                 ctx.runtime.vm.stack.push_reserved(value);
             }
@@ -524,9 +532,14 @@ pub(crate) fn unwind(ctx: &mut ExecCtx<'_, '_>, depth: usize) -> JsResult<bool> 
                 return Ok(true);
             }
         }
+        let handled = exec::coroutines::reject_if_async(ctx, frame)?;
         ctx.runtime.vm.frames.pop();
-        exec::close_frame(ctx, frame);
+        exec::coroutines::abort_frame(ctx, frame);
         ctx.runtime.vm.stack.truncate(frame.base as usize);
+        if let Some(result) = handled {
+            ctx.runtime.vm.stack.push_reserved(result);
+            return Ok(true);
+        }
     }
     Ok(false)
 }

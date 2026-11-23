@@ -1,7 +1,12 @@
 use qjs_bytecode::{Instruction, Opcode, Operands};
 
 use crate::atom::{Atom, KeyKind, PropKey};
-use crate::object::ErrorKind;
+use crate::builtins::promise_json_extras::{
+    new_promise_capability, perform_promise_then, promise_resolve,
+};
+use crate::builtins::vm_internal::{ASYNC_CLOSE_REJECT, ASYNC_UNWRAP, SYNC_DISPOSER};
+use crate::ledger::TrackedBox;
+use crate::object::{IteratorData, IteratorKind, IteratorRecordData, ObjectData, ObjectFlags};
 use crate::ops::{call, convert, property};
 use crate::root::{Args, ExecCtx, Handle};
 use crate::symbol::WellKnown;
@@ -120,8 +125,15 @@ pub(super) fn iterator_op(
                     let method = if let Some(method) = async_method {
                         method
                     } else {
-                        get_method(ctx, h(1), well_known(ctx, WellKnown::Dispose))?
-                            .ok_or_else(|| ctx.throw_type_error("value is not disposable"))?
+                        let method = get_method(ctx, h(1), well_known(ctx, WellKnown::Dispose))?
+                            .ok_or_else(|| ctx.throw_type_error("value is not disposable"))?;
+                        if hint != 0 {
+                            let actual = ctx.bind_function(method, h(1), Args::empty())?;
+                            let wrapper = ctx.new_native(SYNC_DISPOSER, false)?;
+                            ctx.bind_function(wrapper, actual, Args::empty())?
+                        } else {
+                            method
+                        }
                     };
                     one(0, ctx.get(method))
                 }
@@ -227,10 +239,21 @@ fn async_from_sync<'s>(
     iterator: Handle<'s>,
     next: Handle<'s>,
 ) -> JsResult<(Handle<'s>, Handle<'s>)> {
-    let proto = ctx.root(Value::object(ctx.realm().async_from_sync_iterator_proto))?;
-    let wrapper = ctx.new_object_with_proto(Some(proto))?;
-    define_default(ctx, wrapper, state_key(0), iterator)?;
-    define_default(ctx, wrapper, state_key(1), next)?;
+    let proto = ctx.realm().async_from_sync_iterator_proto;
+    let record = IteratorRecordData {
+        object: ctx.get(iterator),
+        next: ctx.get(next),
+    };
+    let wrapper = ctx.make_object(Some(proto), ObjectFlags::EXTENSIBLE, |ledger| {
+        Ok(ObjectData::Iterator(TrackedBox::new(
+            ledger,
+            IteratorData {
+                kind: IteratorKind::Wrap(record),
+            },
+        )?))
+    })?;
+    let id = ctx.object_id(wrapper)?;
+    property::private_define(ctx, id, super::objects::brand_key(), Value::bool(true))?;
     let next = property::get_property(ctx, wrapper, Atom::get("next"))?;
     let next = ctx.root(next)?;
     Ok((wrapper, next))
@@ -242,30 +265,95 @@ pub(crate) fn async_from_sync_call<'s>(
     args: Args<'s>,
     kind: u16,
 ) -> JsResult<Value> {
-    let iterator = property::get_property(ctx, wrapper, state_key(0))?;
-    let iterator = ctx.root(iterator)?;
-    let method = if kind == 0 {
-        let next = property::get_property(ctx, wrapper, state_key(1))?;
-        Some(ctx.root(next)?)
+    let constructor = ctx.root(Value::object(ctx.realm().promise_ctor))?;
+    let capability = new_promise_capability(ctx, constructor)?;
+    let result = (|| {
+        let id = ctx.object_id(wrapper)?;
+        let record = match &ctx.heap().object(id).data {
+            ObjectData::Iterator(data)
+                if property::private_own(ctx, id, super::objects::brand_key())
+                    == Some(Value::bool(true)) =>
+            {
+                let IteratorKind::Wrap(record) = data.kind else {
+                    unreachable!()
+                };
+                record
+            }
+            _ => return Err(ctx.throw_type_error("expected an Async-from-Sync Iterator")),
+        };
+        let iterator = ctx.root(record.object)?;
+        let method = if kind == 0 {
+            Some(ctx.root(record.next)?)
+        } else {
+            get_method(
+                ctx,
+                iterator,
+                Atom::get(if kind == 1 { "return" } else { "throw" }),
+            )?
+        };
+        let Some(method) = method else {
+            if kind == 2 {
+                close_iterator(ctx, iterator)?;
+                return Err(ctx.throw_type_error("iterator does not have a throw method"));
+            }
+            let value = args.get(0).map_or(Value::UNDEFINED, |arg| ctx.get(arg));
+            let value = ctx.root(value)?;
+            let result = iterator_result(ctx, value, true)?;
+            let result = ctx.root(result)?;
+            let args = ctx.args(&[result])?;
+            let undefined = ctx.root(Value::UNDEFINED)?;
+            call::call(ctx, capability.resolve, undefined, args)?;
+            return Ok(());
+        };
+        let forwarded = if let Some(value) = args.get(0) {
+            ctx.args(&[value])?
+        } else {
+            Args::empty()
+        };
+        let (value, done) = iterator_next(ctx, iterator, method, forwarded, true)?;
+        let value = ctx.root(value)?;
+        let close_on_reject = !done && kind != 1;
+        let promise = match promise_resolve(ctx, constructor, value) {
+            Err(Abrupt::Thrown) if close_on_reject => {
+                let (error, _) = ctx.take_exception().unwrap();
+                return close_original(ctx, iterator, error);
+            }
+            result => result?,
+        };
+        let done = ctx.root(Value::bool(done))?;
+        let fulfilled = ctx.new_native(ASYNC_UNWRAP, false)?;
+        let fulfilled = ctx.bind_function(fulfilled, done, Args::empty())?;
+        let rejected = if close_on_reject {
+            let rejected = ctx.new_native(ASYNC_CLOSE_REJECT, false)?;
+            ctx.bind_function(rejected, iterator, Args::empty())?
+        } else {
+            ctx.root(Value::UNDEFINED)?
+        };
+        perform_promise_then(ctx, promise, fulfilled, rejected, Some(capability))
+    })();
+    if result == Err(Abrupt::Thrown) {
+        let (error, _) = ctx.take_exception().unwrap();
+        let error = ctx.root(error)?;
+        let undefined = ctx.root(Value::UNDEFINED)?;
+        let args = ctx.args(&[error])?;
+        call::call(ctx, capability.reject, undefined, args)?;
+        ctx.runtime.vm.thrown_frames.clear();
     } else {
-        get_method(
-            ctx,
-            iterator,
-            Atom::get(if kind == 1 { "return" } else { "throw" }),
-        )?
-    };
-    if let Some(method) = method {
-        return call::call(ctx, method, iterator, args);
+        result?;
     }
-    if kind == 2 {
-        close_iterator(ctx, iterator)?;
-        return Err(ctx.throw_type_error("iterator does not have a throw method"));
+    Ok(ctx.get(capability.promise))
+}
+
+pub(crate) fn close_original<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    iterator: Handle<'s>,
+    error: Value,
+) -> JsResult<()> {
+    let reason = ctx.root(error)?;
+    if close_iterator(ctx, iterator) == Err(Abrupt::Interrupted) {
+        return Err(Abrupt::Interrupted);
     }
-    let value = match args.get(0) {
-        Some(value) => value,
-        None => ctx.root(Value::UNDEFINED)?,
-    };
-    iterator_result(ctx, value, true)
+    Err(ctx.throw(reason))
 }
 
 pub(crate) fn iterator_result<'s>(
@@ -458,8 +546,4 @@ pub(crate) fn for_in_next<'s>(
         }
         ctx.check_interrupt()?;
     }
-}
-
-pub(super) fn invalid_resume(ctx: &mut ExecCtx<'_, '_>) -> Abrupt {
-    ctx.throw_error(ErrorKind::Internal, "coroutine resumed outside a generator")
 }

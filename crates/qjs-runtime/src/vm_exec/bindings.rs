@@ -600,6 +600,18 @@ fn arguments(
     if mapped {
         let callee = ctx.root(Value::object(frame.callee))?;
         define_flags(ctx, object, Atom::get("callee"), callee, flags)?;
+    } else {
+        let poison = ctx.new_native(crate::builtins::vm_internal::THROW_TYPE_ERROR, false)?;
+        property::define_own_property(
+            ctx,
+            object,
+            Atom::get("callee"),
+            property::PropertyDescriptor {
+                get: Some(poison),
+                set: Some(poison),
+                ..Default::default()
+            },
+        )?;
     }
     let array = ctx.root(Value::object(ctx.realm().array_proto))?;
     let iterator_key = well_known(ctx, WellKnown::Iterator);

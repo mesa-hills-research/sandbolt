@@ -115,6 +115,7 @@ pub struct CallFrame {
     pub(crate) last_pc: u32,
     pub(crate) return_call: bool,
     pub(crate) require_object: bool,
+    pub(crate) coroutine: Option<CoroId>,
 }
 impl Trace for CallFrame {
     fn trace(&self, tracer: &Tracer<'_>) {
@@ -122,6 +123,7 @@ impl Trace for CallFrame {
         self.realm.trace(tracer);
         self.code.trace(tracer);
         self.new_target.trace(tracer);
+        self.coroutine.trace(tracer);
     }
 }
 
@@ -131,7 +133,39 @@ pub struct CoroutineState {
     pub frames: TrackedVec<CallFrame>,
     pub stack: TrackedVec<Value>,
     pub open_vars: TrackedVec<VarRefId>,
+    pub(crate) owner: Option<ObjId>,
+    pub(crate) kind: FunctionKind,
+    pub(crate) status: CoroStatus,
+    pub(crate) initial_call: bool,
+    pub(crate) capability: [Value; 3],
+    pub(crate) requests: TrackedVec<CoroRequest>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoroStatus {
+    Running,
+    Start,
+    Yield,
+    YieldStar,
+    Await,
+    AwaitReturn,
+    Done,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CoroRequest {
+    pub mode: u16,
+    pub value: Value,
+    pub capability: [Value; 3],
+}
+
+impl Trace for CoroRequest {
+    fn trace(&self, tracer: &Tracer<'_>) {
+        self.value.trace(tracer);
+        self.capability.as_slice().trace(tracer);
+    }
+}
+
 impl ArenaItem for CoroutineState {
     type Id = CoroId;
 }
@@ -141,6 +175,9 @@ impl Trace for CoroutineState {
         self.frames.trace(tracer);
         self.stack.trace(tracer);
         self.open_vars.trace(tracer);
+        self.owner.trace(tracer);
+        self.capability.as_slice().trace(tracer);
+        self.requests.trace(tracer);
     }
 }
 

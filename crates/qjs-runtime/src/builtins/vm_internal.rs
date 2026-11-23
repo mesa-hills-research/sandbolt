@@ -28,7 +28,12 @@ const ASYNC_FROM_SYNC_THROW: NativeFnId = NativeFnId(BASE + 16);
 const FOR_IN_NEXT: NativeFnId = NativeFnId(BASE + 17);
 const HOST: NativeFnId = NativeFnId(BASE + 18);
 const PRINT: NativeFnId = NativeFnId(BASE + 19);
-const THROW_TYPE_ERROR: NativeFnId = NativeFnId(BASE + 20);
+pub(crate) const THROW_TYPE_ERROR: NativeFnId = NativeFnId(BASE + 20);
+pub(crate) const AWAIT_FULFILLED: NativeFnId = NativeFnId(BASE + 21);
+pub(crate) const AWAIT_REJECTED: NativeFnId = NativeFnId(BASE + 22);
+pub(crate) const ASYNC_UNWRAP: NativeFnId = NativeFnId(BASE + 23);
+pub(crate) const ASYNC_CLOSE_REJECT: NativeFnId = NativeFnId(BASE + 24);
+pub(crate) const SYNC_DISPOSER: NativeFnId = NativeFnId(BASE + 25);
 
 pub fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
     let global = ctx.root(Value::object(ctx.realm().global_object))?;
@@ -109,6 +114,37 @@ pub fn dispatch<'s>(
         | ASYNC_GENERATOR_THROW => exec::resume_generator(ctx, this, args, id.0 - GENERATOR_NEXT.0),
         ASYNC_FROM_SYNC_NEXT | ASYNC_FROM_SYNC_RETURN | ASYNC_FROM_SYNC_THROW => {
             exec::async_from_sync_call(ctx, this, args, id.0 - ASYNC_FROM_SYNC_NEXT.0)
+        }
+        AWAIT_FULFILLED | AWAIT_REJECTED => {
+            exec::coroutines::resume_await(ctx, this, args, id == AWAIT_REJECTED)
+        }
+        ASYNC_UNWRAP => {
+            let arg = match args.get(0) {
+                Some(arg) => arg,
+                None => ctx.root(Value::UNDEFINED)?,
+            };
+            exec::iterator_result(ctx, arg, ctx.get(this) == Value::bool(true))
+        }
+        ASYNC_CLOSE_REJECT => {
+            let error = args.get(0).map_or(Value::UNDEFINED, |arg| ctx.get(arg));
+            exec::close_original(ctx, this, error).map(|()| Value::UNDEFINED)
+        }
+        SYNC_DISPOSER => {
+            let undefined = ctx.root(Value::UNDEFINED)?;
+            match crate::ops::call::call(ctx, this, undefined, Args::empty()) {
+                Ok(_) => Ok(Value::UNDEFINED),
+                Err(Abrupt::Thrown) => {
+                    let reason = ctx.take_exception().unwrap().0;
+                    let reason = ctx.root(reason)?;
+                    let ctor = ctx.root(Value::object(ctx.realm().promise_ctor))?;
+                    let cap =
+                        crate::builtins::promise_json_extras::new_promise_capability(ctx, ctor)?;
+                    let args = ctx.args(&[reason])?;
+                    crate::ops::call::call(ctx, cap.reject, undefined, args)?;
+                    Ok(ctx.get(cap.promise))
+                }
+                Err(error) => Err(error),
+            }
         }
         FOR_IN_NEXT => {
             let [value, done] = exec::for_in_next(ctx, this)?;
