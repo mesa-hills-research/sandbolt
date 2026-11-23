@@ -117,10 +117,11 @@ impl JsEngine {
 
     pub fn set_can_block(&mut self, can_block: bool) {
         self.can_block = can_block;
+        self.runtime.set_can_block(can_block);
     }
 
     pub fn can_block(&self) -> bool {
-        self.can_block
+        self.runtime.can_block()
     }
 
     pub fn host_callback_mut(&mut self) -> Option<&mut HostCallback> {

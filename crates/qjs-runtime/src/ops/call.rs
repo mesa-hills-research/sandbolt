@@ -23,7 +23,7 @@ pub fn call<'s>(
     this: Handle<'s>,
     args: Args<'s>,
 ) -> JsResult<Value> {
-    invoke(ctx, ctx.get(callee), ctx.get(this), args, false)
+    invoke(ctx, ctx.get(callee), ctx.get(this), args, None)
 }
 
 pub fn construct<'s>(
@@ -51,6 +51,19 @@ pub fn construct<'s>(
         }
         callee_id = bound.target;
     }
+    // Built-in native constructors (`0x1000..=0x1FFF`) perform their own argument
+    // validation and `OrdinaryCreateFromConstructor(newTarget, defaultProto)`.
+    if let ObjectData::NativeFunction(native_fn) = &ctx.heap().object(callee_id).data
+        && (0x1000..=0x1FFF).contains(&native_fn.function.0)
+    {
+        return invoke(
+            ctx,
+            actual_callee,
+            Value::UNDEFINED,
+            args,
+            Some(new_target_id),
+        );
+    }
     let new_target = ctx.root(Value::object(new_target_id))?;
     let proto = super::property::get_property(ctx, new_target, PropKey::atom(Atom::PROTOTYPE))?;
     let realm = function_realm(ctx.heap(), new_target_id).unwrap_or(ctx.realm_id());
@@ -59,7 +72,13 @@ pub fn construct<'s>(
         .unwrap_or(ctx.heap().realm(realm).object_proto);
     let rooted_proto = ctx.root(Value::object(proto))?;
     let object = ctx.new_object_with_proto(Some(rooted_proto))?;
-    let result = invoke(ctx, actual_callee, ctx.get(object), args, true)?;
+    let result = invoke(
+        ctx,
+        actual_callee,
+        ctx.get(object),
+        args,
+        Some(new_target_id),
+    )?;
     Ok(if result.as_object().is_some() {
         result
     } else {
@@ -67,7 +86,7 @@ pub fn construct<'s>(
     })
 }
 
-fn function_realm(heap: &Heap, mut id: ObjId) -> Option<RealmId> {
+pub(crate) fn function_realm(heap: &Heap, mut id: ObjId) -> Option<RealmId> {
     loop {
         match &heap.object(id).data {
             ObjectData::NativeFunction(f) => return Some(f.realm),
@@ -84,7 +103,7 @@ fn invoke<'s>(
     callee: Value,
     this: Value,
     args: Args<'s>,
-    constructing: bool,
+    new_target: Option<ObjId>,
 ) -> JsResult<Value> {
     let depth = ctx.runtime.vm.frames.len();
     let base = ctx.runtime.vm.stack.len();
@@ -107,7 +126,7 @@ fn invoke<'s>(
             let value = ctx.get(args.get(index).unwrap());
             ctx.runtime.vm.stack.push_reserved(value);
         }
-        enter(ctx, base, args.len(), constructing)?;
+        enter(ctx, base, args.len(), new_target)?;
         drive(ctx, depth)?;
         Ok(ctx.runtime.vm.stack[base])
     })();
@@ -122,8 +141,9 @@ fn enter(
     ctx: &mut ExecCtx<'_, '_>,
     base: usize,
     mut count: usize,
-    constructing: bool,
+    new_target: Option<ObjId>,
 ) -> JsResult<()> {
+    let constructing = new_target.is_some();
     let mut callee = base_value(ctx, base)
         .as_object()
         .ok_or_else(|| ctx.throw_type_error("expected a callable function"))?;
@@ -169,6 +189,7 @@ fn enter(
         callee,
         realm,
         code,
+        new_target,
         pc: 0,
         base: base as u32,
         arg_count: count as u32,
@@ -306,7 +327,7 @@ fn execute(
             if len - floor < values {
                 return Err(ctx.throw_type_error("bytecode stack underflow"));
             }
-            enter(ctx, len - values, count as usize, false)?;
+            enter(ctx, len - values, count as usize, None)?;
             return Ok(None);
         }
         MiniOp::Return => return pop(ctx, floor).map(Some),

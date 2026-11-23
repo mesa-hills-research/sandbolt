@@ -1,3 +1,5 @@
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
 use crate::EngineLimits;
 use crate::arena::ArenaItem;
 use crate::atom::{Atom, PropKey};
@@ -61,7 +63,7 @@ impl Trace for EmergencyError {
 }
 
 macro_rules! intrinsics {
-    ($object:ident, $internal_error:ident, $range_error:ident, $array:ident; $(($proto:ident, $ctor:ident, $parent:ident)),+ $(,)?) => {
+    ($object:ident, $internal_error:ident, $range_error:ident, $array:ident, $iterator:ident, $async_iterator:ident; $(($proto:ident, $ctor:ident, $parent:ident)),+ $(,)?) => {
         #[derive(Debug)]
         pub struct Realm {
             pub global_object: ObjId,
@@ -70,7 +72,19 @@ macro_rules! intrinsics {
             pub function_proto: ObjId,
             pub function_ctor: ObjId,
             $( pub $proto: ObjId, pub $ctor: ObjId, )+
+            pub array_iterator_proto: ObjId,
+            pub string_iterator_proto: ObjId,
+            pub regexp_string_iterator_proto: ObjId,
+            pub map_iterator_proto: ObjId,
+            pub set_iterator_proto: ObjId,
+            pub iterator_helper_proto: ObjId,
+            pub iterator_wrap_proto: ObjId,
+            pub async_from_sync_iterator_proto: ObjId,
+            pub for_in_iterator_proto: ObjId,
+            pub typed_array_concrete: [Option<(ObjId, ObjId)>; 12],
             pub std_array_prototype_intact: bool,
+            pub time_origin_instant: Instant,
+            pub time_origin_epoch_ms: f64,
             pub(crate) oom_error: EmergencyError,
             pub(crate) stack_error: EmergencyError,
         }
@@ -83,6 +97,19 @@ macro_rules! intrinsics {
                 self.function_proto.trace(tracer);
                 self.function_ctor.trace(tracer);
                 $( self.$proto.trace(tracer); self.$ctor.trace(tracer); )+
+                self.array_iterator_proto.trace(tracer);
+                self.string_iterator_proto.trace(tracer);
+                self.regexp_string_iterator_proto.trace(tracer);
+                self.map_iterator_proto.trace(tracer);
+                self.set_iterator_proto.trace(tracer);
+                self.iterator_helper_proto.trace(tracer);
+                self.iterator_wrap_proto.trace(tracer);
+                self.async_from_sync_iterator_proto.trace(tracer);
+                self.for_in_iterator_proto.trace(tracer);
+                for pair in self.typed_array_concrete.into_iter().flatten() {
+                    pair.0.trace(tracer);
+                    pair.1.trace(tracer);
+                }
                 self.oom_error.trace(tracer);
                 self.stack_error.trace(tracer);
             }
@@ -96,14 +123,41 @@ macro_rules! intrinsics {
             let function_proto = heap.insert_object(Some($object), proto, ObjectData::Ordinary)?;
             let global_object = heap.insert_object(Some($object), ordinary, ObjectData::Ordinary)?;
             $( let $proto = heap.insert_object(Some($parent), proto, ObjectData::Ordinary)?; )+
+            let array_iterator_proto = heap.insert_object(Some($iterator), proto, ObjectData::Ordinary)?;
+            let string_iterator_proto = heap.insert_object(Some($iterator), proto, ObjectData::Ordinary)?;
+            let regexp_string_iterator_proto = heap.insert_object(Some($iterator), proto, ObjectData::Ordinary)?;
+            let map_iterator_proto = heap.insert_object(Some($iterator), proto, ObjectData::Ordinary)?;
+            let set_iterator_proto = heap.insert_object(Some($iterator), proto, ObjectData::Ordinary)?;
+            let iterator_helper_proto = heap.insert_object(Some($iterator), proto, ObjectData::Ordinary)?;
+            let iterator_wrap_proto = heap.insert_object(Some($iterator), proto, ObjectData::Ordinary)?;
+            let async_from_sync_iterator_proto = heap.insert_object(Some($async_iterator), proto, ObjectData::Ordinary)?;
+            let for_in_iterator_proto = heap.insert_object(Some($object), proto, ObjectData::Ordinary)?;
             let oom_error = EmergencyError::new(heap, $internal_error, ErrorKind::Internal, "out of memory")?;
             let stack_error = EmergencyError::new(heap, $range_error, ErrorKind::Range, "Maximum call stack size exceeded")?;
+            let time_origin_instant = Instant::now();
+            let time_origin_epoch_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
 
             // Constructor identity is installed after the realm has an ID.
             let realm = heap.realms.insert_reserved(Realm {
                 global_object, object_proto: $object, object_ctor: function_proto, function_proto, function_ctor: function_proto,
                 $( $proto, $ctor: function_proto, )+
-                std_array_prototype_intact: true, oom_error, stack_error,
+                array_iterator_proto,
+                string_iterator_proto,
+                regexp_string_iterator_proto,
+                map_iterator_proto,
+                set_iterator_proto,
+                iterator_helper_proto,
+                iterator_wrap_proto,
+                async_from_sync_iterator_proto,
+                for_in_iterator_proto,
+                typed_array_concrete: [None; 12],
+                std_array_prototype_intact: true,
+                time_origin_instant,
+                time_origin_epoch_ms,
+                oom_error, stack_error,
             });
             let constructors = (|| {
                 let data = native_payload(heap, realm, NativeFnId::EMPTY)?;
@@ -131,7 +185,7 @@ macro_rules! intrinsics {
     };
 }
 
-intrinsics!(object_proto, internal_error_proto, range_error_proto, array_proto;
+intrinsics!(object_proto, internal_error_proto, range_error_proto, array_proto, iterator_proto, async_iterator_proto;
     (array_proto, array_ctor, object_proto), (error_proto, error_ctor, object_proto),
     (type_error_proto, type_error_ctor, error_proto), (range_error_proto, range_error_ctor, error_proto),
     (reference_error_proto, reference_error_ctor, error_proto), (syntax_error_proto, syntax_error_ctor, error_proto),
@@ -344,7 +398,14 @@ pub(crate) fn bootstrap_error(
 ) -> AllocResult<ObjId> {
     let message = JsString::from_str(&heap.ledger, text)?;
     let message = Value::string(heap.strings.insert(&heap.ledger, message)?);
-    let data = TrackedBox::new(&heap.ledger, ErrorData { kind, message })?;
+    let data = TrackedBox::new(
+        &heap.ledger,
+        ErrorData {
+            kind,
+            message,
+            stack: Value::UNDEFINED,
+        },
+    )?;
     let object = heap.insert_object(
         Some(proto),
         ObjectFlags::EXTENSIBLE,
@@ -403,6 +464,12 @@ impl Runtime {
     }
     pub fn set_interrupt_handler(&mut self, handler: Option<Box<dyn FnMut() -> bool>>) {
         self.vm.interrupt_handler = handler;
+    }
+    pub fn can_block(&self) -> bool {
+        self.vm.can_block
+    }
+    pub fn set_can_block(&mut self, can_block: bool) {
+        self.vm.can_block = can_block;
     }
     pub fn pending_exception(&self) -> Option<Value> {
         self.vm.exception

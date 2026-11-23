@@ -54,6 +54,7 @@ pub struct CallFrame {
     pub callee: ObjId,
     pub realm: RealmId,
     pub code: Option<BcId>,
+    pub new_target: Option<ObjId>,
     pub pc: u32,
     pub base: u32,
     pub arg_count: u32,
@@ -63,6 +64,7 @@ impl Trace for CallFrame {
         self.callee.trace(tracer);
         self.realm.trace(tracer);
         self.code.trace(tracer);
+        self.new_target.trace(tracer);
     }
 }
 
@@ -149,6 +151,7 @@ pub struct VmState {
     pub(crate) exception: Option<Value>,
     pub(crate) oom_thrown: bool,
     pub(crate) interrupt_handler: Option<Box<dyn FnMut() -> bool>>,
+    pub can_block: bool,
     pub limits: EngineLimits,
 }
 
@@ -161,6 +164,7 @@ impl VmState {
             exception: None,
             oom_thrown: false,
             interrupt_handler: None,
+            can_block: true,
             limits,
         }
     }

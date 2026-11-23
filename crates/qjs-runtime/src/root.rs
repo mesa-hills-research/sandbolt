@@ -154,6 +154,40 @@ impl<'s> ExecCtx<'_, 's> {
     pub fn realm_id(&self) -> RealmId {
         self.realm
     }
+    pub fn new_target(&self) -> Option<ObjId> {
+        self.runtime.vm.frames.last().and_then(|frame| frame.new_target)
+    }
+    pub fn can_block(&self) -> bool {
+        self.runtime.vm.can_block
+    }
+    pub fn ordinary_create_from_constructor(
+        &mut self,
+        new_target: ObjId,
+        default_proto: impl FnOnce(&Realm) -> ObjId,
+        flags: ObjectFlags,
+        mut make_data: impl FnMut(&Heap) -> crate::ledger::AllocResult<ObjectData>,
+    ) -> JsResult<Handle<'s>> {
+        let rooted_nt = self.root(Value::object(new_target))?;
+        let proto = crate::ops::property::get_property(
+            self,
+            rooted_nt,
+            PropKey::atom(crate::atom::Atom::PROTOTYPE),
+        )?;
+        let proto_id = if let Some(obj) = proto.as_object() {
+            obj
+        } else {
+            let realm_id =
+                crate::ops::call::function_realm(self.heap(), new_target).unwrap_or(self.realm);
+            default_proto(self.heap().realm(realm_id))
+        };
+        let rooted_proto = self.root(Value::object(proto_id))?;
+        let id = self.allocate(|runtime| {
+            let proto = runtime.vm.stack[rooted_proto.index()].as_object();
+            let payload = make_data(&runtime.heap)?;
+            runtime.heap.insert_object(proto, flags, payload)
+        })?;
+        self.root(Value::object(id))
+    }
 
     pub fn with_scope<R>(&mut self, f: impl for<'a> FnOnce(&mut ExecCtx<'_, 'a>) -> R) -> R {
         RootScope::new(self.runtime, self.realm).run(f)
@@ -569,6 +603,10 @@ impl<'s> ExecCtx<'_, 's> {
                     code,
                     realm,
                     closure: copy_args(closure)?,
+                    home_object: None,
+                    is_class_constructor: false,
+                    is_arrow: false,
+                    is_derived_constructor: false,
                 },
             )?;
             heap.insert_object(Some(proto), flags, ObjectData::BytecodeFunction(data))

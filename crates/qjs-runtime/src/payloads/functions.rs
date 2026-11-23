@@ -8,12 +8,17 @@ pub struct BytecodeFunctionData {
     pub code: BcId,
     pub realm: RealmId,
     pub closure: TrackedVec<Value>,
+    pub home_object: Option<ObjId>,
+    pub is_class_constructor: bool,
+    pub is_arrow: bool,
+    pub is_derived_constructor: bool,
 }
 impl Trace for BytecodeFunctionData {
     fn trace(&self, tracer: &Tracer<'_>) {
         self.code.trace(tracer);
         self.realm.trace(tracer);
         self.closure.trace(tracer);
+        self.home_object.trace(tracer);
     }
 }
 

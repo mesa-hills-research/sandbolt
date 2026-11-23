@@ -35,9 +35,11 @@ impl ErrorKind {
 pub struct ErrorData {
     pub kind: ErrorKind,
     pub message: Value,
+    pub stack: Value,
 }
 impl Trace for ErrorData {
     fn trace(&self, tracer: &Tracer<'_>) {
         self.message.trace(tracer);
+        self.stack.trace(tracer);
     }
 }
