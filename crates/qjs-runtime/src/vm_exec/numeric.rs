@@ -238,8 +238,14 @@ pub(super) fn binary<'s>(
     right: Handle<'s>,
 ) -> JsResult<Value> {
     use Opcode::*;
-    if let (Some(a), Some(b)) = (ctx.get(left).as_number(), ctx.get(right).as_number()) {
+    let (a, b) = (ctx.get(left), ctx.get(right));
+    if let (Some(a), Some(b)) = (a.as_number(), b.as_number()) {
         return Ok(number_binary(op, a, b));
+    }
+    if matches!(a.decode(), ValueKind::ShortBigInt(_))
+        && matches!(b.decode(), ValueKind::ShortBigInt(_))
+    {
+        return bigint_binary(ctx, op, a, b);
     }
     let (left, right) = if op == Add {
         let a = convert::to_primitive(ctx, left, PreferredType::Default)?;
@@ -263,36 +269,81 @@ pub(super) fn binary<'s>(
     let (a, b) = match (left, right) {
         (Numeric::Number(a), Numeric::Number(b)) => (a, b),
         (Numeric::BigInt(a), Numeric::BigInt(b)) => {
-            if op == Shr {
-                return Err(ctx.throw_type_error("BigInt has no unsigned right shift"));
-            }
-            let (a, b) = (ctx.get(a), ctx.get(b));
-            return with_host(ctx, |heap, host| {
-                let a = read(heap, host, a)?;
-                let b = read(heap, host, b)?;
-                let result = match op {
-                    Add => a.add(&b, host)?,
-                    Sub => a.sub(&b, host)?,
-                    Mul => a.mul(&b, host)?,
-                    Div => a.divrem(&b, host)?.0,
-                    Mod => a.divrem(&b, host)?.1,
-                    Pow => a.pow(&b, host)?,
-                    Shl => a.shl(&b, host)?,
-                    Sar => a.sar(&b, host)?,
-                    And => a.bitand(&b, host)?,
-                    Or => a.bitor(&b, host)?,
-                    Xor => a.bitxor(&b, host)?,
-                    _ => unreachable!(),
-                };
-                store(heap, host, &result)
-            });
+            return bigint_binary(ctx, op, ctx.get(a), ctx.get(b));
         }
         _ => return Err(ctx.throw_type_error("cannot mix BigInt and Number")),
     };
     Ok(number_binary(op, a, b))
 }
 
-fn number_binary(op: Opcode, a: f64, b: f64) -> Value {
+#[inline]
+pub(super) fn short_binary(op: Opcode, a: i64, b: i64, has_interrupt: bool) -> Option<Value> {
+    use Opcode::*;
+    // The limb routines for these operators poll even on one-word operands.
+    if has_interrupt && matches!(op, Mul | Div | Mod | Pow) {
+        return None;
+    }
+    let result = match op {
+        Add => a + b,
+        Sub => a - b,
+        Mul => a.checked_mul(b)?,
+        Div => a.checked_div(b)?,
+        Mod => a.checked_rem(b)?,
+        Pow => a.checked_pow(u32::try_from(b).ok()?)?,
+        And => a & b,
+        Or => a | b,
+        Xor => a ^ b,
+        Shl | Sar => {
+            let shift = b.unsigned_abs();
+            if (op == Sar) ^ (b < 0) {
+                a >> shift.min(63)
+            } else if a == 0 {
+                0
+            } else if shift < 47 {
+                i64::try_from(i128::from(a) << shift).ok()?
+            } else {
+                return None;
+            }
+        }
+        Shr => return None,
+        _ => unreachable!(),
+    };
+    Value::short_bigint(result)
+}
+
+fn bigint_binary(ctx: &mut ExecCtx<'_, '_>, op: Opcode, a: Value, b: Value) -> JsResult<Value> {
+    use Opcode::*;
+    if op == Shr {
+        return Err(ctx.throw_type_error("BigInt has no unsigned right shift"));
+    }
+    if let (ValueKind::ShortBigInt(a), ValueKind::ShortBigInt(b)) = (a.decode(), b.decode())
+        && let Some(result) = short_binary(op, a, b, ctx.runtime.vm.interrupt_handler.is_some())
+    {
+        return Ok(result);
+    }
+    with_host(ctx, |heap, host| {
+        let a = read(heap, host, a)?;
+        let b = read(heap, host, b)?;
+        let result = match op {
+            Add => a.add(&b, host)?,
+            Sub => a.sub(&b, host)?,
+            Mul => a.mul(&b, host)?,
+            Div => a.divrem(&b, host)?.0,
+            Mod => a.divrem(&b, host)?.1,
+            Pow => a.pow(&b, host)?,
+            Shl => a.shl(&b, host)?,
+            Sar => a.sar(&b, host)?,
+            And => a.bitand(&b, host)?,
+            Or => a.bitor(&b, host)?,
+            Xor => a.bitxor(&b, host)?,
+            _ => unreachable!(),
+        };
+        store(heap, host, &result)
+    })
+}
+
+#[inline]
+pub(super) fn number_binary(op: Opcode, a: f64, b: f64) -> Value {
     use Opcode::*;
     if matches!(op, Shl | Sar | Shr | And | Or | Xor) {
         let a = convert::number_to_uint32(a);
@@ -329,6 +380,11 @@ pub(super) fn unary<'s>(
     if let Some(number) = raw.as_number() {
         return Ok(number_unary(op, number));
     }
+    if let ValueKind::ShortBigInt(n) = raw.decode()
+        && let Some(result) = short_unary(op, n)
+    {
+        return Ok((raw, result));
+    }
     let value = ctx.root(raw)?;
     if bigint(raw) {
         if op == Plus {
@@ -356,7 +412,21 @@ pub(super) fn unary<'s>(
     }
 }
 
-fn number_unary(op: Opcode, number: f64) -> (Value, Value) {
+#[inline]
+pub(super) fn short_unary(op: Opcode, number: i64) -> Option<Value> {
+    use Opcode::*;
+    Value::short_bigint(match op {
+        Neg => -number,
+        Inc | PostInc | IncLoc => number + 1,
+        Dec | PostDec | DecLoc => number - 1,
+        Not => !number,
+        Plus => return None,
+        _ => unreachable!(),
+    })
+}
+
+#[inline]
+pub(super) fn number_unary(op: Opcode, number: f64) -> (Value, Value) {
     use Opcode::*;
     let result = match op {
         Neg => -number,

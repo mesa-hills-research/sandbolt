@@ -1,6 +1,8 @@
 use qjs_bytecode::{ClosureKind, Instruction, Opcode, Operands};
 
+use crate::arena::Arena;
 use crate::atom::{Atom, PropKey};
+use crate::heap::Heap;
 use crate::ledger::{TrackedBox, TrackedVec};
 use crate::object::{ArgumentsData, ErrorKind, MappedArgumentsData, ObjectData, ObjectFlags};
 use crate::ops::{convert, property};
@@ -56,18 +58,37 @@ pub(super) fn local_ref(
 }
 
 pub(super) fn close_local(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame, slot: usize) {
-    let cell = capture_slot(frame, slot);
-    if let ValueKind::VarRef(reference) = ctx.runtime.vm.stack[cell].decode() {
-        let value = ctx.runtime.vm.stack[slot];
-        ctx.runtime.heap.var_refs.get_mut(reference).unwrap().state = VarRefState::Closed(value);
-        ctx.runtime.vm.stack[cell] = Value::UNDEFINED;
+    close_slot(
+        &mut ctx.runtime.heap.var_refs,
+        &mut ctx.runtime.vm.stack,
+        slot,
+        capture_slot(frame, slot),
+    );
+}
+
+#[inline]
+fn close_slot(var_refs: &mut Arena<VarRef>, stack: &mut [Value], slot: usize, cell: usize) {
+    if let ValueKind::VarRef(reference) = stack[cell].decode() {
+        var_refs.get_mut(reference).unwrap().state = VarRefState::Closed(stack[slot]);
+        stack[cell] = Value::UNDEFINED;
     }
 }
 
 pub(crate) fn close_frame(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame) {
-    for slot in frame.capture_base as usize..frame.floor as usize {
-        let local = slot - frame.capture_base as usize + frame.base as usize + 2;
-        close_local(ctx, frame, local);
+    close_frame_slots(
+        &mut ctx.runtime.heap.var_refs,
+        &mut ctx.runtime.vm.stack,
+        frame,
+    );
+}
+
+pub(super) fn close_frame_slots(
+    var_refs: &mut Arena<VarRef>,
+    stack: &mut [Value],
+    frame: CallFrame,
+) {
+    for (i, cell) in (frame.capture_base as usize..frame.floor as usize).enumerate() {
+        close_slot(var_refs, stack, frame.base as usize + 2 + i, cell);
     }
 }
 
@@ -174,14 +195,30 @@ pub(super) fn var_op(
 }
 
 fn global_scope(ctx: &ExecCtx<'_, '_>) -> Option<ModId> {
-    ctx.runtime.modules.iter().copied().find(|&id| {
-        let record = ctx.heap().modules.get(id).unwrap();
-        record.global_scope && record.realm == Some(ctx.realm_id())
+    global_scope_in(ctx.heap(), &ctx.runtime.modules, ctx.realm_id())
+}
+
+fn global_scope_in(heap: &Heap, modules: &[ModId], realm: RealmId) -> Option<ModId> {
+    modules.iter().copied().find(|&id| {
+        let record = heap.modules.get(id).unwrap();
+        record.global_scope && record.realm == Some(realm)
     })
 }
 
 fn lexical(ctx: &ExecCtx<'_, '_>, key: PropKey) -> Option<(VarRefId, bool)> {
-    let scope = ctx.heap().modules.get(global_scope(ctx)?).unwrap();
+    lexical_in(ctx.heap(), &ctx.runtime.modules, ctx.realm_id(), key)
+}
+
+pub(super) fn lexical_in(
+    heap: &Heap,
+    modules: &[ModId],
+    realm: RealmId,
+    key: PropKey,
+) -> Option<(VarRefId, bool)> {
+    let scope = heap
+        .modules
+        .get(global_scope_in(heap, modules, realm)?)
+        .unwrap();
     scope
         .lexical
         .iter()
@@ -218,6 +255,7 @@ fn define_lexical(ctx: &mut ExecCtx<'_, '_>, key: PropKey, writable: bool) -> Js
             },
         )?;
         scope.lexical.push_reserved((key, (id, writable)));
+        rt.vm.global_lexical_epoch += 1;
         Ok(())
     })
 }

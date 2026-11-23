@@ -1,4 +1,5 @@
 mod bindings;
+mod cache;
 pub(crate) mod coroutines;
 pub(crate) mod eval;
 mod iterators;
@@ -20,7 +21,7 @@ use crate::ops::{call, compare, convert, property};
 use crate::root::{Args, ExecCtx, Handle};
 use crate::shape::PropFlags;
 use crate::value::*;
-use crate::vm::{CallFrame, CompiledFunc};
+use crate::vm::{CallFrame, CompiledFunc, VarRefState};
 
 pub(crate) use bindings::{read_ref, write_ref};
 pub(crate) use iterators::{async_from_sync_call, close_original, for_in_next, iterator_result};
@@ -80,13 +81,22 @@ pub(super) fn well_known(ctx: &ExecCtx<'_, '_>, symbol: crate::symbol::WellKnown
 }
 
 fn key(ctx: &ExecCtx<'_, '_>, code: BcId, atom: qjs_bytecode::UnitAtom) -> PropKey {
+    compiled_key(ctx.heap(), compiled(ctx, code), atom)
+}
+
+fn compiled_key(
+    heap: &crate::heap::Heap,
+    function: &CompiledFunc,
+    atom: qjs_bytecode::UnitAtom,
+) -> PropKey {
     let index = atom
         .raw()
         .wrapping_sub(qjs_bytecode::BuiltinAtom::SymbolToPrimitive as u32) as usize;
-    if let Some(symbol) = crate::symbol::WellKnown::ALL.get(index) {
-        well_known(ctx, *symbol)
+    if let Some(&symbol) = crate::symbol::WellKnown::ALL.get(index) {
+        let id = heap.symbol_registry.well_known(symbol);
+        heap.symbols.get(id).unwrap().key()
     } else {
-        compiled(ctx, code).key(atom)
+        function.key(atom)
     }
 }
 
@@ -116,30 +126,564 @@ fn branch(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame, index: usize, target: u32
     Ok(())
 }
 
-pub(crate) fn step(
+pub(crate) fn run_frame(
+    ctx: &mut ExecCtx<'_, '_>,
+    mut index: usize,
+    mut code: BcId,
+) -> JsResult<Option<Value>> {
+    use Opcode::*;
+    let entry_index = index;
+    'frames: loop {
+        let frame = ctx.runtime.vm.frames[index];
+        let arg_base = frame.base as usize + 2;
+        let var_base = arg_base + frame.arg_slots as usize;
+        let mut pc = frame.pc;
+        loop {
+            // A slow instruction can collect or reenter the VM. Take these borrows again after it.
+            let heap = &mut ctx.runtime.heap;
+            let vm = &mut ctx.runtime.vm;
+            let bytecode = heap.bytecode.get(code).unwrap();
+            let function = bytecode.compiled.as_ref().unwrap();
+            let bytes = &function.code;
+            let (at, op) = loop {
+                if !function.hoisted.is_empty()
+                    && let Ok(i) = function.hoisted.binary_search_by_key(&pc, |&(at, _)| at)
+                {
+                    pc = function.hoisted[i].1;
+                    continue;
+                }
+                let at = pc;
+                let pos = at as usize + 1;
+                let byte = bytes[at as usize];
+                let op = Opcode::ALL[byte as usize];
+                pc += u32::from(op.info().size);
+                let u16 = || u16::from_le_bytes([bytes[pos], bytes[pos + 1]]);
+                let u32 = || {
+                    u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                };
+                let stack = &mut vm.stack;
+                let tail = stack.len();
+                match op {
+                    Nop => {}
+                    PushI32 | PushI16 | PushI8 | PushMinus1 | Push0 | Push1 | Push2 | Push3
+                    | Push4 | Push5 | Push6 | Push7 => {
+                        stack.push_reserved(Value::int32(match op {
+                            PushI32 => u32() as i32,
+                            PushI16 => i32::from(u16() as i16),
+                            PushI8 => i32::from(bytes[pos] as i8),
+                            _ => i32::from(byte) - Push0 as i32,
+                        }))
+                    }
+                    PushBigintI32 => {
+                        stack.push_reserved(Value::short_bigint(i64::from(u32() as i32)).unwrap());
+                    }
+                    Undefined => stack.push_reserved(Value::UNDEFINED),
+                    Null => stack.push_reserved(Value::NULL),
+                    PushFalse | PushTrue => stack.push_reserved(Value::bool(op == PushTrue)),
+                    PushThis => {
+                        let raw = stack[arg_base - 1];
+                        let value = if function.strict || raw.as_object().is_some() {
+                            raw
+                        } else if raw == Value::NULL || raw == Value::UNDEFINED {
+                            Value::object(heap.realm(frame.realm).global_object)
+                        } else {
+                            break (at, op);
+                        };
+                        stack.push_reserved(value);
+                    }
+                    SpecialObject if matches!(bytes[pos], 2 | 3) && function.eval.is_none() => {
+                        let value = if bytes[pos] == 2 {
+                            Value::object(frame.callee)
+                        } else {
+                            frame.new_target.map_or(Value::UNDEFINED, Value::object)
+                        };
+                        stack.push_reserved(value);
+                    }
+                    PushConst | PushConst8 => {
+                        let i = if op == PushConst8 {
+                            bytes[pos].into()
+                        } else {
+                            u32()
+                        };
+                        if !function.regex_constants.is_empty()
+                            && function.regex_constants.binary_search(&i).is_ok()
+                        {
+                            break (at, op);
+                        }
+                        stack.push_reserved(bytecode.constants[i as usize]);
+                    }
+                    Drop => {
+                        stack.pop();
+                    }
+                    Dup => stack.push_reserved(stack[tail - 1]),
+                    Dup1 => {
+                        let last = stack[tail - 1];
+                        stack[tail - 1] = stack[tail - 2];
+                        stack.push_reserved(last);
+                    }
+                    Swap => stack.swap(tail - 2, tail - 1),
+                    Nip => {
+                        let last = stack.pop().unwrap();
+                        stack[tail - 2] = last;
+                    }
+                    GetLoc0Loc1 => {
+                        stack.push_reserved(stack[var_base]);
+                        stack.push_reserved(stack[var_base + 1]);
+                    }
+                    GetLoc | GetLoc8 | GetLoc0 | GetLoc1 | GetLoc2 | GetLoc3 | PutLoc | PutLoc8
+                    | PutLoc0 | PutLoc1 | PutLoc2 | PutLoc3 | SetLoc | SetLoc8 | SetLoc0
+                    | SetLoc1 | SetLoc2 | SetLoc3 => {
+                        let slot = var_base
+                            + match op {
+                                GetLoc | PutLoc | SetLoc => usize::from(u16()),
+                                GetLoc8 | PutLoc8 | SetLoc8 => usize::from(bytes[pos]),
+                                _ => usize::from((byte - GetLoc0 as u8) % 4),
+                            };
+                        match op {
+                            GetLoc | GetLoc8 | GetLoc0 | GetLoc1 | GetLoc2 | GetLoc3 => {
+                                stack.push_reserved(stack[slot]);
+                            }
+                            PutLoc | PutLoc8 | PutLoc0 | PutLoc1 | PutLoc2 | PutLoc3 => {
+                                stack[slot] = stack.pop().unwrap();
+                            }
+                            _ => stack[slot] = stack[tail - 1],
+                        }
+                    }
+                    GetArg | GetArg0 | GetArg1 | GetArg2 | GetArg3 | PutArg | PutArg0 | PutArg1
+                    | PutArg2 | PutArg3 | SetArg | SetArg0 | SetArg1 | SetArg2 | SetArg3 => {
+                        let slot = arg_base
+                            + match op {
+                                GetArg | PutArg | SetArg => usize::from(u16()),
+                                _ => usize::from((byte - GetArg0 as u8) % 4),
+                            };
+                        match op {
+                            GetArg | GetArg0 | GetArg1 | GetArg2 | GetArg3 => {
+                                stack.push_reserved(stack[slot]);
+                            }
+                            PutArg | PutArg0 | PutArg1 | PutArg2 | PutArg3 => {
+                                stack[slot] = stack.pop().unwrap();
+                            }
+                            _ => stack[slot] = stack[tail - 1],
+                        }
+                    }
+                    GetVarRef | GetVarRef0 | GetVarRef1 | GetVarRef2 | GetVarRef3 | PutVarRef
+                    | PutVarRef0 | PutVarRef1 | PutVarRef2 | PutVarRef3 | SetVarRef
+                    | SetVarRef0 | SetVarRef1 | SetVarRef2 | SetVarRef3 => {
+                        let i = match op {
+                            GetVarRef | PutVarRef | SetVarRef => usize::from(u16()),
+                            _ => usize::from((byte - GetVarRef0 as u8) % 4),
+                        };
+                        let ObjectData::BytecodeFunction(data) = &heap.object(frame.callee).data
+                        else {
+                            unreachable!()
+                        };
+                        let Some(ValueKind::VarRef(id)) = data.closure.get(i).map(|v| v.decode())
+                        else {
+                            break (at, op);
+                        };
+                        if matches!(
+                            op,
+                            GetVarRef | GetVarRef0 | GetVarRef1 | GetVarRef2 | GetVarRef3
+                        ) {
+                            let value = match heap.var_refs.get(id).unwrap().state {
+                                VarRefState::OpenStack(i) => stack[i as usize],
+                                VarRefState::OpenCoro { coro, local } => {
+                                    heap.coroutines.get(coro).unwrap().stack[local as usize]
+                                }
+                                VarRefState::Closed(value) => value,
+                            };
+                            stack.push_reserved(value);
+                        } else {
+                            let value = stack[tail - 1];
+                            let entry = heap.var_refs.get_mut(id).unwrap();
+                            match entry.state {
+                                VarRefState::OpenStack(i) => stack[i as usize] = value,
+                                VarRefState::OpenCoro { coro, local } => {
+                                    heap.coroutines.get_mut(coro).unwrap().stack[local as usize] =
+                                        value;
+                                }
+                                VarRefState::Closed(_) => entry.state = VarRefState::Closed(value),
+                            }
+                            if matches!(
+                                op,
+                                PutVarRef | PutVarRef0 | PutVarRef1 | PutVarRef2 | PutVarRef3
+                            ) {
+                                stack.pop();
+                            }
+                        }
+                    }
+                    Add | Sub | Mul | Div | Mod | Shl | Sar | Shr | And | Or | Xor | Pow
+                    | AddLoc => {
+                        let lhs = if op == AddLoc {
+                            var_base + usize::from(bytes[pos])
+                        } else {
+                            tail - 2
+                        };
+                        let binop = if op == AddLoc { Add } else { op };
+                        let Some(result) = fast_binary(
+                            binop,
+                            stack[lhs],
+                            stack[tail - 1],
+                            vm.interrupt_handler.is_some(),
+                        ) else {
+                            break (at, op);
+                        };
+                        stack[lhs] = result;
+                        stack.pop();
+                    }
+                    Neg | Plus | Not | Inc | Dec | PostInc | PostDec | IncLoc | DecLoc => {
+                        let slot = if matches!(op, IncLoc | DecLoc) {
+                            var_base + usize::from(bytes[pos])
+                        } else {
+                            tail - 1
+                        };
+                        let Some((before, after)) = fast_unary(op, stack[slot]) else {
+                            break (at, op);
+                        };
+                        if matches!(op, PostInc | PostDec) {
+                            stack[slot] = before;
+                            stack.push_reserved(after);
+                        } else {
+                            stack[slot] = after;
+                        }
+                    }
+                    Eq | Neq | StrictEq | StrictNeq | Lt | Lte | Gt | Gte => {
+                        let (Some(a), Some(b)) =
+                            (stack[tail - 2].as_number(), stack[tail - 1].as_number())
+                        else {
+                            break (at, op);
+                        };
+                        stack[tail - 2] = Value::bool(match op {
+                            Eq | StrictEq => a == b,
+                            Neq | StrictNeq => a != b,
+                            Lt => a < b,
+                            Lte => a <= b,
+                            Gt => a > b,
+                            Gte => a >= b,
+                            _ => unreachable!(),
+                        });
+                        stack.pop();
+                    }
+                    Lnot => {
+                        stack[tail - 1] =
+                            Value::bool(!convert::to_boolean_value(heap, stack[tail - 1]));
+                    }
+                    GetField | GetField2 | PutField => {
+                        let writing = op == PutField;
+                        let object_slot = tail - 1 - usize::from(writing);
+                        let Some(id) = stack[object_slot].as_object() else {
+                            break (at, op);
+                        };
+                        let name = cache::Key::Field(qjs_bytecode::UnitAtom(u32()));
+                        let Some(entry) = cache::own_slot(
+                            heap,
+                            function,
+                            at,
+                            id,
+                            writing,
+                            (0, name),
+                            (&[], frame.realm),
+                        ) else {
+                            break (at, op);
+                        };
+                        let slot = entry.slot as usize;
+                        match op {
+                            PutField => {
+                                heap.objects.get_mut(id).unwrap().props[slot] = stack[tail - 1];
+                                stack.truncate(tail - 2);
+                            }
+                            GetField2 => stack.push_reserved(heap.object(id).props[slot]),
+                            _ => stack[object_slot] = heap.object(id).props[slot],
+                        }
+                    }
+                    GetVar | GetVarUndef | PutVar | MakeVarRef => {
+                        if function.eval.is_some() {
+                            break (at, op);
+                        }
+                        let id = heap.realm(frame.realm).global_object;
+                        let atom = qjs_bytecode::UnitAtom(u32());
+                        let name = if op == MakeVarRef {
+                            cache::Key::GlobalRef(atom)
+                        } else {
+                            cache::Key::Global(atom)
+                        };
+                        let Some(entry) = cache::own_slot(
+                            heap,
+                            function,
+                            at,
+                            id,
+                            op == PutVar,
+                            (vm.global_lexical_epoch, name),
+                            (&ctx.runtime.modules, frame.realm),
+                        ) else {
+                            break (at, op);
+                        };
+                        let slot = entry.slot as usize;
+                        match op {
+                            PutVar => {
+                                heap.objects.get_mut(id).unwrap().props[slot] = stack.pop().unwrap()
+                            }
+                            MakeVarRef => {
+                                stack.push_reserved(Value::object(id));
+                                stack.push_reserved(entry.key);
+                            }
+                            _ => stack.push_reserved(heap.object(id).props[slot]),
+                        }
+                    }
+                    GetRefValue | PutRefValue => {
+                        let writing = op == PutRefValue;
+                        let source = tail - 2 - usize::from(writing);
+                        let global = heap.realm(frame.realm).global_object;
+                        if stack[source] != Value::object(global) {
+                            break (at, op);
+                        }
+                        let ValueKind::String(str) = stack[source + 1].decode() else {
+                            break (at, op);
+                        };
+                        let Some(entry) = cache::own_slot(
+                            heap,
+                            function,
+                            at,
+                            global,
+                            writing,
+                            (0, cache::Key::ResolvedRef(str)),
+                            (&[], frame.realm),
+                        ) else {
+                            break (at, op);
+                        };
+                        let slot = entry.slot as usize;
+                        if writing {
+                            heap.objects.get_mut(global).unwrap().props[slot] = stack[tail - 1];
+                            stack.truncate(source);
+                        } else {
+                            stack.push_reserved(heap.object(global).props[slot]);
+                        }
+                    }
+                    GetArrayEl | GetArrayEl2 | PutArrayEl => {
+                        let writing = op == PutArrayEl;
+                        let object_slot = tail - 2 - usize::from(writing);
+                        let Some(id) = stack[object_slot].as_object() else {
+                            break (at, op);
+                        };
+                        let ValueKind::Int32(index) = stack[object_slot + 1].decode() else {
+                            break (at, op);
+                        };
+                        let Ok(index) = usize::try_from(index) else {
+                            break (at, op);
+                        };
+                        let object = heap.object(id);
+                        if writing {
+                            let value = stack[tail - 1];
+                            match &object.data {
+                                ObjectData::Array(array)
+                                    if object.flags.contains(
+                                        ObjectFlags::FAST_ARRAY | ObjectFlags::EXTENSIBLE,
+                                    ) && !object.flags.contains(ObjectFlags::IS_PROTOTYPE)
+                                        && array
+                                            .elements
+                                            .get(index)
+                                            .is_some_and(|&v| v != Value::EMPTY) =>
+                                {
+                                    let ObjectData::Array(array) =
+                                        &mut heap.objects.get_mut(id).unwrap().data
+                                    else {
+                                        unreachable!()
+                                    };
+                                    array.elements[index] = value;
+                                }
+                                ObjectData::TypedArray(view) => {
+                                    let view = **view;
+                                    if crate::builtins::typed_atomics::fast_typed_array_set(
+                                        &mut heap.objects,
+                                        view,
+                                        index,
+                                        value,
+                                    )
+                                    .is_none()
+                                    {
+                                        break (at, op);
+                                    }
+                                }
+                                _ => break (at, op),
+                            }
+                            stack.truncate(object_slot);
+                        } else {
+                            let value = match &object.data {
+                                ObjectData::Array(array)
+                                    if object.flags.contains(ObjectFlags::FAST_ARRAY) =>
+                                {
+                                    array
+                                        .elements
+                                        .get(index)
+                                        .copied()
+                                        .filter(|&v| v != Value::EMPTY)
+                                }
+                                ObjectData::TypedArray(view) => {
+                                    crate::builtins::typed_atomics::fast_typed_array_get(
+                                        heap, **view, index,
+                                    )
+                                }
+                                _ => None,
+                            };
+                            let Some(value) = value else { break (at, op) };
+                            if op == GetArrayEl2 {
+                                stack[tail - 1] = value;
+                            } else {
+                                stack[object_slot] = value;
+                                stack.pop();
+                            }
+                        }
+                    }
+                    Goto | Goto8 | Goto16 | IfFalse | IfTrue | IfFalse8 | IfTrue8 => {
+                        let conditional = !matches!(op, Goto | Goto8 | Goto16);
+                        if !conditional
+                            || matches!(op, IfTrue | IfTrue8)
+                                == convert::to_boolean_value(heap, stack[tail - 1])
+                        {
+                            let offset = match op {
+                                Goto8 | IfFalse8 | IfTrue8 => i32::from(bytes[pos] as i8),
+                                Goto16 => i32::from(u16() as i16),
+                                _ => u32() as i32,
+                            };
+                            let target = (at + 1).wrapping_add_signed(offset);
+                            if target <= at && vm.interrupt_handler.is_some() {
+                                break (at, op);
+                            }
+                            pc = target;
+                        }
+                        if conditional {
+                            stack.pop();
+                        }
+                    }
+                    Call | Call0 | Call1 | Call2 | Call3 | CallMethod => {
+                        let count = match op {
+                            Call | CallMethod => usize::from(u16()),
+                            _ => usize::from(byte - Call0 as u8),
+                        };
+                        let Some(plain) =
+                            call::prepare_plain(heap, vm, frame.realm, count, op == CallMethod)
+                        else {
+                            break (at, op);
+                        };
+                        vm.frames[index].last_pc = at;
+                        vm.frames[index].pc = pc;
+                        (code, ctx.realm) = plain.enter(ctx)?;
+                        index += 1;
+                        continue 'frames;
+                    }
+                    Return | ReturnUndef | ReturnAsync => {
+                        let value = if op == ReturnUndef {
+                            Value::UNDEFINED
+                        } else {
+                            stack[tail - 1]
+                        };
+                        if index == entry_index {
+                            vm.frames[index].last_pc = at;
+                            vm.frames[index].pc = pc;
+                            return Ok(Some(value));
+                        }
+                        bindings::close_frame_slots(&mut heap.var_refs, stack, frame);
+                        vm.frames.pop();
+                        stack.truncate(frame.base as usize);
+                        stack.push_reserved(value);
+                        index -= 1;
+                        let caller = &vm.frames[index];
+                        code = caller.code.unwrap();
+                        ctx.realm = caller.realm;
+                        continue 'frames;
+                    }
+                    _ => break (at, op),
+                }
+            };
+            let strict = function.strict;
+            let inst = Instruction::decode(bytes, at as usize).expect("verified instruction");
+            debug_assert_eq!(inst.opcode, op);
+            let frame = &mut vm.frames[index];
+            frame.last_pc = at;
+            frame.pc = pc;
+            let mut original = *frame;
+            original.pc = at;
+            let result = slow_op(ctx, original, index, code, inst, strict, pc)?;
+            if result.is_some() || ctx.runtime.vm.frames.len() != index + 1 {
+                return Ok(result);
+            }
+            pc = ctx.runtime.vm.frames[index].pc;
+        }
+    }
+}
+
+#[inline]
+fn fast_binary(op: Opcode, lhs: Value, rhs: Value, has_interrupt: bool) -> Option<Value> {
+    use Opcode::*;
+    match (lhs.decode(), rhs.decode()) {
+        (ValueKind::Int32(a), ValueKind::Int32(b)) => {
+            let integer = match op {
+                Add => a.checked_add(b),
+                Sub => a.checked_sub(b),
+                Mul if !(a == 0 && b < 0) && !(b == 0 && a < 0) => a.checked_mul(b),
+                And => Some(a & b),
+                Or => Some(a | b),
+                Xor => Some(a ^ b),
+                Shl => Some(a.wrapping_shl(b as u32)),
+                Sar => Some(a.wrapping_shr(b as u32)),
+                _ => None,
+            };
+            Some(integer.map_or_else(
+                || numeric::number_binary(op, a.into(), b.into()),
+                Value::int32,
+            ))
+        }
+        (ValueKind::ShortBigInt(a), ValueKind::ShortBigInt(b)) => {
+            numeric::short_binary(op, a, b, has_interrupt)
+        }
+        _ => Some(numeric::number_binary(
+            op,
+            lhs.as_number()?,
+            rhs.as_number()?,
+        )),
+    }
+}
+
+#[inline]
+fn fast_unary(op: Opcode, value: Value) -> Option<(Value, Value)> {
+    use Opcode::*;
+    let op = match op {
+        IncLoc => Inc,
+        DecLoc => Dec,
+        _ => op,
+    };
+    match value.decode() {
+        ValueKind::Int32(n) => {
+            let int = match op {
+                Inc | PostInc => n.checked_add(1),
+                Dec | PostDec => n.checked_sub(1),
+                Not => Some(!n),
+                Plus => Some(n),
+                _ => None,
+            };
+            Some(int.map_or_else(
+                || numeric::number_unary(op, n.into()),
+                |after| (value, Value::int32(after)),
+            ))
+        }
+        ValueKind::Float64(n) => Some(numeric::number_unary(op, n)),
+        ValueKind::ShortBigInt(n) => Some((value, numeric::short_unary(op, n)?)),
+        _ => None,
+    }
+}
+
+#[cold]
+fn slow_op(
     ctx: &mut ExecCtx<'_, '_>,
     frame: CallFrame,
     index: usize,
     code: BcId,
+    inst: Instruction,
+    strict: bool,
+    next: u32,
 ) -> JsResult<Option<Value>> {
     use Opcode::*;
-    let function = compiled(ctx, code);
-    if !function.hoisted.is_empty()
-        && let Ok(i) = function
-            .hoisted
-            .binary_search_by_key(&frame.pc, |&(pc, _)| pc)
-    {
-        let next = function.hoisted[i].1;
-        ctx.runtime.vm.frames[index].pc = next;
-        return Ok(None);
-    }
-    let strict = function.strict;
-    let inst = Instruction::decode(&function.code, frame.pc as usize)
-        .map_err(|_| ctx.throw_type_error("invalid bytecode offset"))?;
     let op = inst.opcode;
-    let next = frame.pc + u32::from(op.info().size);
-    ctx.runtime.vm.frames[index].last_pc = frame.pc;
-    ctx.runtime.vm.frames[index].pc = next;
     let this = frame.base as usize + 1;
     let arg_start = this + 1;
     let local_start = arg_start + frame.arg_slots as usize;
@@ -148,29 +692,6 @@ pub(crate) fn step(
     let value = |ctx: &ExecCtx<'_, '_>, n: usize| ctx.runtime.vm.stack[tail - n];
     match op {
         Invalid => unreachable!("verified opcode"),
-        Nop => {}
-        PushI32 | PushI8 | PushI16 | Push0 | Push1 | Push2 | Push3 | Push4 | Push5 | Push6
-        | Push7 | PushMinus1 | PushBigintI32 => {
-            let Operands::Signed(n) = inst.operands else {
-                unreachable!()
-            };
-            let n = if op == PushBigintI32 {
-                Value::short_bigint(i64::from(n)).unwrap()
-            } else {
-                Value::int32(n)
-            };
-            replace(ctx, 0, &[n]);
-        }
-        Undefined | Null | PushTrue | PushFalse => replace(
-            ctx,
-            0,
-            &[match op {
-                Undefined => Value::UNDEFINED,
-                Null => Value::NULL,
-                PushTrue => Value::bool(true),
-                _ => Value::bool(false),
-            }],
-        ),
         PushConst | PushConst8 => {
             let Operands::Constant(c) = inst.operands else {
                 unreachable!()
@@ -258,11 +779,7 @@ pub(crate) fn step(
             })?;
             replace(ctx, consumed, &[result]);
         }
-        Drop => replace(ctx, 1, &[]),
-        Nip => replace(ctx, 2, &[value(ctx, 1)]),
         Nip1 => replace(ctx, 3, &[value(ctx, 2), value(ctx, 1)]),
-        Dup => replace(ctx, 0, &[value(ctx, 1)]),
-        Dup1 => replace(ctx, 2, &[value(ctx, 2), value(ctx, 2), value(ctx, 1)]),
         Dup2 => replace(ctx, 0, &[value(ctx, 2), value(ctx, 1)]),
         Dup3 => replace(ctx, 0, &[value(ctx, 3), value(ctx, 2), value(ctx, 1)]),
         Insert2 => replace(ctx, 2, &[value(ctx, 1), value(ctx, 2), value(ctx, 1)]),
@@ -285,7 +802,6 @@ pub(crate) fn step(
         Perm3 => ctx.runtime.vm.stack[tail - 3..tail - 1].rotate_right(1),
         Perm4 => ctx.runtime.vm.stack[tail - 4..tail - 1].rotate_right(1),
         Perm5 => ctx.runtime.vm.stack[tail - 5..tail - 1].rotate_right(1),
-        Swap => ctx.runtime.vm.stack.swap(tail - 2, tail - 1),
         Swap2 => ctx.runtime.vm.stack[tail - 4..].rotate_left(2),
         Rot3l => ctx.runtime.vm.stack[tail - 3..].rotate_left(1),
         Rot4l => ctx.runtime.vm.stack[tail - 4..].rotate_left(1),
@@ -332,8 +848,6 @@ pub(crate) fn step(
             };
             spread_call(ctx, tail - 3, handle(3), handle(2), handle(1), mode)?;
         }
-        Return | ReturnAsync => return Ok(Some(value(ctx, 1))),
-        ReturnUndef => return Ok(Some(Value::UNDEFINED)),
         Throw => return Err(ctx.throw_value(value(ctx, 1), false)),
         ThrowError => {
             let Operands::AtomU8(atom, kind) = inst.operands else {
@@ -427,26 +941,15 @@ pub(crate) fn step(
             };
             replace(ctx, tail - start - offset, &[value(ctx, 1)]);
         }
-        GetLoc0Loc1 => replace(
-            ctx,
-            0,
-            &[
-                ctx.runtime.vm.stack[local_start],
-                ctx.runtime.vm.stack[local_start + 1],
-            ],
-        ),
-        GetLoc | GetLoc8 | GetLoc0 | GetLoc1 | GetLoc2 | GetLoc3 | GetLocCheck | PutLoc
-        | PutLoc8 | PutLoc0 | PutLoc1 | PutLoc2 | PutLoc3 | PutLocCheck | PutLocCheckInit
-        | SetLoc | SetLoc8 | SetLoc0 | SetLoc1 | SetLoc2 | SetLoc3 | SetLocUninitialized
-        | CloseLoc => {
+        GetLocCheck | PutLocCheck | PutLocCheckInit | SetLocUninitialized | CloseLoc => {
             let Operands::Local(n) = inst.operands else {
                 unreachable!()
             };
             let slot = local_start + n as usize;
             let current = ctx.runtime.vm.stack[slot];
             match op {
-                GetLoc | GetLoc8 | GetLoc0 | GetLoc1 | GetLoc2 | GetLoc3 | GetLocCheck => {
-                    if op == GetLocCheck && current == Value::UNINITIALIZED {
+                GetLocCheck => {
+                    if current == Value::UNINITIALIZED {
                         ctx.with_realm(frame.caller_realm, |ctx| {
                             bindings::check_initialized(ctx, current)
                         })?;
@@ -467,23 +970,6 @@ pub(crate) fn step(
                         );
                     }
                     ctx.runtime.vm.stack[slot] = value(ctx, 1);
-                    if !matches!(op, SetLoc | SetLoc8 | SetLoc0 | SetLoc1 | SetLoc2 | SetLoc3) {
-                        replace(ctx, 1, &[]);
-                    }
-                }
-            }
-        }
-        GetArg | GetArg0 | GetArg1 | GetArg2 | GetArg3 | PutArg | PutArg0 | PutArg1 | PutArg2
-        | PutArg3 | SetArg | SetArg0 | SetArg1 | SetArg2 | SetArg3 => {
-            let Operands::Argument(n) = inst.operands else {
-                unreachable!()
-            };
-            let slot = arg_start + n as usize;
-            if matches!(op, GetArg | GetArg0 | GetArg1 | GetArg2 | GetArg3) {
-                replace(ctx, 0, &[ctx.runtime.vm.stack[slot]]);
-            } else {
-                ctx.runtime.vm.stack[slot] = value(ctx, 1);
-                if matches!(op, PutArg | PutArg0 | PutArg1 | PutArg2 | PutArg3) {
                     replace(ctx, 1, &[]);
                 }
             }
@@ -505,33 +991,18 @@ pub(crate) fn step(
                 _ => None,
             };
             let slot = local.unwrap_or(tail - 1);
-            let fast = match (op, ctx.runtime.vm.stack[slot].decode()) {
-                (Inc | PostInc | IncLoc, ValueKind::Int32(n)) if n < i32::MAX => {
-                    Some((Value::int32(n), Value::int32(n + 1)))
+            let (before, after) = ctx.with_scope(|ctx| {
+                if op == AddLoc {
+                    return numeric::binary(ctx, Add, Handle::at(slot), Handle::at(tail - 1))
+                        .map(|v| (Value::UNDEFINED, v));
                 }
-                (Dec | PostDec | DecLoc, ValueKind::Int32(n)) if n > i32::MIN => {
-                    Some((Value::int32(n), Value::int32(n - 1)))
-                }
-                (Not, ValueKind::Int32(n)) => Some((Value::UNDEFINED, Value::int32(!n))),
-                (Plus, ValueKind::Int32(n)) => Some((Value::UNDEFINED, Value::int32(n))),
-                _ => None,
-            };
-            let (before, after) = if let Some(pair) = fast {
-                pair
-            } else {
-                ctx.with_scope(|ctx| {
-                    if op == AddLoc {
-                        return numeric::binary(ctx, Add, Handle::at(slot), Handle::at(tail - 1))
-                            .map(|v| (Value::UNDEFINED, v));
-                    }
-                    let op = match op {
-                        IncLoc => Inc,
-                        DecLoc => Dec,
-                        other => other,
-                    };
-                    numeric::unary(ctx, op, Handle::at(slot))
-                })?
-            };
+                let op = match op {
+                    IncLoc => Inc,
+                    DecLoc => Dec,
+                    other => other,
+                };
+                numeric::unary(ctx, op, Handle::at(slot))
+            })?;
             if let Some(slot) = local {
                 ctx.runtime.vm.stack[slot] = after;
                 if op == AddLoc {
@@ -544,62 +1015,17 @@ pub(crate) fn step(
             }
         }
         Mul | Div | Mod | Add | Sub | Shl | Sar | Shr | And | Xor | Or | Pow => {
-            let lhs = ctx.runtime.vm.stack[tail - 2];
-            let rhs = ctx.runtime.vm.stack[tail - 1];
-            let fast = match (lhs.decode(), rhs.decode()) {
-                (ValueKind::Int32(a), ValueKind::Int32(b)) => match op {
-                    Add => Some(
-                        a.checked_add(b)
-                            .map(Value::int32)
-                            .unwrap_or_else(|| Value::number(f64::from(a) + f64::from(b))),
-                    ),
-                    Sub => Some(
-                        a.checked_sub(b)
-                            .map(Value::int32)
-                            .unwrap_or_else(|| Value::number(f64::from(a) - f64::from(b))),
-                    ),
-                    Mul if !(a == 0 && b < 0) && !(b == 0 && a < 0) => Some(
-                        a.checked_mul(b)
-                            .map(Value::int32)
-                            .unwrap_or_else(|| Value::number(f64::from(a) * f64::from(b))),
-                    ),
-                    And => Some(Value::int32(a & b)),
-                    Or => Some(Value::int32(a | b)),
-                    Xor => Some(Value::int32(a ^ b)),
-                    Shl => Some(Value::int32(((a as u32) << ((b as u32) & 31)) as i32)),
-                    Sar => Some(Value::int32(a >> ((b as u32) & 31))),
-                    Shr => Some(Value::number(((a as u32) >> ((b as u32) & 31)) as f64)),
-                    _ => None,
-                },
-                _ => None,
-            };
-            let result = if let Some(result) = fast {
-                result
-            } else {
-                ctx.with_scope(|ctx| {
-                    numeric::binary(ctx, op, Handle::at(tail - 2), Handle::at(tail - 1))
-                })?
-            };
+            let result = ctx.with_scope(|ctx| {
+                numeric::binary(ctx, op, Handle::at(tail - 2), Handle::at(tail - 1))
+            })?;
             replace(ctx, 2, &[result]);
         }
         Eq | Neq | StrictEq | StrictNeq | Lt | Lte | Gt | Gte => {
-            let lhs = ctx.runtime.vm.stack[tail - 2];
-            let rhs = ctx.runtime.vm.stack[tail - 1];
-            let result = match (lhs.decode(), rhs.decode()) {
-                (ValueKind::Int32(a), ValueKind::Int32(b)) => match op {
-                    Eq | StrictEq => a == b,
-                    Neq | StrictNeq => a != b,
-                    Lt => a < b,
-                    Lte => a <= b,
-                    Gt => a > b,
-                    Gte => a >= b,
-                    _ => unreachable!(),
-                },
-                _ if matches!(op, StrictEq | StrictNeq) => {
-                    compare::strict_eq(ctx, Handle::at(tail - 2), Handle::at(tail - 1))
-                        ^ (op == StrictNeq)
-                }
-                _ => ctx.with_scope(|ctx| {
+            let result = if matches!(op, StrictEq | StrictNeq) {
+                compare::strict_eq(ctx, Handle::at(tail - 2), Handle::at(tail - 1))
+                    ^ (op == StrictNeq)
+            } else {
+                ctx.with_scope(|ctx| {
                     let (a, b) = (Handle::at(tail - 2), Handle::at(tail - 1));
                     Ok(match op {
                         Eq | Neq => compare::abstract_eq(ctx, a, b)? ^ (op == Neq),
@@ -609,11 +1035,11 @@ pub(crate) fn step(
                         Gte => compare::abstract_relational(ctx, a, b, true)? == Some(false),
                         _ => unreachable!(),
                     })
-                })?,
+                })?
             };
             replace(ctx, 2, &[Value::bool(result)]);
         }
-        Typeof | Lnot | TypeofIsFunction | TypeofIsUndefined | IsUndefinedOrNull | IsUndefined
+        Typeof | TypeofIsFunction | TypeofIsUndefined | IsUndefinedOrNull | IsUndefined
         | IsNull => {
             let raw = value(ctx, 1);
             let result = match op {
@@ -624,7 +1050,6 @@ pub(crate) fn step(
                         Ok(ctx.get(name))
                     })?
                 }
-                Lnot => Value::bool(!convert::to_boolean_value(ctx.heap(), raw)),
                 TypeofIsFunction => Value::bool(convert::typeof_str(ctx, handle(1)) == "function"),
                 TypeofIsUndefined => {
                     Value::bool(convert::typeof_str(ctx, handle(1)) == "undefined")
@@ -695,6 +1120,7 @@ pub(crate) fn step(
             })?;
             replace(ctx, 2, &[resolution]);
         }
+        _ => unreachable!("instruction handled by the dispatch loop"),
     }
     Ok(None)
 }

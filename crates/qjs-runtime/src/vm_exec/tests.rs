@@ -260,6 +260,192 @@ fn handles_number_and_bigint_conversions() {
 }
 
 #[test]
+fn short_bigint_arithmetic_spills_at_the_signed_payload_limits() {
+    assert_eq!(
+        run(r#"
+        let min = -(2n ** 46n), max = 2n ** 46n - 1n;
+        let results = [max + 1n, min - 1n, min * -1n, min / -1n, -min];
+        let p = max++, q = min--;
+        results.push(p, max, q, min, min % -2n);
+        results.join('|');
+        "#),
+        "70368744177664|-70368744177665|70368744177664|70368744177664|70368744177664|70368744177663|70368744177664|-70368744177664|-70368744177665|-1"
+    );
+}
+
+#[test]
+fn short_bigint_arithmetic_keeps_js_signs_and_range_errors() {
+    assert_eq!(
+        run(r#"
+        let x = -37n, y = 2n, n = -2n;
+        let result = [x + y, x - y, x * y, x / y, x % y, -x / n, -x % n,
+            x & y, x | y, x ^ y, ~x, x << n, x >> n, x >> 64n, 3n >> -64n,
+            (-1n) ** 70368744177663n, y ** 45n, y ** 46n, 0n << 1048576n];
+        for (const op of [() => x / 0n, () => x % 0n, () => y ** -1n,
+            () => x >>> 1n, () => 1n << 1048576n]) {
+            try { op(); } catch (e) { result.push(e.name); }
+        }
+        result.join('|');
+        "#),
+        "-35|-39|-74|-18|-1|-18|1|2|-37|-39|36|-10|-148|-1|55340232221128654848|-1|35184372088832|70368744177664|0|RangeError|RangeError|RangeError|TypeError|RangeError"
+    );
+}
+
+#[test]
+fn short_bigint_multiply_divide_remainder_and_power_keep_interrupt_checks() {
+    use std::{cell::Cell, rc::Rc};
+
+    for op in ["*", "/", "%", "**"] {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        engine
+            .eval("var a = 3n, b = 2n", EvalOptions::default())
+            .unwrap();
+        let polls = Rc::new(Cell::new(0));
+        engine.set_interrupt_handler(Some(Box::new({
+            let polls = polls.clone();
+            move || {
+                polls.set(polls.get() + 1);
+                polls.get() == 3
+            }
+        })));
+        assert_eq!(
+            engine.eval(
+                &format!("try {{ a {op} b }} catch {{}}"),
+                EvalOptions::default()
+            ),
+            Err(EngineError::Interrupted),
+            "{op}"
+        );
+        assert_eq!(polls.get(), 3, "{op}");
+    }
+}
+
+#[test]
+fn field_cache_does_not_keep_shapes_alive_or_skip_accessors() {
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let options = EvalOptions::default();
+    engine
+        .eval(
+            r#"
+        function read(o) { return o.slot; }
+        function write(o, x) { 'use strict'; o.slot = x; }
+        read({ extra: 0, slot: 1 });
+    "#,
+            options.clone(),
+        )
+        .unwrap();
+    let heap = engine.runtime().heap();
+    let cached_shape = heap
+        .bytecode
+        .iter()
+        .filter_map(|(_, code)| code.compiled.as_ref())
+        .flat_map(|code| code.inline_caches.iter().filter_map(|cell| cell.get()))
+        .find(|entry| entry.slot == 1)
+        .unwrap()
+        .shape;
+    assert!(heap.shapes.get_weak(cached_shape).is_some());
+    engine.collect_garbage();
+    assert!(
+        engine
+            .runtime()
+            .heap()
+            .shapes
+            .get_weak(cached_shape)
+            .is_none()
+    );
+    assert_eq!(
+        engine
+            .eval_to_string(
+                r#"
+        let data = { slot: 2 }, getter = { get slot() { return 3; } };
+        let result = [read(data), read(getter)];
+        write(data, 4);
+        result.push(read(data));
+        Object.defineProperty(data, 'slot', { writable: false });
+        try { write(data, 5); } catch (e) { result.push(e.name); }
+        result.push(read(data), read(new Proxy(data, { get() { return 6; } })));
+        result.join('|');
+    "#,
+                options
+            )
+            .unwrap(),
+        "2|3|4|TypeError|4|6"
+    );
+}
+
+#[test]
+fn global_cache_rechecks_new_lexical_bindings_across_scripts() {
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let options = EvalOptions::default();
+    assert_eq!(
+        engine
+            .eval_to_string(
+                r#"
+        globalThis.shadow = 1;
+        function read() { return shadow; }
+        function write(value) { 'use strict'; shadow = value; }
+        read(); write(2); read();
+    "#,
+                options.clone()
+            )
+            .unwrap(),
+        "2"
+    );
+    assert_eq!(
+        engine
+            .eval_to_string(
+                r#"
+        let shadow = 3;
+        let before = read();
+        write(4);
+        [before, read(), globalThis.shadow].join('|');
+    "#,
+                options
+            )
+            .unwrap(),
+        "3|4|2"
+    );
+}
+
+#[test]
+fn indexed_access_leaves_holes_and_invalid_typed_views_to_the_slow_path() {
+    assert_eq!(
+        run(r#"
+        function read(a, i) { return a[i]; }
+        function write(a, i, v) { 'use strict'; a[i] = v; }
+        let a = [1, 2];
+        write(a, 0, 3);
+        let before = read(a, 0);
+        delete a[0];
+        Object.defineProperty(Array.prototype, '0', {
+            configurable: true, get() { return 4; }
+        });
+        let hole = read(a, 0);
+        delete Array.prototype[0];
+        Object.freeze(a);
+        let frozen;
+        try { write(a, 1, 5); } catch (e) { frozen = e.name; }
+        let b = new ArrayBuffer(8, { maxByteLength: 16 });
+        let t = new Int32Array(b, 4, 1);
+        write(t, 0, -9);
+        let present = read(t, 0);
+        b.resize(4);
+        let calls = 0;
+        write(t, 0, { valueOf() { calls++; return 5; } });
+        let small = read(t, 0);
+        b.resize(8);
+        let restored = read(t, 0);
+        b.transfer();
+        let detached = read(t, 0);
+        let u = new BigUint64Array(1);
+        write(u, 0, -1n);
+        [before, hole, frozen, present, small, restored, detached, calls, read(u, 0)].join('|');
+    "#),
+        "3|4|TypeError|-9||0||1|18446744073709551615"
+    );
+}
+
+#[test]
 fn primitive_property_reads_keep_the_receiver_and_string_indices() {
     assert_eq!(
         run(r#"
@@ -446,7 +632,7 @@ fn run_with_other_realm(script: &str) -> String {
 fn shares_a_frozen_throw_type_error_within_each_realm() {
     assert_eq!(
         run_with_other_realm(
-                r#"
+            r#"
                 const caller = Object.getOwnPropertyDescriptor(Function.prototype, 'caller');
                 const args = Object.getOwnPropertyDescriptor(Function.prototype, 'arguments');
                 const thrower = caller.get;
@@ -462,7 +648,8 @@ fn shares_a_frozen_throw_type_error_within_each_realm() {
                  callee(nonSimple()).get === thrower, thrower !== otherThrower,
                  Object.getOwnPropertyNames(thrower).join(','), Object.isFrozen(thrower),
                  thrower.call(sloppy) === undefined].join(';');
-                "#),
+                "#
+        ),
         "true;true;true;true;true;true;true;length,name;true;true"
     );
 }
@@ -470,7 +657,8 @@ fn shares_a_frozen_throw_type_error_within_each_realm() {
 #[test]
 fn call_and_construct_choose_the_error_realm() {
     assert_eq!(
-        run_with_other_realm(r#"
+        run_with_other_realm(
+            r#"
             function throws(ctor, run) {
                 try { run(); } catch (e) { return e.constructor === ctor; }
                 return false;
@@ -490,7 +678,8 @@ fn call_and_construct_choose_the_error_realm() {
              throws(other.TypeError, () => other.Reflect.apply(() => {}, null, 1)),
              revokeDuringPrototypeLookup(function () {}), revokeDuringPrototypeLookup(Function)]
                  .join(',');
-        "#),
+        "#
+        ),
         "true,true,true,true,true,true,true,true,true"
     );
 }
@@ -1183,6 +1372,67 @@ fn rethrow_keeps_error_creation_frames() {
         panic!("expected a throw");
     };
     assert_eq!(message, "{\"n\":1}");
+}
+
+#[test]
+fn direct_calls_restore_the_receiver_and_close_captured_slots() {
+    assert_eq!(
+        run(r#"
+        function wrap(first) {
+            let add = (second) => first += second;
+            add(2);
+            return add;
+        }
+        const receiver = {
+            name: 'receiver',
+            call(a, b) { return [this.name, a, b].join(':'); },
+        };
+        const add = wrap(3);
+        [add(7), receiver.call(8), receiver.call(9, 10), add(1)].join('|');
+        "#),
+        "12|receiver:8:|receiver:9:10|13"
+    );
+}
+
+#[test]
+fn direct_calls_poll_once_per_entry_and_skip_finally_on_interrupt() {
+    use std::{cell::Cell, rc::Rc};
+
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let options = EvalOptions::default();
+    engine
+        .eval(
+            r#"
+        var reached = 0;
+        function outer() {
+            const leaf = () => ++reached;
+            leaf();
+            leaf();
+        }
+        outer();
+        reached = 0;
+    "#,
+            options.clone(),
+        )
+        .unwrap();
+    let polls = Rc::new(Cell::new(0));
+    engine.set_interrupt_handler(Some(Box::new({
+        let polls = polls.clone();
+        move || {
+            polls.set(polls.get() + 1);
+            polls.get() == 5
+        }
+    })));
+    assert_eq!(
+        engine.eval(
+            "try { outer(); } finally { reached = -1; }",
+            options.clone()
+        ),
+        Err(EngineError::Interrupted)
+    );
+    assert_eq!(polls.get(), 5);
+    engine.set_interrupt_handler(None);
+    assert_eq!(engine.eval_to_string("reached", options).unwrap(), "1");
 }
 
 #[test]

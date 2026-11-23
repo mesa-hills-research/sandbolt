@@ -37,25 +37,52 @@ pub(super) fn number_bits(kind: TypedArrayKind, n: f64) -> u64 {
     }
 }
 
-pub(super) fn decode(
-    ctx: &mut ExecCtx<'_, '_>,
-    kind: TypedArrayKind,
-    bits: u64,
-) -> JsResult<Value> {
+#[inline]
+pub(super) fn encode_immediate(kind: TypedArrayKind, value: Value) -> Option<u64> {
     use TypedArrayKind::*;
-    Ok(match kind {
+    match (kind, value.decode()) {
+        (BigInt64 | BigUint64, ValueKind::ShortBigInt(n)) => Some(n as u64),
+        (BigInt64 | BigUint64, _) => None,
+        (Int8 | Uint8 | Int16 | Uint16 | Int32 | Uint32, ValueKind::Int32(n)) => Some(n as u64),
+        (_, ValueKind::Int32(n)) => Some(number_bits(kind, f64::from(n))),
+        (_, ValueKind::Float64(n)) => Some(number_bits(kind, n)),
+        _ => None,
+    }
+}
+
+#[inline]
+pub(super) fn decode_immediate(kind: TypedArrayKind, bits: u64) -> Option<Value> {
+    use TypedArrayKind::*;
+    Some(match kind {
         Int8 => Value::int32(bits as i8 as i32),
         Uint8 | Uint8Clamped => Value::int32(bits as u8 as i32),
         Int16 => Value::int32(bits as i16 as i32),
         Uint16 => Value::int32(bits as u16 as i32),
         Int32 => Value::int32(bits as i32),
         Uint32 => Value::number(f64::from(bits as u32)),
-        BigInt64 => make_bigint(ctx, (bits as i64) < 0, (bits as i64).unsigned_abs())?,
-        BigUint64 => make_bigint(ctx, false, bits)?,
+        BigInt64 => return Value::short_bigint(bits as i64),
+        BigUint64 => return i64::try_from(bits).ok().and_then(Value::short_bigint),
         Float16 => Value::number(from_half(bits as u16)),
         Float32 => Value::number(f64::from(f32::from_bits(bits as u32))),
         Float64 => Value::number(f64::from_bits(bits)),
     })
+}
+
+pub(super) fn decode(
+    ctx: &mut ExecCtx<'_, '_>,
+    kind: TypedArrayKind,
+    bits: u64,
+) -> JsResult<Value> {
+    if let Some(value) = decode_immediate(kind, bits) {
+        return Ok(value);
+    }
+    match kind {
+        TypedArrayKind::BigInt64 => {
+            make_bigint(ctx, (bits as i64) < 0, (bits as i64).unsigned_abs())
+        }
+        TypedArrayKind::BigUint64 => make_bigint(ctx, false, bits),
+        _ => unreachable!(),
+    }
 }
 
 pub(super) fn to_bigint<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<Value> {

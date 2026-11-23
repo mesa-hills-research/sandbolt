@@ -248,6 +248,30 @@ fn closures_eval_with_and_per_iteration_cells() {
 }
 
 #[test]
+fn arguments_are_created_only_when_the_binding_can_be_observed() {
+    for (function, expected) in [
+        ("function f(a) { return a; }", false),
+        ("function f(a) { return arguments[0]; }", true),
+        ("function f(a) { return () => arguments[0]; }", true),
+        ("function f(a) { return eval('arguments[0]'); }", true),
+        ("function f(a) { return () => eval('arguments[0]'); }", true),
+        ("function f(a = arguments[1]) { return a; }", true),
+    ] {
+        let image = script(function);
+        let arguments = instructions(&image, 1).iter().any(|i| {
+            matches!(
+                i,
+                Instruction {
+                    opcode: Opcode::SpecialObject,
+                    operands: Operands::Unsigned(0 | 1)
+                }
+            )
+        });
+        assert_eq!(arguments, expected, "{function}");
+    }
+}
+
+#[test]
 fn eval_created_variables_participate_in_outer_name_lookup() {
     let image = script(
         "function outer() { let x = 1; return function inner() { eval('var x = 2'); return x; }; }",

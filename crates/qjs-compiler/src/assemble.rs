@@ -85,6 +85,45 @@ fn shorter(op: Opcode, diff: i64) -> Opcode {
     }
 }
 
+fn discard_unused_arguments(function: &FunctionBytecode, instructions: &mut [Option<Instruction>]) {
+    use Opcode::*;
+    use Operands::{Local, Locals, Unsigned};
+    let Some((init, slot)) =
+        instructions
+            .windows(2)
+            .enumerate()
+            .find_map(|(i, pair)| match *pair {
+                [
+                    Some(Instruction {
+                        opcode: SpecialObject,
+                        operands: Unsigned(0 | 1),
+                    }),
+                    Some(Instruction {
+                        opcode: PutLoc | PutLoc8 | PutLoc0 | PutLoc1 | PutLoc2 | PutLoc3,
+                        operands: Local(slot),
+                    }),
+                ] => Some((i, slot)),
+                _ => None,
+            })
+    else {
+        return;
+    };
+    // Name resolution marks captures, including bindings visible to direct eval.
+    if function.vars[usize::from(function.arg_count) + usize::from(slot)].captured
+        || instructions.iter().enumerate().any(|(i, insn)| {
+            i != init + 1
+                && insn.is_some_and(|insn| match insn.operands {
+                    Local(n) => n == slot,
+                    Locals(a, b) => a == slot || b == slot,
+                    _ => false,
+                })
+        })
+    {
+        return;
+    }
+    instructions[init..init + 2].fill(None);
+}
+
 pub(crate) fn assemble(mut draft: Draft) -> Result<FunctionBytecode> {
     let ir: Vec<_> = draft.prologue.into_iter().chain(draft.ir).collect();
     let mut instructions = ir
@@ -92,6 +131,7 @@ pub(crate) fn assemble(mut draft: Draft) -> Result<FunctionBytecode> {
         .copied()
         .map(as_instruction)
         .collect::<Result<Vec<_>>>()?;
+    discard_unused_arguments(&draft.bytecode, &mut instructions);
     let mut labels = vec![None; draft.labels as usize];
     let mut positions = vec![0; ir.len()];
     let end = loop {
