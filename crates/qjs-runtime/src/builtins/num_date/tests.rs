@@ -223,6 +223,54 @@ fn number_and_boolean_construct_with_brand_and_new_target_prototype() {
 }
 
 #[test]
+fn hypot_scales_and_compensates_squared_terms() {
+    let tiny = f64::from_bits(1);
+    let small = f64::from_bits(0x3e40_0000_0000_0000); // 2^-27
+    let large_norm = f64::from_bits(0x6964_e718_d7d7_625b);
+    let compensated = f64::from_bits(1.0_f64.to_bits() + 1);
+    runtime(|ctx, global| {
+        let math = get(ctx, global, "Math");
+        for (inputs, expected) in [
+            (&[][..], 0.0),
+            (&[-0.0, 0.0][..], 0.0),
+            (&[f64::NAN, f64::MAX, f64::MAX][..], f64::NAN),
+            (&[f64::NEG_INFINITY, f64::NAN][..], f64::INFINITY),
+            (&[f64::NAN, f64::INFINITY][..], f64::INFINITY),
+            (&[-3.0, 4.0, -12.0][..], 13.0),
+            (&[3e199, 4e199][..], large_norm),
+            (&[4e199, 3e199][..], large_norm),
+            (&[3e-299, 4e-299][..], 5e-299),
+            (&[f64::MAX, tiny][..], f64::MAX),
+            (&[f64::MAX, f64::MAX][..], f64::INFINITY),
+            (&[tiny, tiny][..], tiny),
+            (&[2.0 * tiny, 2.0 * tiny][..], 3.0 * tiny),
+            (
+                &[1.0, small, small, small, small, small, small, small, small][..],
+                compensated,
+            ),
+            (
+                &[small, small, small, small, small, small, small, small, 1.0][..],
+                compensated,
+            ),
+        ] {
+            let args = inputs
+                .iter()
+                .map(|&x| ctx.root(Value::number(x)).unwrap())
+                .collect::<Vec<_>>();
+            let result = invoke(ctx, math, "hypot", &args)
+                .unwrap()
+                .as_number()
+                .unwrap();
+            if expected.is_nan() {
+                assert!(result.is_nan(), "{inputs:?}");
+            } else {
+                assert_eq!(result.to_bits(), expected.to_bits(), "{inputs:?}");
+            }
+        }
+    });
+}
+
+#[test]
 fn math_preserves_signed_zero_and_has_es_power_edges() {
     runtime(|ctx, global| {
         let math = get(ctx, global, "Math");
@@ -237,10 +285,6 @@ fn math_preserves_signed_zero_and_has_es_power_edges() {
             ("pow", &[-1.0, f64::NEG_INFINITY][..], f64::NAN),
             ("pow", &[f64::NAN, -0.0][..], 1.0),
             ("pow", &[-0.0, -3.0][..], f64::NEG_INFINITY),
-            ("hypot", &[f64::NAN, f64::MAX, f64::MAX][..], f64::NAN),
-            ("hypot", &[f64::NEG_INFINITY, f64::NAN][..], f64::INFINITY),
-            ("hypot", &[3e199, 4e199][..], 5e199),
-            ("hypot", &[3e-299, 4e-299][..], 5e-299),
         ] {
             let args = inputs
                 .iter()

@@ -129,22 +129,11 @@ pub(super) fn dispatch<'s>(
             f64::from(to_uint32(ctx, x)?.wrapping_mul(to_uint32(ctx, y)?) as i32)
         }
         Hypot => {
-            let mut n: f64 = 0.0;
-            let mut infinite = false;
-            let mut nan = false;
+            let mut norm = Norm::default();
             for i in 0..args.len() {
-                let x = to_number(ctx, args.get(i).unwrap())?;
-                infinite |= x.is_infinite();
-                nan |= x.is_nan();
-                n = n.hypot(x);
+                norm.add(to_number(ctx, args.get(i).unwrap())?);
             }
-            if infinite {
-                f64::INFINITY
-            } else if nan {
-                f64::NAN
-            } else {
-                n
-            }
+            norm.finish()
         }
         Max | Min => {
             let max = matches!(METHODS[(offset - START) as usize].2, Max);
@@ -174,6 +163,80 @@ pub(super) fn dispatch<'s>(
         }
     };
     Ok(Value::number(n))
+}
+
+#[derive(Default)]
+struct Norm {
+    exponent: i32,
+    sum: f64,
+    error: f64,
+    infinite: bool,
+    nan: bool,
+}
+
+impl Norm {
+    fn add(&mut self, value: f64) {
+        let x = value.abs();
+        if !x.is_finite() || x == 0.0 {
+            self.infinite |= x.is_infinite();
+            self.nan |= x.is_nan();
+            return;
+        }
+        let exponent = ((x.to_bits() >> 52) as i32 - 1023).max(-1022);
+        if self.sum == 0.0 {
+            self.exponent = exponent;
+        } else if exponent > self.exponent {
+            // Rescale both parts without squaring the factor, which can underflow first.
+            let factor = power_of_two(self.exponent - exponent);
+            self.sum = (self.sum * factor) * factor;
+            self.error = (self.error * factor) * factor;
+            self.exponent = exponent;
+        }
+        let scaled = x * power_of_two(-self.exponent);
+        let (square, square_error) = square_with_error(scaled);
+        let total = self.sum + square;
+        let roundoff = if self.sum >= square {
+            (self.sum - total) + square
+        } else {
+            (square - total) + self.sum
+        };
+        self.error += roundoff + square_error;
+        self.sum = total;
+    }
+
+    fn finish(self) -> f64 {
+        if self.infinite {
+            f64::INFINITY
+        } else if self.nan {
+            f64::NAN
+        } else if self.sum == 0.0 {
+            0.0
+        } else {
+            let root = self.sum.sqrt();
+            let (square, square_error) = square_with_error(root);
+            let residual = ((self.sum - square) - square_error) + self.error;
+            (root + residual / (2.0 * root)) * power_of_two(self.exponent)
+        }
+    }
+}
+
+fn power_of_two(exponent: i32) -> f64 {
+    f64::from_bits(match exponent {
+        -1022..=1023 => ((exponent + 1023) as u64) << 52,
+        -1074..=-1023 => 1 << (exponent + 1074),
+        _ => 0,
+    })
+}
+
+// Dekker splitting recovers the rounding error without a platform FMA.
+fn square_with_error(x: f64) -> (f64, f64) {
+    let split = 134_217_729.0 * x;
+    let high = split - (split - x);
+    let low = x - high;
+    let square = x * x;
+    let cross = high * low;
+    let error = (((high * high - square) + cross) + cross) + low * low;
+    (square, error)
 }
 
 fn round(x: f64) -> f64 {
