@@ -28,8 +28,8 @@ pub(crate) struct Scope {
 pub(crate) enum Cleanup {
     Drop,
     Catch,
-    CloseIterator,
-    AsyncIterator,
+    CloseIterator(Span),
+    AsyncIterator(Span),
     Finally(u32),
     Dispose(u32, u16),
     Scope(u16),
@@ -436,12 +436,12 @@ impl<'a> Emitter<'a> {
     }
 
     fn entry(&mut self) -> Result {
-        self.draft(
-            self.program.span,
-            BuiltinAtom::InternalEval.id(),
-            self.program.strict,
-            None,
-        )?;
+        let name = if matches!(self.options.goal, ParseGoal::DirectEval { .. }) {
+            BuiltinAtom::InternalEval.id()
+        } else {
+            UnitAtom::NONE
+        };
+        self.draft(self.program.span, name, self.program.strict, None)?;
         let body = &self.program.body;
         if self.options.goal == ParseGoal::Module {
             let name = self.atom(&self.source.filename)?;
@@ -646,6 +646,7 @@ impl<'a> Emitter<'a> {
             super_allowed: method
                 || (function.is_arrow && self.functions[parent].bytecode.flags.super_allowed),
             arguments_allowed: true,
+            name_is_inferred: method || function.name.is_none(),
             ..FunctionFlags::default()
         };
         let f = self.fm();

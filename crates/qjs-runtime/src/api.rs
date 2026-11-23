@@ -331,7 +331,9 @@ pub(crate) fn compile_text(
     parse: ParseOptions,
 ) -> JsResult<ProgramImage> {
     qjs_compiler::compile_source(source, parse).map_err(|error| match error {
-        CompileError::Syntax { message, .. } => ctx.throw_error(ErrorKind::Syntax, &message),
+        CompileError::Syntax { message, line, col } => {
+            exec::stack::throw_syntax_error(ctx, &message, &source.filename, line, col)
+        }
         CompileError::OutOfMemory => ctx.throw_oom(),
         CompileError::StackOverflow => ctx.stack_overflow(),
         #[allow(unreachable_patterns)]

@@ -664,6 +664,7 @@ impl Emitter<'_> {
                 Ok(true)
             }
             Expr::Identifier(i) => {
+                self.source_loc(self.ast().expr(id).span);
                 let atom = self.atom(&i.name)?;
                 self.ir(IrOp::ScopeGetRef(self.scoped(atom)));
                 Ok(true)
@@ -696,6 +697,8 @@ impl Emitter<'_> {
     ) -> Result {
         use Opcode::*;
         let super_call = self.is_super(callee);
+        let constructor_site =
+            (constructor || super_call).then(|| self.ast().expr(self.unparen(callee)).span);
         let direct = !constructor
             && !optional
             && matches!(&self.ast().expr(self.unparen(callee)).kind, Expr::Identifier(i) if i.name == "eval");
@@ -726,6 +729,9 @@ impl Emitter<'_> {
                 }
             }
             self.array(args.iter().copied().map(Some), false)?;
+            if let Some(site) = constructor_site {
+                self.source_loc(site);
+            }
             if direct {
                 self.ir(IrOp::ApplyEval {
                     scope: self.f().scope,
@@ -740,6 +746,9 @@ impl Emitter<'_> {
                 }
             }
             let argc = u16::try_from(args.len()).map_err(|_| CompileError::StackOverflow)?;
+            if let Some(site) = constructor_site {
+                self.source_loc(site);
+            }
             if direct {
                 self.ir(IrOp::DirectEval {
                     arguments: argc,

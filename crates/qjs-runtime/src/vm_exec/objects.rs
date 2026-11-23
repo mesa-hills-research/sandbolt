@@ -249,10 +249,7 @@ pub(super) fn object_op(
                 none(2)
             }
             GetArrayEl | GetArrayEl2 => {
-                let receiver = h(2);
-                convert::require_object_coercible(ctx, ctx.get(receiver))?;
-                let key = convert::to_property_key(ctx, h(1))?;
-                let value = property::get_property(ctx, receiver, key)?;
+                let value = property::get_computed_property(ctx, h(2), h(1))?;
                 one(if op == GetArrayEl { 2 } else { 1 }, value)
             }
             PutArrayEl => {

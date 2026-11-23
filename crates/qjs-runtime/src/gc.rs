@@ -117,6 +117,7 @@ impl Runtime {
             self.vm.stack.trace(&tracer);
             self.vm.frames.trace(&tracer);
             self.vm.exception.trace(&tracer);
+            self.vm.stack_capture.trace(&tracer);
             self.realms.trace(&tracer);
             self.modules.trace(&tracer);
             self.active_coroutines.trace(&tracer);

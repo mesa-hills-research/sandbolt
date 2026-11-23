@@ -57,6 +57,169 @@ fn bytecode_uses_utf8_columns() {
 }
 
 #[test]
+fn prepares_stack_with_native_and_constructor_sites() {
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let options = EvalOptions {
+        filename: "example.js".into(),
+        ..Default::default()
+    };
+    engine
+        .eval(
+            r#"
+        Error.prepareStackTrace = function (error, frames) {
+            if (this !== Error || error.stack !== undefined) throw 'bad formatter receiver';
+            return frames;
+        };
+        var kept = [0].map(function build() {
+            function Example() { return new Error(); }
+            return new Example();
+        })[0].stack;
+        delete Error.prepareStackTrace;
+        "#,
+            options.clone(),
+        )
+        .unwrap();
+    engine.collect_garbage();
+    let text = engine
+        .eval_to_string(
+            r#"
+        let ctor = kept[0], caller = kept[1], native = kept[2];
+        [ctor.getFunctionName(), ctor.getFunction().name, ctor.getFileName(),
+         ctor.isConstructor(), caller.getFunctionName(), caller.isConstructor(),
+         native.getFunction() === Array.prototype.map, native.isNative(),
+         native.getFileName() === null, native.getLineNumber() === null,
+         native.getColumnNumber() === null, Object.prototype.toString.call(native),
+         typeof CallSite].join('|');
+        "#,
+            options,
+        )
+        .unwrap();
+    assert_eq!(
+        text,
+        "Example|Example|example.js|true|build|false|true|true|true|true|true|[object CallSite]|undefined"
+    );
+}
+
+#[test]
+fn forwarded_calls_keep_native_frames_without_rust_reentry() {
+    assert_eq!(
+        run(r#"
+        Error.prepareStackTrace = (_, frames) => frames;
+        function capture() { return new Error().stack; }
+        let results = [capture.call(null), capture.apply(null, []),
+                       Reflect.apply(capture, null, []), Reflect.construct(capture, [])];
+        results.map(frames => [frames[0].isConstructor(), frames[1].getFunctionName(),
+                               frames[1].isNative(), frames[2].getFunctionName() === null].join(':')).join('|');
+        "#),
+        "false:call:true:true|false:apply:true:true|false:apply:true:true|true:construct:true:true"
+    );
+}
+
+#[test]
+fn stack_hooks_keep_the_original_error_and_respect_the_limit() {
+    assert_eq!(
+        run(r#"
+        let result = [Error.stackTraceLimit];
+        let limit = {valueOf() { throw new Error('conversion'); }};
+        Error.stackTraceLimit = limit;
+        Error.prepareStackTrace = (_, frames) => frames.length;
+        result.push(Error.stackTraceLimit === limit, new Error('original').stack);
+        Error.stackTraceLimit = Infinity;
+        function depth(n) { return n ? depth(n - 1) : new Error().stack; }
+        result.push(depth(70));
+        Error.stackTraceLimit = 1.8;
+        Error.prepareStackTrace = (error, frames) => {
+            result.push(frames.length, new Error().stack === undefined);
+            throw new Error('formatting');
+        };
+        try { noSuchGlobal; } catch (error) {
+            result.push(error instanceof ReferenceError, error.stack === null);
+        }
+        result.join('|');
+        "#),
+        "10|true|0|64|1|true|true|true"
+    );
+}
+
+#[test]
+fn captured_stack_filters_frames_and_honors_own_stack() {
+    assert_eq!(
+        run(r#"
+        const target = {};
+        Error.prepareStackTrace = (_, frames) => frames;
+        function frame() { Error.captureStackTrace(target, frame); }
+        function parent() { frame(); }
+        parent();
+        let d = Object.getOwnPropertyDescriptor(target, 'stack');
+        Error.prepareStackTrace = e => { e.stack = 'own'; return 'hidden'; };
+        const e = new Error();
+        delete e.stack;
+        [d.value[0].getFunctionName(), d.enumerable, d.configurable, d.writable,
+         e.stack === undefined].join('|');
+        "#),
+        "parent|false|true|true|true"
+    );
+}
+
+#[test]
+fn syntax_and_iterator_frames_keep_the_source_location() {
+    assert_eq!(
+        run(r#"
+        let positions = [];
+        Error.prepareStackTrace = (_, frames) => frames;
+        function add(site) {
+            positions.push(site.getLineNumber() + ':' + site.getColumnNumber());
+        }
+        for (const source of ['let n = 123bcd', '`xyz\nabc', '`xyz\nabc`; let n = @', "  'ab\\\ncd"]) {
+            try { eval(source); } catch (e) {
+                if (source.includes('123bcd')) positions.push(e.message);
+                positions.push(e.stack[0].getFileName());
+                add(e.stack[0]);
+            }
+        }
+        var iterable = {
+            [Symbol.iterator]() { return {next: () => ({value: 1, done: false}),
+                return() { add(new Error().stack[1]); return {}; }}; }
+        };
+        eval('for (const x of iterable) {\n  break;\n}\nfor (const [x] of [iterable]) break;');
+        Error.prepareStackTrace = undefined;
+        try { (0, eval)('   missingName'); }
+        catch (e) { positions.push(e.stack.includes('<input>:1:4')); }
+        try { (0, eval)('  (missingName)()'); }
+        catch (e) { positions.push(e.stack.includes('<input>:1:4')); }
+        positions.push(eval('  var sample = new Error("sample"); sample.stack.includes("<input>:1:20")'));
+        positions.join('|');
+        "#),
+        "invalid number literal|<input>|1:9|<input>|1:1|<input>|2:15|<input>|1:3|1:1|4:12|true|true|true"
+    );
+}
+
+#[test]
+fn type_errors_describe_the_key_or_the_declared_function() {
+    assert_eq!(
+        run(r#"
+        let result = [];
+        let calls = 0;
+        let key = { [Symbol.toPrimitive]() { calls++; } };
+        for (const k of ['x', 42, Symbol('local'), Symbol.iterator, key, '\ud800']) {
+            try { null[k]; } catch (e) { result.push(e.message); }
+        }
+        try { undefined.x; } catch (e) { result.push(e.message); }
+        function* Declared() {}
+        Object.defineProperty(Declared, 'name', { value: 'changed' });
+        let inferred = function* () {};
+        for (const f of [Declared, inferred]) {
+            try { new f(); } catch (e) { result.push(e.message); }
+        }
+        result[5] = result[5].charCodeAt(22);
+        result.push(calls);
+        result.join('|');
+        "#),
+        "cannot read property 'x' of null|cannot read property '42' of null|cannot read property 'local' of null|cannot read property 'Symbol.iterator' of null|cannot read property '{}' of null|55296|cannot read property 'x' of undefined|Declared is not a constructor|not a constructor|0"
+    );
+}
+
+#[test]
 fn executes_compiled_closures_and_finally() {
     assert_eq!(
         run(

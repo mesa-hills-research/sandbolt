@@ -554,6 +554,7 @@ fn write_function(w: &mut Writer, func: &FunctionBytecode) -> Result<()> {
         f.super_allowed,
         f.arguments_allowed,
         f.backtrace_barrier,
+        f.name_is_inferred,
     ]))?;
     w.uint(func.arg_count)?;
     w.uint(func.var_count)?;
@@ -589,7 +590,7 @@ fn write_function(w: &mut Writer, func: &FunctionBytecode) -> Result<()> {
 fn read_function(r: &mut Reader<'_>) -> Result<FunctionBytecode> {
     let name = r.atom()?;
     let kind = read_function_kind(r)?;
-    let flags = r.flags(0x3ff, "function")?;
+    let flags = r.flags(0x7ff, "function")?;
     let set = |index: u32| flags & (1 << index) != 0;
     Ok(FunctionBytecode {
         name,
@@ -605,6 +606,7 @@ fn read_function(r: &mut Reader<'_>) -> Result<FunctionBytecode> {
             super_allowed: set(7),
             arguments_allowed: set(8),
             backtrace_barrier: set(9),
+            name_is_inferred: set(10),
         },
         arg_count: r.uint16()?,
         var_count: r.uint16()?,

@@ -1,11 +1,13 @@
-use crate::atom::{Atom, KeyKind, PropKey};
+use crate::atom::{Atom, AtomTable, KeyKind, PropKey};
 use crate::heap::Heap;
 use crate::ledger::{TrackedBox, TrackedVec};
-use crate::object::{Accessor, ObjectData, ObjectFlags, ProxyData};
+use crate::object::{Accessor, ErrorKind, ObjectData, ObjectFlags, ProxyData};
 use crate::root::{Args, ExecCtx, Handle};
 use crate::shape::{PropFlags, Shape, ShapeProp};
 use crate::string::JsString;
+use crate::symbol::SymbolDescription;
 use crate::value::*;
+use crate::vm::exec::utf16_lossy;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PropertyDescriptor<T = Value> {
@@ -392,6 +394,78 @@ pub fn get_property<'s>(
     get_property_with_receiver(ctx, object, key, object)
 }
 
+pub(crate) fn get_computed_property<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    object: Handle<'s>,
+    key: Handle<'s>,
+) -> JsResult<Value> {
+    let receiver = ctx.get(object).decode();
+    if matches!(receiver, ValueKind::Null | ValueKind::Undefined) {
+        return throw_nullish_read(ctx, receiver, key);
+    }
+    let key = super::convert::to_property_key(ctx, key)?;
+    get_property(ctx, object, key)
+}
+
+pub(crate) fn key_text(heap: &Heap, key: PropKey) -> String {
+    match key.decode() {
+        KeyKind::Index(index) => index.to_string(),
+        KeyKind::String(atom) => AtomTable::builtin(atom)
+            .map(str::to_owned)
+            .unwrap_or_else(|| utf16_lossy(heap, heap.atoms.dynamic_string(atom).unwrap())),
+        KeyKind::Symbol(token) => {
+            symbol_text(heap, heap.symbol_registry.from_token(token).unwrap())
+        }
+    }
+}
+
+fn symbol_text(heap: &Heap, id: SymId) -> String {
+    match heap.symbols.get(id).unwrap().description {
+        SymbolDescription::None => String::new(),
+        SymbolDescription::String(id) => utf16_lossy(heap, id),
+        SymbolDescription::WellKnown(symbol) => symbol.description().into(),
+    }
+}
+
+fn throw_nullish_read<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    receiver: ValueKind,
+    key: Handle<'s>,
+) -> JsResult<Value> {
+    // Report the key without invoking ToPrimitive on objects.
+    let text = match ctx.get(key).decode() {
+        ValueKind::Object(_) => ctx.new_string("{}")?,
+        ValueKind::Symbol(id) => match ctx.heap().symbols.get(id).unwrap().description {
+            SymbolDescription::None => ctx.new_string("")?,
+            SymbolDescription::String(id) => ctx.root(Value::string(id))?,
+            SymbolDescription::WellKnown(symbol) => ctx.new_string(symbol.description())?,
+        },
+        ValueKind::String(_) => key,
+        _ => super::convert::to_string(ctx, key)?,
+    };
+    let ValueKind::String(id) = ctx.get(text).decode() else {
+        unreachable!()
+    };
+    let prefix = "cannot read property '";
+    let suffix = if matches!(receiver, ValueKind::Null) {
+        "' of null"
+    } else {
+        "' of undefined"
+    };
+    Err(ctx.throw_error_with(ErrorKind::Type, |heap| {
+        let key = || heap.string_units(id).take_while(|&unit| unit != 0);
+        JsString::from_units(
+            &heap.ledger,
+            prefix.len() + key().count() + suffix.len(),
+            key().any(|unit| unit > 255),
+            prefix
+                .encode_utf16()
+                .chain(key())
+                .chain(suffix.encode_utf16()),
+        )
+    }))
+}
+
 pub fn get_property_with_receiver<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     object: Handle<'s>,
@@ -399,6 +473,12 @@ pub fn get_property_with_receiver<'s>(
     receiver: Handle<'s>,
 ) -> JsResult<Value> {
     let kind = ctx.get(object).decode();
+    if matches!(kind, ValueKind::Null | ValueKind::Undefined) {
+        return ctx.with_scope(|ctx| {
+            let key = super::convert::key_value(ctx, key)?;
+            throw_nullish_read(ctx, kind, key)
+        });
+    }
     if let ValueKind::String(string) = kind
         && let Some((string, index)) = string_own_property(ctx.heap(), string, key)
     {

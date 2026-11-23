@@ -4,7 +4,7 @@ use crate::atom::{AtomTable, PropKey};
 use crate::heap::{Heap, PersistentRoot};
 use crate::ledger::{AllocError, AllocResult, HeapLedger, TrackedBox, TrackedVec};
 use crate::object::*;
-use crate::realm::{NativeFnId, Realm, Runtime, bootstrap_error};
+use crate::realm::{NativeFnId, Realm, Runtime, bootstrap_error_message};
 use crate::string::{JsString, MAX_ROPE_DEPTH};
 use crate::symbol::SymbolDescription;
 use crate::value::*;
@@ -294,11 +294,19 @@ impl<'s> ExecCtx<'_, 's> {
     }
 
     pub fn throw_error(&mut self, kind: ErrorKind, text: &str) -> Abrupt {
+        self.throw_error_with(kind, |heap| JsString::from_str(&heap.ledger, text))
+    }
+
+    pub(crate) fn throw_error_with(
+        &mut self,
+        kind: ErrorKind,
+        message: impl Fn(&Heap) -> AllocResult<JsString>,
+    ) -> Abrupt {
         let proto = self.realm().error_prototype(kind);
-        match self
-            .runtime
-            .allocate(|runtime| bootstrap_error(&mut runtime.heap, proto, kind, text))
-        {
+        match self.runtime.allocate(|runtime| {
+            let message = message(&runtime.heap)?;
+            bootstrap_error_message(&mut runtime.heap, proto, kind, message)
+        }) {
             Ok(id) => self.throw_value(Value::object(id), false),
             Err(_) => self.throw_oom(),
         }

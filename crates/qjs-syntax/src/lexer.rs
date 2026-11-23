@@ -313,6 +313,12 @@ impl<'a> Lexer<'a> {
 
     fn number(&mut self) -> Result<NumericLiteral, ParseError> {
         let start = self.pos;
+        self.scan_number()
+            .ok_or_else(|| self.error(start, "invalid number literal"))
+    }
+
+    fn scan_number(&mut self) -> Option<NumericLiteral> {
+        let start = self.pos;
         let mut kind = NumericKind::Decimal;
         let mut radix = 10;
         let mut integer = true;
@@ -331,22 +337,18 @@ impl<'a> Lexer<'a> {
                     kind = NumericKind::Binary;
                 }
                 Some(b'0'..=b'9') => kind = NumericKind::LegacyOctal,
-                Some(b'_') => {
-                    return Err(self.error(start, "Numeric separator after a leading zero"));
-                }
+                Some(b'_') => return None,
                 _ => (),
             }
         }
         if radix != 10 {
             self.pos += 2;
             if !matches!(self.digits(radix, true), Some(1..)) {
-                return Err(self.error(start, "Invalid digits in numeric literal"));
+                return None;
             }
         } else {
             let legacy = kind == NumericKind::LegacyOctal;
-            if self.digits(10, !legacy).is_none() {
-                return Err(self.error(start, "Invalid numeric separator"));
-            }
+            self.digits(10, !legacy)?;
             if legacy && self.bytes()[start..self.pos].iter().any(|&b| b >= b'8') {
                 kind = NumericKind::LegacyDecimal;
             }
@@ -354,9 +356,7 @@ impl<'a> Lexer<'a> {
                 if self.at(0) == Some(b'.') {
                     integer = false;
                     self.pos += 1;
-                    if self.digits(10, true).is_none() {
-                        return Err(self.error(start, "Invalid numeric separator"));
-                    }
+                    self.digits(10, true)?;
                 }
                 if matches!(self.at(0), Some(b'e' | b'E')) {
                     integer = false;
@@ -365,7 +365,7 @@ impl<'a> Lexer<'a> {
                         self.pos += 1;
                     }
                     if !matches!(self.digits(10, true), Some(1..)) {
-                        return Err(self.error(start, "Invalid numeric exponent"));
+                        return None;
                     }
                 }
             }
@@ -381,12 +381,12 @@ impl<'a> Lexer<'a> {
             .cp()
             .is_some_and(|(c, _)| id_start(c) || c == u32::from(b'\\') || (48..=57).contains(&c))
         {
-            return Err(self.error(start, "Unexpected character after numeric literal"));
+            return None;
         }
         let raw = std::str::from_utf8(&self.bytes()[start..self.pos])
             .expect("ASCII numeric literal")
             .into();
-        Ok(NumericLiteral { raw, kind })
+        Some(NumericLiteral { raw, kind })
     }
 
     fn fixed_hex(&mut self, len: usize) -> Option<u32> {
@@ -492,6 +492,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn template(&mut self) -> Result<TokenKind, ParseError> {
+        let token_start = self.pos;
         self.pos += 1;
         let start = self.pos;
         let mut raw = Vec::new();
@@ -499,7 +500,7 @@ impl<'a> Lexer<'a> {
             let end = self.pos;
             let (c, n) = self
                 .cp()
-                .ok_or_else(|| self.error(start, "Unterminated template literal"))?;
+                .ok_or_else(|| self.error(token_start, "Unterminated template literal"))?;
             self.pos += n;
             let tail = c == u32::from(b'`');
             if tail || (c == u32::from(b'$') && self.at(0) == Some(b'{')) {
@@ -521,7 +522,7 @@ impl<'a> Lexer<'a> {
                 raw.push(b'\\' as u16);
                 let (escaped, n) = self
                     .cp()
-                    .ok_or_else(|| self.error(start, "Unterminated template escape"))?;
+                    .ok_or_else(|| self.error(token_start, "Unterminated template escape"))?;
                 self.pos += n;
                 self.template_raw(&mut raw, escaped);
             } else {

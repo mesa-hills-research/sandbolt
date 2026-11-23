@@ -346,14 +346,7 @@ fn resolve_request(
             return Err(ctx.throw_oom());
         }
         let source = SourceText::from_utf8(name, &source);
-        let image = qjs_compiler::compile_source(&source, parse).map_err(|error| match error {
-            qjs_compiler::CompileError::Syntax { message, .. } => {
-                ctx.throw_error(ErrorKind::Syntax, &message)
-            }
-            qjs_compiler::CompileError::OutOfMemory => ctx.throw_oom(),
-            qjs_compiler::CompileError::StackOverflow => ctx.stack_overflow(),
-            other => ctx.throw_error(ErrorKind::Internal, &format!("{other:?}")),
-        })?;
+        let image = crate::api::compile_text(ctx, &source, parse)?;
         return register_image(ctx, &image, Some(&source));
     }
     let value = match loaded {

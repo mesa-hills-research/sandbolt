@@ -80,6 +80,7 @@ pub struct FunctionFlags {
     pub super_allowed: bool,
     pub arguments_allowed: bool,
     pub backtrace_barrier: bool,
+    pub name_is_inferred: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

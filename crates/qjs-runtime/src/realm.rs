@@ -87,6 +87,9 @@ macro_rules! intrinsics {
             pub for_in_iterator_proto: ObjId,
             pub typed_array_concrete: [Option<(ObjId, ObjId)>; 12],
             pub std_array_prototype_intact: bool,
+            pub(crate) callsite_proto: ObjId,
+            pub(crate) error_stack_limit: Value,
+            pub(crate) error_prepare_stack: Value,
             pub time_origin_instant: Instant,
             pub time_origin_epoch_ms: f64,
             pub(crate) oom_error: EmergencyError,
@@ -115,6 +118,9 @@ macro_rules! intrinsics {
                     pair.0.trace(tracer);
                     pair.1.trace(tracer);
                 }
+                self.callsite_proto.trace(tracer);
+                self.error_stack_limit.trace(tracer);
+                self.error_prepare_stack.trace(tracer);
                 self.oom_error.trace(tracer);
                 self.stack_error.trace(tracer);
             }
@@ -138,6 +144,7 @@ macro_rules! intrinsics {
             let iterator_wrap_proto = heap.insert_object(Some($iterator), proto, ObjectData::Ordinary)?;
             let async_from_sync_iterator_proto = heap.insert_object(Some($async_iterator), proto, ObjectData::Ordinary)?;
             let for_in_iterator_proto = heap.insert_object(Some($object), proto, ObjectData::Ordinary)?;
+            let callsite_proto = heap.insert_object(Some($object), proto, ObjectData::Ordinary)?;
             let oom_error = EmergencyError::new(heap, $internal_error, ErrorKind::Internal, "out of memory")?;
             let stack_error = EmergencyError::new(heap, $range_error, ErrorKind::Range, "Maximum call stack size exceeded")?;
             let time_origin_instant = Instant::now();
@@ -162,6 +169,9 @@ macro_rules! intrinsics {
                 for_in_iterator_proto,
                 typed_array_concrete: [None; 12],
                 std_array_prototype_intact: true,
+                callsite_proto,
+                error_stack_limit: Value::int32(10),
+                error_prepare_stack: Value::UNDEFINED,
                 time_origin_instant,
                 time_origin_epoch_ms,
                 oom_error, stack_error,
@@ -410,6 +420,15 @@ pub(crate) fn bootstrap_error(
     text: &str,
 ) -> AllocResult<ObjId> {
     let message = JsString::from_str(&heap.ledger, text)?;
+    bootstrap_error_message(heap, proto, kind, message)
+}
+
+pub(crate) fn bootstrap_error_message(
+    heap: &mut Heap,
+    proto: ObjId,
+    kind: ErrorKind,
+    message: JsString,
+) -> AllocResult<ObjId> {
     let message = Value::string(heap.strings.insert(&heap.ledger, message)?);
     let data = TrackedBox::new(
         &heap.ledger,

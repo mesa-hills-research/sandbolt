@@ -19,6 +19,7 @@ fn unit() -> ProgramImage {
             super_allowed: true,
             arguments_allowed: true,
             backtrace_barrier: true,
+            name_is_inferred: true,
         },
         arg_count: 1,
         var_count: 2,

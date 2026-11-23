@@ -411,7 +411,13 @@ fn validate_function_source(
 ) -> JsResult<()> {
     use crate::object::ErrorKind;
     let program = qjs_syntax::parse(source, parse).map_err(|error| match error.kind {
-        ParseErrorKind::Syntax => ctx.throw_error(ErrorKind::Syntax, &error.message),
+        ParseErrorKind::Syntax => crate::vm::exec::stack::throw_syntax_error(
+            ctx,
+            &error.message,
+            &source.filename,
+            error.line,
+            error.col,
+        ),
         ParseErrorKind::OutOfMemory => ctx.throw_oom(),
         ParseErrorKind::StackOverflow => ctx.stack_overflow(),
     })?;

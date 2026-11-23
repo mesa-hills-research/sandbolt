@@ -1,9 +1,10 @@
 use crate::atom::Atom;
 use crate::builtins::{configure_ctor, install_accessor};
 use crate::ledger::TrackedBox;
-use crate::object::{ErrorData, ErrorKind, ObjectData, ObjectFlags};
+use crate::object::{ErrorData, ErrorKind, FrameSource, ObjectData, ObjectFlags};
 use crate::realm::Realm;
 use crate::value::{ObjId, ValueKind};
+use crate::vm::exec::stack;
 
 use super::*;
 
@@ -23,6 +24,18 @@ const IS_ERROR: u16 = 0x6a;
 const TO_STRING: u16 = 0x6b;
 const STACK_GET: u16 = 0x6c;
 const STACK_SET: u16 = 0x6d;
+const LIMIT_GET: u16 = 0x6e;
+const LIMIT_SET: u16 = 0x6f;
+const PREPARE_GET: u16 = 0x70;
+const PREPARE_SET: u16 = 0x71;
+const CAPTURE: u16 = 0x72;
+const SITE_NATIVE: u16 = 0x73;
+const SITE_CONSTRUCTOR: u16 = 0x74;
+const SITE_FILE: u16 = 0x75;
+const SITE_FUNCTION: u16 = 0x76;
+const SITE_NAME: u16 = 0x77;
+const SITE_COLUMN: u16 = 0x78;
+const SITE_LINE: u16 = 0x79;
 
 fn ctor_id(realm: &Realm, kind: ErrorKind) -> ObjId {
     match kind {
@@ -54,7 +67,59 @@ pub(super) fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
         })?;
     }
     let ctor = ctx.root(Value::object(ctx.realm().error_ctor))?;
-    methods(ctx, ctor, &[(IS_ERROR, "isError", 1)])?;
+    methods(
+        ctx,
+        ctor,
+        &[(IS_ERROR, "isError", 1), (CAPTURE, "captureStackTrace", 2)],
+    )?;
+    for (name, getter, setter, get_name, set_name) in [
+        (
+            "stackTraceLimit",
+            LIMIT_GET,
+            LIMIT_SET,
+            "get stackTraceLimit",
+            "set stackTraceLimit",
+        ),
+        (
+            "prepareStackTrace",
+            PREPARE_GET,
+            PREPARE_SET,
+            "get prepareStackTrace",
+            "set prepareStackTrace",
+        ),
+    ] {
+        let key = ctx.intern_str(name)?;
+        install_accessor(
+            ctx,
+            ctor,
+            key,
+            Some((id(getter), get_name)),
+            Some((id(setter), set_name)),
+            true,
+        )?;
+    }
+    let site_proto = ctx.root(Value::object(ctx.realm().callsite_proto))?;
+    methods(
+        ctx,
+        site_proto,
+        &[
+            (SITE_NATIVE, "isNative", 0),
+            (SITE_CONSTRUCTOR, "isConstructor", 0),
+            (SITE_FILE, "getFileName", 0),
+            (SITE_FUNCTION, "getFunction", 0),
+            (SITE_NAME, "getFunctionName", 0),
+            (SITE_COLUMN, "getColumnNumber", 0),
+            (SITE_LINE, "getLineNumber", 0),
+        ],
+    )?;
+    let tag = ctx.new_string("CallSite")?;
+    define_data(
+        ctx,
+        site_proto,
+        symbol_key(ctx, WellKnown::ToStringTag),
+        tag,
+        PropFlags::CONFIGURABLE,
+    )?;
     let proto = ctx.root(Value::object(ctx.realm().error_proto))?;
     methods(ctx, proto, &[(TO_STRING, "toString", 0)])?;
     install_accessor(
@@ -107,6 +172,55 @@ pub(super) fn dispatch<'s>(
                 put(ctx, this, key, value)?;
             }
             Ok(Value::UNDEFINED)
+        }
+        LIMIT_GET | PREPARE_GET => {
+            convert::require_object_coercible(ctx, ctx.get(this))?;
+            let realm = ctx.realm();
+            Ok(if op == LIMIT_GET {
+                realm.error_stack_limit
+            } else {
+                realm.error_prepare_stack
+            })
+        }
+        LIMIT_SET | PREPARE_SET => {
+            convert::require_object_coercible(ctx, ctx.get(this))?;
+            let value = args.get(0).map_or(Value::UNDEFINED, |arg| ctx.get(arg));
+            let id = ctx.realm_id();
+            let realm = ctx.runtime.heap.realms.get_mut(id).unwrap();
+            if op == LIMIT_SET {
+                realm.error_stack_limit = value;
+            } else {
+                realm.error_prepare_stack = value;
+            }
+            Ok(Value::UNDEFINED)
+        }
+        CAPTURE => {
+            let target = arg(ctx, args, 0)?;
+            let filter = args.get(1).map_or(Value::UNDEFINED, |arg| ctx.get(arg));
+            stack::capture_on_object(ctx, target, filter)?;
+            Ok(Value::UNDEFINED)
+        }
+        SITE_NATIVE..=SITE_LINE => {
+            let Some(ObjectData::CallSite(frame)) = ctx
+                .get(this)
+                .as_object()
+                .map(|id| &ctx.heap().object(id).data)
+            else {
+                return Err(ctx.throw_type_error("CallSite object expected"));
+            };
+            let frame = **frame;
+            Ok(match op {
+                SITE_NATIVE => Value::bool(matches!(frame.source, FrameSource::Native)),
+                SITE_CONSTRUCTOR => Value::bool(frame.constructor),
+                SITE_FUNCTION => frame.function.map_or(Value::NULL, Value::object),
+                SITE_NAME => return stack::callsite_name(ctx, frame.name),
+                SITE_FILE => return stack::callsite_file(ctx, frame.source),
+                SITE_COLUMN | SITE_LINE => stack::callsite_position(ctx.heap(), frame.source)
+                    .map_or(Value::NULL, |(line, column)| {
+                        Value::number(f64::from(if op == SITE_COLUMN { column } else { line }))
+                    }),
+                _ => unreachable!(),
+            })
         }
         _ => Err(ctx.throw_type_error("unknown Error builtin")),
     }
@@ -181,7 +295,9 @@ fn error_constructor<'s>(
         }
         _ => {}
     }
-    Ok(ctx.get(error))
+    let value = ctx.get(error);
+    stack::capture_constructor(ctx, value)?;
+    Ok(value)
 }
 
 fn error_to_string<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>) -> JsResult<Value> {

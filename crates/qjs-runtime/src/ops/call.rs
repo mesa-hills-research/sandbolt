@@ -134,7 +134,7 @@ fn enter_call(
                     .flags
                     .contains(ObjectFlags::IS_CONSTRUCTOR)
                 {
-                    return Err(ctx.throw_type_error("expected a constructor"));
+                    return Err(not_a_constructor(ctx, id));
                 }
             }
         }
@@ -178,23 +178,21 @@ fn enter_call(
                 }
             }
             ObjectData::NativeFunction(native) if new_target.is_none() => {
-                let caller_realm = ctx.realm;
-                let id = native.function.0;
-                ctx.realm = native.realm;
-                // An inlined call still enters the builtin's realm.
-                if let Some((new_count, target)) =
-                    exec::transform_native_call(ctx, id, base, count)?
-                {
-                    callee = ctx.runtime.vm.stack[base]
-                        .as_object()
-                        .ok_or_else(|| ctx.throw_type_error("expected a callable function"))?;
-                    count = new_count;
-                    new_target = target;
-                    ctx.check_interrupt()?;
-                } else {
-                    ctx.realm = caller_realm;
+                let Some(forward) = exec::NativeForward::from_id(native.function.0) else {
                     break;
+                };
+                let realm = native.realm;
+                if !ctx.runtime.vm.check_budget(0, 1, 0) {
+                    return Err(ctx.stack_overflow());
                 }
+                // Keep the builtin on the VM stack without recursing into Rust.
+                push_forwarding_frame(ctx, callee, realm, base)?;
+                ctx.realm = realm;
+                (count, new_target) = exec::transform_native_call(ctx, forward, base, count)?;
+                callee = ctx.runtime.vm.stack[base]
+                    .as_object()
+                    .ok_or_else(|| ctx.throw_type_error("expected a callable function"))?;
+                ctx.check_interrupt()?;
             }
             ObjectData::BytecodeFunction(_) | ObjectData::NativeFunction(_) => break,
             _ => return Err(ctx.throw_type_error("expected a callable function")),
@@ -290,6 +288,50 @@ fn enter_call(
         exec::coroutines::enter(ctx, ctx.runtime.vm.frames.len() - 1, kind)?;
     }
     Ok(())
+}
+
+fn push_forwarding_frame(
+    ctx: &mut ExecCtx<'_, '_>,
+    callee: ObjId,
+    realm: RealmId,
+    base: usize,
+) -> JsResult<()> {
+    let frame = CallFrame {
+        callee,
+        realm,
+        caller_realm: ctx.realm,
+        code: None,
+        new_target: None,
+        pc: 0,
+        base: base as u32,
+        arg_count: 0,
+        arg_slots: 0,
+        capture_base: 0,
+        floor: 0,
+        last_pc: 0,
+        return_call: true,
+        require_object: false,
+        coroutine: None,
+    };
+    if ctx.runtime.vm.frames.len() < ctx.runtime.vm.frames.capacity() {
+        ctx.runtime.vm.frames.push_reserved(frame);
+        Ok(())
+    } else {
+        ctx.allocate(|runtime| runtime.vm.frames.push(&runtime.heap.ledger, frame))
+    }
+}
+
+pub(crate) fn not_a_constructor(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> Abrupt {
+    if let ObjectData::BytecodeFunction(f) = &ctx.heap().object(id).data
+        && let Some(function) = &ctx.heap().bytecode.get(f.code).unwrap().compiled
+        && !function.flags.name_is_inferred
+        && let Some(name) = function.name
+    {
+        let name = super::property::key_text(ctx.heap(), name);
+        ctx.throw_type_error(&format!("{name} is not a constructor"))
+    } else {
+        ctx.throw_type_error("not a constructor")
+    }
 }
 
 fn proxy_call(

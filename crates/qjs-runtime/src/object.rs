@@ -110,6 +110,7 @@ object_data!(
     SymbolObject(SymbolObjectData),
     BigIntObject(BigIntObjectData),
     Error(ErrorData),
+    CallSite(ErrorFrame),
     RegExp(RegExpData),
     Date(DateData),
     ArrayBuffer(ArrayBufferData),

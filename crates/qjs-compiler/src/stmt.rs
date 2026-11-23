@@ -356,7 +356,7 @@ impl Emitter<'_> {
                 target,
                 iterable,
                 body,
-            } => self.for_each(*kind, target, *iterable, *body, labels)?,
+            } => self.for_each(node.span, *kind, target, *iterable, *body, labels)?,
             Stmt::Switch {
                 discriminant,
                 cases,
@@ -591,6 +591,7 @@ impl Emitter<'_> {
 
     fn for_each(
         &mut self,
+        span: Span,
         kind: ForKind,
         target: &ForTarget,
         iterable: ExprId,
@@ -620,11 +621,11 @@ impl Emitter<'_> {
             }
             ForKind::Of => {
                 self.plain(ForOfStart);
-                Cleanup::CloseIterator
+                Cleanup::CloseIterator(span)
             }
             ForKind::AwaitOf => {
                 self.plain(ForAwaitOfStart);
-                Cleanup::AsyncIterator
+                Cleanup::AsyncIterator(span)
             }
         };
         self.fm().cleanup.push(cleanup);
@@ -860,7 +861,7 @@ impl Emitter<'_> {
             let cleanup = self.f().cleanup[i];
             match cleanup {
                 Cleanup::Catch => self.plain(NipCatch),
-                Cleanup::CloseIterator | Cleanup::AsyncIterator => {
+                Cleanup::CloseIterator(_) | Cleanup::AsyncIterator(_) => {
                     self.plain(NipCatch);
                     self.plain(Rot3r);
                     self.plain(Undefined);
@@ -923,8 +924,12 @@ impl Emitter<'_> {
         use Opcode::*;
         match cleanup {
             Cleanup::Drop | Cleanup::Catch => self.plain(Drop),
-            Cleanup::CloseIterator => self.plain(IteratorClose),
-            Cleanup::AsyncIterator => {
+            Cleanup::CloseIterator(span) => {
+                self.source_loc(span);
+                self.plain(IteratorClose);
+            }
+            Cleanup::AsyncIterator(span) => {
+                self.source_loc(span);
                 self.plain(Drop);
                 self.plain(Drop);
                 self.async_close_object();

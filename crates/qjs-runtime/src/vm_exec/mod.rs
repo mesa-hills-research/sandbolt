@@ -6,6 +6,7 @@ mod load;
 pub(crate) mod modules;
 pub(crate) mod numeric;
 mod objects;
+pub(crate) mod stack;
 
 #[cfg(test)]
 mod tests;
@@ -13,7 +14,7 @@ mod tests;
 use qjs_bytecode::{ExceptionHandler, Instruction, Opcode, Operands};
 use qjs_syntax::SourceText;
 
-use crate::atom::{Atom, AtomTable, KeyKind, PropKey};
+use crate::atom::{Atom, PropKey};
 use crate::object::{ErrorKind, ObjectData, ObjectFlags};
 use crate::ops::{call, compare, convert, property};
 use crate::root::{Args, ExecCtx, Handle};
@@ -27,28 +28,7 @@ pub(crate) use iterators::{async_from_sync_call, close_original, for_in_next, it
 pub(crate) use coroutines::resume_generator;
 pub(crate) use objects::brand_key;
 
-fn format_stack(ctx: &ExecCtx<'_, '_>, skip: usize) -> String {
-    use std::fmt::Write;
-    let mut text = String::new();
-    for frame in stack_frames(ctx, true, skip) {
-        let name = if frame.function.is_empty() || frame.function == "<eval>" {
-            "<anonymous>"
-        } else {
-            &frame.function
-        };
-        if frame.line == 0 {
-            writeln!(text, "    at {name} (native)").unwrap();
-        } else {
-            writeln!(
-                text,
-                "    at {name} ({}:{}:{})",
-                frame.file, frame.line, frame.column
-            )
-            .unwrap();
-        }
-    }
-    text
-}
+pub(crate) use stack::{capture_frames, capture_throw, native_stack, saved_frames};
 
 impl<'s> ExecCtx<'_, 's> {
     pub fn function_source(&mut self, function: Handle<'s>) -> JsResult<Option<Handle<'s>>> {
@@ -66,216 +46,6 @@ impl<'s> ExecCtx<'_, 's> {
         };
         source.map(|id| self.root(Value::string(id))).transpose()
     }
-
-    pub fn capture_stack(&mut self, skip: usize) -> JsResult<Handle<'s>> {
-        let text = format_stack(self, skip);
-        self.new_string(&text)
-    }
-
-    pub fn capture_error_stack(&mut self, error: Handle<'s>) -> JsResult<()> {
-        save_error_stack(self, error, 0)
-    }
-}
-
-fn collect_error_frames(ctx: &ExecCtx<'_, '_>, skip: usize) -> Vec<crate::object::ErrorFrame> {
-    let heap = ctx.heap();
-    let mut frames = Vec::new();
-    for frame in ctx.runtime.vm.frames.iter().rev().skip(skip) {
-        let Some(code) = frame.code else {
-            continue;
-        };
-        let Some(f) = &heap.bytecode.get(code).unwrap().compiled else {
-            continue;
-        };
-        frames.push(crate::object::ErrorFrame {
-            code,
-            pc: frame.last_pc,
-        });
-        if f.flags.backtrace_barrier {
-            break;
-        }
-    }
-    frames
-}
-
-/// Captures frames and formatted stack onto an already-rooted `Error` object
-/// without consuming VM stack slots, so stack-overflow errors keep their frames.
-fn save_error_data(ctx: &mut ExecCtx<'_, '_>, id: ObjId, skip: usize) -> JsResult<()> {
-    let needs_stack = matches!(
-        &ctx.heap().object(id).data,
-        ObjectData::Error(data) if data.stack == Value::UNDEFINED
-    );
-    if !needs_stack {
-        return Ok(());
-    }
-    let raw_frames = collect_error_frames(ctx, skip);
-    let text = format_stack(ctx, skip);
-    ctx.allocate(|rt| {
-        let heap = &mut rt.heap;
-        let frames = crate::ledger::TrackedVec::from_slice(&heap.ledger, &raw_frames)?;
-        let stack_str = crate::string::JsString::from_str(&heap.ledger, &text)?;
-        let stack_id = heap.strings.insert(&heap.ledger, stack_str)?;
-        let ObjectData::Error(data) = &mut heap.objects.get_mut(id).unwrap().data else {
-            unreachable!()
-        };
-        data.frames = frames;
-        data.stack = Value::string(stack_id);
-        Ok(())
-    })
-}
-
-fn save_error_stack<'s>(ctx: &mut ExecCtx<'_, 's>, error: Handle<'s>, skip: usize) -> JsResult<()> {
-    let id = ctx.object_id(error)?;
-    match &ctx.heap().object(id).data {
-        ObjectData::Error(_) => save_error_data(ctx, id, skip),
-        ObjectData::DomException(_) => {
-            let current = property::get_own_property_descriptor(ctx, error, Atom::get("stack"))?;
-            if current.is_some_and(|d| matches!(d.value.map(Value::decode), Some(ValueKind::String(s)) if ctx.heap().string(s).is_empty())) {
-                let stack = ctx.capture_stack(skip)?;
-                property::define_own_property(ctx, error, Atom::get("stack"), property::PropertyDescriptor { value: Some(stack), ..Default::default() })?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-pub(crate) fn saved_frames(ctx: &ExecCtx<'_, '_>, error: Value) -> Option<Vec<crate::Frame>> {
-    let id = error.as_object()?;
-    let ObjectData::Error(data) = &ctx.heap().object(id).data else {
-        return None;
-    };
-    if data.frames.is_empty() {
-        return None;
-    }
-    let heap = ctx.heap();
-    let mut frames = Vec::with_capacity(data.frames.len());
-    for frame in data.frames.iter() {
-        if let Some(resolved) = resolve_frame(heap, frame.code, frame.pc) {
-            frames.push(resolved);
-        }
-    }
-    Some(frames)
-}
-
-pub(crate) fn native_stack(ctx: &mut ExecCtx<'_, '_>, value: Value) -> JsResult<Value> {
-    if value.as_object().is_some_and(|id| {
-        matches!(
-            ctx.heap().object(id).data,
-            ObjectData::Error(_) | ObjectData::DomException(_)
-        )
-    }) {
-        ctx.with_scope(|ctx| {
-            let error = ctx.root(value)?;
-            save_error_stack(ctx, error, 1)
-        })?;
-    }
-    Ok(value)
-}
-
-pub(crate) fn capture_throw(ctx: &mut ExecCtx<'_, '_>) {
-    if ctx.runtime.vm.thrown_frames.is_empty() {
-        ctx.runtime.vm.thrown_frames = capture_frames(ctx);
-    }
-    let Some(value) = ctx.pending_exception() else {
-        return;
-    };
-    if ctx.is_oom() {
-        return;
-    }
-    let Some(id) = value.as_object() else {
-        return;
-    };
-    match &ctx.heap().object(id).data {
-        ObjectData::Error(_) => {
-            // `value` is rooted in `vm.exception`; capture directly without
-            // pushing onto `vm.stack` so stack-overflow errors keep their origin.
-            let _ = save_error_data(ctx, id, 0);
-            ctx.throw_value(value, false);
-        }
-        ObjectData::DomException(_) => {
-            let _ = ctx.with_scope(|ctx| {
-                let root = ctx.root(value)?;
-                let _ = save_error_stack(ctx, root, 0);
-                ctx.throw_value(value, false);
-                Ok::<_, Abrupt>(())
-            });
-            ctx.throw_value(value, false);
-        }
-        _ => {}
-    }
-}
-
-pub(crate) fn capture_frames(ctx: &ExecCtx<'_, '_>) -> Vec<crate::Frame> {
-    stack_frames(ctx, false, 0)
-}
-
-fn resolve_frame(heap: &crate::heap::Heap, code: BcId, pc: u32) -> Option<crate::Frame> {
-    let f = heap.bytecode.get(code)?.compiled.as_ref()?;
-    let end = f.pc_map.partition_point(|p| p.pc <= pc);
-    let byte = f.pc_map[..end]
-        .last()
-        .map_or(f.source_start, |p| p.byte_offset);
-    let line = f
-        .line_starts
-        .partition_point(|&start| start <= byte)
-        .saturating_sub(1);
-    let column = byte.saturating_sub(f.line_starts[line]) + 1;
-    Some(crate::Frame {
-        file: String::from_utf8_lossy(&f.filename).into_owned(),
-        function: f.name.map_or_else(String::new, |key| match key.decode() {
-            KeyKind::Index(i) => i.to_string(),
-            KeyKind::String(atom) => AtomTable::builtin(atom)
-                .map(str::to_owned)
-                .or_else(|| {
-                    heap.atoms
-                        .dynamic_string(atom)
-                        .map(|id| utf16_lossy(heap, id))
-                })
-                .unwrap_or_default(),
-            KeyKind::Symbol(_) => String::new(),
-        }),
-        line: line as u32 + 1,
-        column,
-    })
-}
-
-fn stack_frames(ctx: &ExecCtx<'_, '_>, natives: bool, skip: usize) -> Vec<crate::Frame> {
-    let heap = ctx.heap();
-    let mut frames = Vec::new();
-    for frame in ctx.runtime.vm.frames.iter().rev().skip(skip) {
-        let Some(code) = frame.code else {
-            if natives {
-                let function = heap.object(frame.callee);
-                let name =
-                    heap.shape(function.shape)
-                        .find(Atom::get("name"))
-                        .and_then(|(index, _)| match function.props[index].decode() {
-                            ValueKind::String(id) => Some(utf16_lossy(heap, id)),
-                            _ => None,
-                        });
-                if let Some(function) = name {
-                    frames.push(crate::Frame {
-                        file: String::new(),
-                        function,
-                        line: 0,
-                        column: 0,
-                    });
-                }
-            }
-            continue;
-        };
-        let Some(f) = &heap.bytecode.get(code).unwrap().compiled else {
-            continue;
-        };
-        if let Some(resolved) = resolve_frame(heap, code, frame.last_pc) {
-            frames.push(resolved);
-        }
-        if f.flags.backtrace_barrier {
-            break;
-        }
-    }
-    frames
 }
 
 pub(crate) fn utf16_lossy(heap: &crate::heap::Heap, id: StrId) -> String {
@@ -536,7 +306,11 @@ pub(crate) fn step(
                 }
                 CallConstructor => {
                     let start = tail - count - 2;
-                    target = Some(ctx.object_id(Handle::at(start + 1))?);
+                    target = Some(
+                        ctx.runtime.vm.stack[start + 1]
+                            .as_object()
+                            .ok_or_else(|| ctx.throw_type_error("not a function"))?,
+                    );
                     start
                 }
                 _ => {
@@ -934,7 +708,21 @@ fn spread_call<'s>(
     mode: u32,
 ) -> JsResult<()> {
     let this_value = ctx.get(this);
-    let new_target = (mode == 1).then(|| ctx.object_id(this)).transpose()?;
+    let new_target = (mode == 1)
+        .then(|| {
+            this_value
+                .as_object()
+                .ok_or_else(|| ctx.throw_type_error("not a function"))
+        })
+        .transpose()?;
+    if mode == 1
+        && !ctx
+            .get(callee)
+            .as_object()
+            .is_some_and(|id| call::is_callable(ctx.heap(), id))
+    {
+        return Err(ctx.throw_type_error("not a function"));
+    }
     let count = expand_array_like(ctx, base, ctx.get(callee), this_value, array, mode != 1)?;
     call::enter(ctx, base, count, new_target)
 }
@@ -985,13 +773,32 @@ fn expand_array_like<'s>(
     Ok(count)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum NativeForward {
+    Call,
+    Apply,
+    ReflectApply,
+    ReflectConstruct,
+}
+
+impl NativeForward {
+    pub(crate) fn from_id(id: u16) -> Option<Self> {
+        Some(match id.wrapping_sub(crate::builtins::CORE_BASE) {
+            0x43 => Self::Call,
+            0x41 => Self::Apply,
+            0x80 => Self::ReflectApply,
+            0x81 => Self::ReflectConstruct,
+            _ => return None,
+        })
+    }
+}
+
 pub(crate) fn transform_native_call(
     ctx: &mut ExecCtx<'_, '_>,
-    id: u16,
+    forward: NativeForward,
     base: usize,
     count: usize,
-) -> JsResult<Option<(usize, Option<ObjId>)>> {
-    let core = crate::builtins::CORE_BASE;
+) -> JsResult<(usize, Option<ObjId>)> {
     let arg = |ctx: &ExecCtx<'_, '_>, i| {
         if i < count {
             ctx.runtime.vm.stack[base + 2 + i]
@@ -999,25 +806,25 @@ pub(crate) fn transform_native_call(
             Value::UNDEFINED
         }
     };
-    if id == core + 0x43 {
+    if matches!(forward, NativeForward::Call) {
         let this = arg(ctx, 0);
         ctx.runtime.vm.stack[base] = ctx.runtime.vm.stack[base + 1];
         ctx.runtime.vm.stack[base + 1] = this;
         if count > 0 {
             ctx.runtime.vm.stack.remove(base + 2);
         }
-        return Ok(Some((count.saturating_sub(1), None)));
+        return Ok((count.saturating_sub(1), None));
     }
-    let (callee, this, array, new_target, nullish) = match id.wrapping_sub(core) {
-        0x41 => (
+    let (callee, this, array, new_target, nullish) = match forward {
+        NativeForward::Apply => (
             ctx.runtime.vm.stack[base + 1],
             arg(ctx, 0),
             arg(ctx, 1),
             None,
             true,
         ),
-        0x80 => (arg(ctx, 0), arg(ctx, 1), arg(ctx, 2), None, false),
-        0x81 => {
+        NativeForward::ReflectApply => (arg(ctx, 0), arg(ctx, 1), arg(ctx, 2), None, false),
+        NativeForward::ReflectConstruct => {
             let callee = arg(ctx, 0);
             let target = if count > 2 { arg(ctx, 2) } else { callee };
             for value in [callee, target] {
@@ -1032,12 +839,12 @@ pub(crate) fn transform_native_call(
             }
             (callee, target, arg(ctx, 1), target.as_object(), false)
         }
-        _ => return Ok(None),
+        NativeForward::Call => unreachable!(),
     };
     // Array getters may collect, so retain the argument list while it is expanded.
     let array = ctx.root(array)?;
     let count = expand_array_like(ctx, base, callee, this, array, nullish)?;
-    Ok(Some((count, new_target)))
+    Ok((count, new_target))
 }
 
 pub(crate) fn unwind_frame(

@@ -38,7 +38,7 @@ pub(crate) fn execute_indirect<'s>(
     if (ctx.heap().string(string).len() as usize).saturating_mul(3) > parse.max_bytes {
         return Err(ctx.throw_oom());
     }
-    let source = SourceText::from_utf16("<eval>", ctx.heap().string_units(string).collect());
+    let source = SourceText::from_utf16("<input>", ctx.heap().string_units(string).collect());
     let image = crate::api::compile_text(ctx, &source, parse)?;
     let functions = load::load_functions(ctx, &image, Some(&source))?;
     let code = functions[image.entry_function as usize];
@@ -95,7 +95,7 @@ pub(super) fn execute(
         return Err(ctx.throw_oom());
     }
     let units = ctx.heap().string_units(string).collect();
-    let source = SourceText::from_utf16(options.filename, units);
+    let source = SourceText::from_utf16("<input>", units);
     let image = crate::api::compile_text(ctx, &source, parse)?;
     let this_key = ctx.intern_str("<this>")?;
     let this = find_cell(ctx, &environment, this_key)

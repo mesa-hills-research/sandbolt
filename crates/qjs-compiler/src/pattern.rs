@@ -236,7 +236,7 @@ impl Emitter<'_> {
             }
             Pattern::Array { items, rest } => {
                 self.plain(ForOfStart);
-                self.fm().cleanup.push(Cleanup::CloseIterator);
+                self.fm().cleanup.push(Cleanup::CloseIterator(node.span));
                 for item in items {
                     let target = item
                         .map(|item| self.prepare_target(item, init, true))
@@ -267,6 +267,7 @@ impl Emitter<'_> {
                     self.finish_target(target, init)?;
                 }
                 self.fm().cleanup.pop();
+                self.source_loc(node.span);
                 self.plain(IteratorClose);
             }
             _ => {
