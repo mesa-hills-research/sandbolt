@@ -588,11 +588,11 @@ impl<'s> ExecCtx<'_, 's> {
         let realm = self.realm;
         let mut flags = ObjectFlags::EXTENSIBLE;
         flags.set(ObjectFlags::IS_CONSTRUCTOR, constructor);
-        self.make_object(Some(proto), flags, |ledger| {
-            Ok(ObjectData::NativeFunction(TrackedBox::new(
-                ledger,
-                NativeFunctionData { function, realm },
-            )?))
+        self.make_object(Some(proto), flags, |_| {
+            Ok(ObjectData::NativeFunction(NativeFunctionData {
+                function,
+                realm,
+            }))
         })
     }
 

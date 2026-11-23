@@ -177,9 +177,9 @@ macro_rules! intrinsics {
                 oom_error, stack_error,
             });
             let constructors = (|| {
-                let data = native_payload(heap, realm, NativeFnId::EMPTY)?;
+                let data = native_payload(realm, NativeFnId::EMPTY);
                 heap.objects.get_mut(function_proto).unwrap().data = data;
-                let data = native_payload(heap, realm, crate::builtins::core::THROW_TYPE_ERROR)?;
+                let data = native_payload(realm, crate::builtins::core::THROW_TYPE_ERROR);
                 heap.objects.get_mut(throw_type_error).unwrap().data = data;
                 let empty = JsString::from_str(&heap.ledger, "")?;
                 let empty = Value::string(heap.strings.insert(&heap.ledger, empty)?);
@@ -256,7 +256,7 @@ fn bootstrap_ctor(
     function_proto: ObjId,
     instance_proto: ObjId,
 ) -> AllocResult<ObjId> {
-    let payload = native_payload(heap, realm, NativeFnId::UNIMPLEMENTED)?;
+    let payload = native_payload(realm, NativeFnId::UNIMPLEMENTED);
     let ctor = heap.insert_object(
         Some(function_proto),
         ObjectFlags::EXTENSIBLE | ObjectFlags::IS_CONSTRUCTOR,
@@ -279,11 +279,8 @@ fn bootstrap_ctor(
     Ok(ctor)
 }
 
-fn native_payload(heap: &Heap, realm: RealmId, function: NativeFnId) -> AllocResult<ObjectData> {
-    Ok(ObjectData::NativeFunction(TrackedBox::new(
-        &heap.ledger,
-        NativeFunctionData { function, realm },
-    )?))
+fn native_payload(realm: RealmId, function: NativeFnId) -> ObjectData {
+    ObjectData::NativeFunction(NativeFunctionData { function, realm })
 }
 
 fn bootstrap_methods(heap: &mut Heap, realm: RealmId) -> AllocResult<()> {
@@ -320,7 +317,7 @@ fn bootstrap_methods(heap: &mut Heap, realm: RealmId) -> AllocResult<()> {
         Value::object(global),
     )?;
     let mut method = |parent, key, id| {
-        let data = native_payload(heap, realm, id)?;
+        let data = native_payload(realm, id);
         let callee = heap.insert_object(Some(function), ObjectFlags::EXTENSIBLE, data)?;
         install_property(heap, parent, key, flags, Value::object(callee))
     };
@@ -350,7 +347,7 @@ fn bootstrap_methods(heap: &mut Heap, realm: RealmId) -> AllocResult<()> {
         .symbol_registry
         .well_known(crate::symbol::WellKnown::ToPrimitive);
     let key = heap.symbols.get(sym).unwrap().key();
-    let data = native_payload(heap, realm, NativeFnId::WRAPPER_VALUE_OF)?;
+    let data = native_payload(realm, NativeFnId::WRAPPER_VALUE_OF);
     let callee = heap.insert_object(Some(function), ObjectFlags::EXTENSIBLE, data)?;
     install_property(
         heap,

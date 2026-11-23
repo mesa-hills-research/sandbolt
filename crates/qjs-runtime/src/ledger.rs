@@ -281,27 +281,56 @@ impl<T> Drop for TrackedVec<T> {
 }
 
 #[derive(Debug)]
-pub struct TrackedBox<T>(TrackedVec<T>);
+pub struct TrackedBox<T>(Box<[TrackedBoxInner<T>; 1]>);
+
+#[derive(Debug)]
+struct TrackedBoxInner<T> {
+    value: T,
+    // Fields drop in declaration order. Keep the charge until after value drops.
+    _charge: BoxCharge<T>,
+}
+
+#[derive(Debug)]
+struct BoxCharge<T>(HeapLedger, std::marker::PhantomData<T>);
+
+impl<T> Drop for BoxCharge<T> {
+    fn drop(&mut self) {
+        self.0.release_bytes(size_of::<TrackedBoxInner<T>>());
+    }
+}
 
 impl<T> TrackedBox<T> {
     pub fn new(ledger: &HeapLedger, value: T) -> AllocResult<Self> {
-        let mut slot = TrackedVec::new();
-        slot.try_reserve_exact(ledger, 1)?;
-        slot.push_reserved(value);
-        Ok(Self(slot))
+        let bytes = size_of::<TrackedBoxInner<T>>();
+        ledger.charge_bytes(bytes)?;
+        let mut slot = Vec::new();
+        if slot.try_reserve_exact(1).is_err() {
+            ledger.release_bytes(bytes);
+            return Err(AllocError::Allocator);
+        }
+        debug_assert_eq!(slot.capacity(), 1);
+        slot.push(TrackedBoxInner {
+            value,
+            _charge: BoxCharge(ledger.clone(), std::marker::PhantomData),
+        });
+        let boxed = slot
+            .into_boxed_slice()
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("one boxed element"));
+        Ok(Self(boxed))
     }
 }
 
 impl<T> Deref for TrackedBox<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        &self.0[0]
+        &self.0[0].value
     }
 }
 
 impl<T> DerefMut for TrackedBox<T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.0[0]
+        &mut self.0[0].value
     }
 }
 

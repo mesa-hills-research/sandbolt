@@ -83,6 +83,7 @@ macro_rules! object_data {
         #[derive(Debug)]
         pub enum ObjectData {
             Ordinary,
+            NativeFunction(NativeFunctionData),
             $( $variant(TrackedBox<$payload>), )+
         }
 
@@ -90,6 +91,7 @@ macro_rules! object_data {
             fn trace(&self, tracer: &Tracer<'_>) {
                 match self {
                     Self::Ordinary => {},
+                    Self::NativeFunction(data) => data.trace(tracer),
                     $( Self::$variant(data) => data.trace(tracer), )+
                 }
             }
@@ -100,7 +102,6 @@ macro_rules! object_data {
 object_data!(
     Array(ArrayData),
     BytecodeFunction(BytecodeFunctionData),
-    NativeFunction(NativeFunctionData),
     BoundFunction(BoundFunctionData),
     Arguments(ArgumentsData),
     MappedArguments(MappedArgumentsData),
