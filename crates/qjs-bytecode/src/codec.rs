@@ -11,7 +11,7 @@ use crate::{ImageVerifyError, UnitAtom, verify_image};
 use std::fmt;
 
 pub const IMAGE_MAGIC: &[u8; 8] = b"QJSRBC\0\0";
-pub const IMAGE_VERSION: u32 = 1;
+pub const IMAGE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodecError {

@@ -322,9 +322,7 @@ impl Emitter<'_> {
         let mut heads = Vec::with_capacity(f.scopes.len());
         let args = usize::from(f.bytecode.arg_count);
         for scope in &f.scopes {
-            let mut next = if scope.parameter_end {
-                ScopeLink::ParameterEnd
-            } else if let Some(parent) = scope.info.parent {
+            let mut next = if let Some(parent) = scope.info.parent {
                 match heads[usize::from(parent)] {
                     0 => ScopeLink::End,
                     u16::MAX => ScopeLink::ParameterEnd,
@@ -333,7 +331,23 @@ impl Emitter<'_> {
             } else {
                 ScopeLink::End
             };
-            for &slot in scope.eval_object.iter().chain(&scope.lexical) {
+            let mut non_lexical: Vec<_> = scope
+                .names
+                .values()
+                .filter_map(|&slot| match slot {
+                    Slot::Local(slot) if !f.bytecode.vars[args + usize::from(slot)].lexical_tdz => {
+                        Some(slot)
+                    }
+                    _ => None,
+                })
+                .collect();
+            non_lexical.sort_unstable();
+            for &slot in scope
+                .eval_object
+                .iter()
+                .chain(&scope.lexical)
+                .chain(&non_lexical)
+            {
                 f.bytecode.vars[args + usize::from(slot)].scope_next = next;
                 next = ScopeLink::Local(slot);
             }
@@ -394,10 +408,7 @@ impl Emitter<'_> {
                         self.options.goal,
                         qjs_syntax::ParseGoal::FunctionBody { .. }
                     ))
-                || !f
-                    .ir
-                    .iter()
-                    .any(|op| matches!(op, IrOp::DirectEval { .. } | IrOp::ApplyEval { .. }))
+                || !Self::has_direct_eval(f)
             {
                 continue;
             }
@@ -424,13 +435,29 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    fn has_direct_eval(f: &crate::emit::Draft) -> bool {
+        f.ir.iter()
+            .any(|op| matches!(op, IrOp::DirectEval { .. } | IrOp::ApplyEval { .. }))
+    }
+
     pub(crate) fn resolve(&mut self) -> Result {
         use Opcode::*;
         self.charge(0)?;
         self.prepare_eval_objects()?;
+        // Fill each eval's captures inside out before ordinary lookup can add any of them.
+        for index in 0..self.functions.len() {
+            self.current = index;
+            if Self::has_direct_eval(self.f()) {
+                self.eval_captures()?;
+            }
+        }
         for index in (0..self.functions.len()).rev() {
             self.current = index;
-            let heads = self.link_scopes()?;
+            let heads = if Self::has_direct_eval(self.f()) {
+                self.link_scopes()?
+            } else {
+                Vec::new()
+            };
             let original = std::mem::take(&mut self.fm().ir);
             let globals = std::mem::take(&mut self.fm().globals);
             let flags = |kind, function| {
@@ -473,7 +500,6 @@ impl Emitter<'_> {
                     }
                     IrOp::ScopeGetRef(n) => self.name_op(n, Access::Call, &mut out)?,
                     IrOp::DirectEval { arguments, scope } => {
-                        self.eval_captures()?;
                         out.push(resolved(
                             Eval,
                             Operands::Eval {
@@ -483,7 +509,6 @@ impl Emitter<'_> {
                         ));
                     }
                     IrOp::ApplyEval { scope } => {
-                        self.eval_captures()?;
                         out.push(resolved(
                             ApplyEval,
                             Operands::Unsigned(u32::from(heads[usize::from(scope)])),

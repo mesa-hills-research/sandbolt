@@ -99,18 +99,28 @@ impl Trace for CompiledFunc {
 #[derive(Debug)]
 pub(crate) struct EvalEnvironment {
     pub bindings: TrackedVec<EvalBinding>,
-    pub declarations: Option<ObjId>,
+    pub declarations: Option<EvalDeclarations>,
     pub special: Option<[Value; 3]>,
 }
 
 impl Trace for EvalEnvironment {
     fn trace(&self, tracer: &Tracer<'_>) {
         self.bindings.trace(tracer);
-        self.declarations.trace(tracer);
+        if let Some(declarations) = self.declarations {
+            declarations.object.trace(tracer);
+        }
         if let Some(special) = &self.special {
             special.as_slice().trace(tracer);
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EvalDeclarations {
+    // Only this prefix can conflict with a sloppy eval declaration.
+    pub end: usize,
+    // `None` selects the global variable environment.
+    pub object: Option<ObjId>,
 }
 
 #[derive(Debug, Clone, Copy)]

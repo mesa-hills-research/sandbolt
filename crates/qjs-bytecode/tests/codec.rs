@@ -219,13 +219,13 @@ fn minimal_image_has_stable_wire_bytes() {
         ..ProgramImage::default()
     };
     let mut expected = IMAGE_MAGIC.to_vec();
-    expected.extend([1, 0, 0, 1]); // version, entry, atoms, functions
+    expected.extend([2, 0, 0, 1]); // version, entry, atoms, functions
     expected.extend([0; 14]); // function header and empty tables
     expected.extend([1, 0x29]); // code length and return_undef
     expected.extend([0; 5]); // empty debug info and module table
     assert_eq!(encode_image(&image).unwrap(), expected);
     assert_eq!(decode_image(&expected).unwrap(), image);
-    assert_eq!(IMAGE_VERSION, 1);
+    assert_eq!(IMAGE_VERSION, 2);
 }
 
 #[test]
@@ -251,7 +251,7 @@ fn rejects_invalid_magic_tags_versions_and_leb128() {
     );
     let with_header = |tail: &[u8]| [IMAGE_MAGIC.as_slice(), tail].concat();
     for (tail, kind) in [
-        (&[2][..], CodecErrorKind::UnsupportedVersion(2)),
+        (&[1][..], CodecErrorKind::UnsupportedVersion(1)),
         (&[0x81, 0x00], CodecErrorKind::InvalidLeb128),
         (&[0xff; 10], CodecErrorKind::InvalidLeb128),
         (
@@ -259,11 +259,11 @@ fn rejects_invalid_magic_tags_versions_and_leb128() {
             CodecErrorKind::IntegerOverflow,
         ),
         (
-            &[1, 0, 0xff, 0xff, 0xff, 0xff, 0x0f],
+            &[2, 0, 0xff, 0xff, 0xff, 0xff, 0x0f],
             CodecErrorKind::Truncated,
         ),
         (
-            &[1, 0, 1, 0xff, 0],
+            &[2, 0, 1, 0xff, 0],
             CodecErrorKind::InvalidTag("string", 0xff),
         ),
     ] {

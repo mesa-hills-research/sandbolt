@@ -102,13 +102,13 @@ pub enum VarKind {
     DisposeMethod,
 }
 
-/// The next lexical binding visible to direct eval.
+/// The next local binding visible to direct eval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ScopeLink {
-    /// Resume lookup in the ordinary argument and var bindings.
+    /// End of the local chain.
     #[default]
     End,
-    /// End of the parameter-initializer chain. Body bindings are hidden.
+    /// Reserved end marker for parameter-initializer chains.
     ParameterEnd,
     Local(u16),
 }
