@@ -29,6 +29,7 @@ impl<'s> IteratorRecord<'s> {
     ) -> JsResult<Self> {
         let iterator = call::call(ctx, method, receiver, Args::empty())?;
         let iterator = ctx.root(iterator)?;
+        ctx.object_id(iterator)?;
         let next = get(ctx, iterator, Atom::get("next"))?;
         Ok(Self { iterator, next })
     }
@@ -50,6 +51,7 @@ impl<'s> IteratorRecord<'s> {
     pub(super) fn step(self, ctx: &mut ExecCtx<'_, 's>) -> JsResult<Option<Handle<'s>>> {
         let result = call::call(ctx, self.next, self.iterator, Args::empty())?;
         let result = ctx.root(result)?;
+        ctx.object_id(result)?;
         let done = get(ctx, result, Atom::get("done"))?;
         if convert::to_boolean(ctx, done) {
             Ok(None)
@@ -119,6 +121,7 @@ pub(super) fn populate<'s>(
             let args = if is_set {
                 ctx.args(&[item])?
             } else {
+                ctx.object_id(item)?;
                 let key = get(ctx, item, PropKey::index(0).unwrap())?;
                 let value = get(ctx, item, PropKey::index(1).unwrap())?;
                 ctx.args(&[key, value])?
