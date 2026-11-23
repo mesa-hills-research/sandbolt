@@ -432,6 +432,9 @@ impl Emitter<'_> {
             Stmt::Return(value) => {
                 if let Some(value) = value {
                     self.expression(*value)?;
+                    if self.kind() == FunctionKind::AsyncGenerator {
+                        self.await_value();
+                    }
                 } else {
                     self.plain(Undefined);
                 }
@@ -841,9 +844,6 @@ impl Emitter<'_> {
 
     pub(crate) fn return_value(&mut self) -> Result {
         use Opcode::*;
-        if self.kind() == FunctionKind::AsyncGenerator {
-            self.await_value();
-        }
         for i in (0..self.f().cleanup.len()).rev() {
             let cleanup = self.f().cleanup[i];
             match cleanup {

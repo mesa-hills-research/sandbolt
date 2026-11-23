@@ -841,10 +841,12 @@ impl Emitter<'_> {
             }
             Reference::Field(atom) => self.named(GetField2, atom),
             Reference::Element => {
+                self.plain(ToPropkey2);
                 self.plain(Dup2);
                 self.plain(GetArrayEl);
             }
             Reference::Super => {
+                self.plain(ToPropkey);
                 self.plain(Dup3);
                 self.plain(GetSuperValue);
             }
@@ -884,21 +886,18 @@ impl Emitter<'_> {
             } else {
                 IrOp::ScopePutVar(name)
             }),
-            Reference::Dynamic(name, with) => {
-                let store = self.label();
-                self.get(with);
-                self.if_false(store);
-                self.plain(Dup3);
-                self.plain(Drop);
-                self.plain(Swap);
-                self.plain(In);
-                if self.f().bytecode.strict {
-                    self.if_true(store);
-                    self.flag(ThrowError, name.name, 2);
-                } else {
+            Reference::Dynamic(_, with) => {
+                if !self.f().bytecode.strict {
+                    let store = self.label();
+                    self.get(with);
+                    self.if_false(store);
+                    self.plain(Dup3);
                     self.plain(Drop);
+                    self.plain(Swap);
+                    self.plain(In);
+                    self.plain(Drop);
+                    self.mark(store);
                 }
-                self.mark(store);
                 self.plain(PutRefValue);
             }
             Reference::Field(name) => self.named(PutField, name),
@@ -1031,6 +1030,9 @@ impl Emitter<'_> {
             self.plain(Yield);
             let done = self.label();
             self.if_false(done);
+            if asynchronous {
+                self.await_value();
+            }
             self.return_value()?;
             self.mark(done);
             return Ok(());
@@ -1089,6 +1091,9 @@ impl Emitter<'_> {
         self.mark(no_return);
         for _ in 0..3 {
             self.plain(Nip);
+        }
+        if asynchronous {
+            self.await_value();
         }
         self.return_value()?;
         self.mark(throwing);

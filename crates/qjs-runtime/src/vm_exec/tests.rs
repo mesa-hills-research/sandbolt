@@ -77,6 +77,68 @@ fn handles_number_and_bigint_conversions() {
 }
 
 #[test]
+fn numeric_binary_operators_coerce_the_left_operand_first() {
+    assert_eq!(
+        run(r#"
+        let log = [];
+        function left() {
+            log.push('left');
+            return { valueOf() { log.push('left numeric'); return Symbol(); } };
+        }
+        function right() {
+            log.push('right');
+            return { valueOf() { log.push('right numeric'); throw new Error(); } };
+        }
+        try { left() & right(); } catch (e) { log.push(e.name); }
+        log.join(',')
+    "#),
+        "left,right,left numeric,TypeError"
+    );
+}
+
+#[test]
+fn computed_references_check_the_base_and_reuse_the_key() {
+    assert_eq!(
+        run(r#"
+        let log = [];
+        let key = { toString() { log.push('key'); return 'p'; } };
+        function property() { log.push('property'); return key; }
+        function rhs() { log.push('rhs'); return 4; }
+        try { null[property()]; } catch (e) { log.push(e.name); }
+        try { null[property()] *= rhs(); } catch (e) { log.push(e.name); }
+        let obj = { p: 2 };
+        obj[property()] *= rhs();
+        log.push(obj[property()]++);
+        log.push(obj.p);
+        log.join(',')
+    "#),
+        "property,TypeError,property,TypeError,property,key,rhs,property,key,8,9"
+    );
+}
+
+#[test]
+fn strict_assignment_rechecks_the_resolved_object_binding() {
+    assert_eq!(
+        run(r#"
+        Object.defineProperty(globalThis, 'x', { value: 1, configurable: true });
+        Object.defineProperty(globalThis, 'y', {
+            configurable: true,
+            get() { delete globalThis.y; return 1; }
+        });
+        (function () {
+            'use strict';
+            let log = [];
+            try { x = (delete globalThis.x, 2); } catch (e) { log.push(e.name); }
+            try { ++y; } catch (e) { log.push(e.name); }
+            log.push('x' in globalThis, 'y' in globalThis);
+            return log.join(',');
+        })()
+    "#),
+        "ReferenceError,ReferenceError,false,false"
+    );
+}
+
+#[test]
 fn applies_and_constructs_proxies() {
     assert_eq!(
         run(
@@ -225,6 +287,70 @@ fn generator_captures_live_locals_across_suspension() {
         [first, second, third, last.value, last.done, f()].join(',')
     "#),
         "3,13,3,99,true,4"
+    );
+}
+
+#[test]
+fn initial_yield_requires_a_generator_frame() {
+    let image = ProgramImage {
+        functions: vec![FunctionBytecode {
+            code: vec![Opcode::InitialYield as u8, Opcode::ReturnUndef as u8],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    assert!(matches!(
+        engine.execute_image(&image, None),
+        Err(EngineError::Thrown { message, .. }) if message.contains("function cannot suspend")
+    ));
+}
+
+#[test]
+fn generators_read_the_prototype_after_parameter_initialization() {
+    assert_eq!(
+        run(r#"
+        let log = [];
+        function* g(a = (log.push('parameter'), g.prototype = null)) {
+            log.push('body');
+        }
+        async function* ag(a = (log.push('async parameter'), ag.prototype = null)) {}
+        let proto = g.prototype;
+        let asyncProto = ag.prototype;
+        let it = g();
+        let asyncIt = ag();
+        log.push(Object.getPrototypeOf(it) === proto);
+        log.push(Object.getPrototypeOf(asyncIt) === asyncProto);
+        it.next();
+        log.join(',')
+    "#),
+        "parameter,async parameter,false,false,body"
+    );
+}
+
+#[test]
+fn async_generator_bare_return_does_not_await() {
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let opts = EvalOptions::default();
+    engine
+        .eval(
+            r#"
+        var log = [];
+        async function* fallthrough() {}
+        async function* bareReturn() { return; }
+        async function* valueReturn() { return undefined; }
+        Promise.resolve().then(() => log.push('tick 1')).then(() => log.push('tick 2'));
+        fallthrough().next().then(() => log.push('fallthrough'));
+        bareReturn().next().then(() => log.push('bare'));
+        valueReturn().next().then(() => log.push('value'));
+    "#,
+            opts.clone(),
+        )
+        .unwrap();
+    engine.run_jobs().unwrap();
+    assert_eq!(
+        engine.eval_to_string("log.join(',')", opts).unwrap(),
+        "tick 1,fallthrough,bare,tick 2,value"
     );
 }
 
