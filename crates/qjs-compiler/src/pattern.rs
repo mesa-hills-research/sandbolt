@@ -46,6 +46,31 @@ impl Emitter<'_> {
         })
     }
 
+    pub(crate) fn parameter_expressions(&mut self, id: PatternId) -> Result<bool> {
+        self.descent(|e| match &e.ast().pattern(id).kind {
+            Pattern::Default { .. } => Ok(true),
+            Pattern::Rest(id) => e.parameter_expressions(*id),
+            Pattern::Object { properties, rest } => {
+                for p in properties {
+                    if matches!(p.key, Name::Computed(_)) || e.parameter_expressions(p.target)? {
+                        return Ok(true);
+                    }
+                }
+                rest.map(|id| e.parameter_expressions(id))
+                    .unwrap_or(Ok(false))
+            }
+            Pattern::Array { items, rest } => {
+                for &id in items.iter().flatten().chain(rest.iter()) {
+                    if e.parameter_expressions(id)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            _ => Ok(false),
+        })
+    }
+
     pub(crate) fn pattern_atom(&mut self, id: PatternId) -> Result<Option<UnitAtom>> {
         match &self.ast().pattern(id).kind {
             Pattern::Identifier(ident) => self.atom(&ident.name).map(Some),
@@ -97,7 +122,7 @@ impl Emitter<'_> {
                     break;
                 }
                 Pattern::Reference(id) => {
-                    reference = Some(self.reference(*id, true)?);
+                    reference = Some(self.reference(*id)?);
                     break;
                 }
                 Pattern::Rest(id) => pattern = *id,
@@ -141,7 +166,7 @@ impl Emitter<'_> {
                 }
                 self.get(value);
             }
-            self.store_reference(reference, init, false, true);
+            self.store_reference(reference, init, false);
         } else {
             self.bind_value(target.pattern, init)?;
         }

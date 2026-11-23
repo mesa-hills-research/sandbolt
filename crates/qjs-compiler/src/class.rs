@@ -88,7 +88,7 @@ impl Emitter<'_> {
             let member = match method_kind {
                 None => PrivateMember::Field,
                 Some(MethodKind::Getter | MethodKind::Setter) => {
-                    let setter = self.atom(&format!("{}<set>", id.name))?;
+                    let setter = self.atom(&format!("<private-setter:{}>", id.name))?;
                     self.private_symbol(setter, scope)?;
                     PrivateMember::Accessor { setter }
                 }
@@ -218,24 +218,34 @@ impl Emitter<'_> {
                 ClassElement::StaticBlock(body) => static_init.push(Init::StaticBlock(body)),
             }
         }
-        for (&(owner, key), &member) in &self.f().private_members {
-            if owner != scope {
-                continue;
-            }
-            if let PrivateMember::Accessor { setter } = member {
-                for plan in [&mut instance_private, &mut static_private] {
-                    let has_getter = plan
-                        .iter()
-                        .any(|op| matches!(op, Init::PrivateMethod(symbol, _) if *symbol == key));
-                    let has_setter = plan.iter().any(
-                        |op| matches!(op, Init::PrivateMethod(symbol, _) if *symbol == setter),
-                    );
-                    if has_getter && !has_setter {
-                        plan.push(Init::Field(FieldKey::Private(setter), None));
-                    }
-                    if has_setter && !has_getter {
-                        plan.push(Init::Field(FieldKey::Private(key), None));
-                    }
+        let mut accessors: Vec<_> = self
+            .f()
+            .private_members
+            .iter()
+            .filter_map(|(&(owner, key), member)| {
+                if owner == scope
+                    && let PrivateMember::Accessor { setter } = member
+                {
+                    Some((key, *setter))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        accessors.sort_unstable_by_key(|&(name, _)| name.raw());
+        for (key, setter) in accessors {
+            for plan in [&mut instance_private, &mut static_private] {
+                let has_getter = plan
+                    .iter()
+                    .any(|op| matches!(op, Init::PrivateMethod(symbol, _) if *symbol == key));
+                let has_setter = plan
+                    .iter()
+                    .any(|op| matches!(op, Init::PrivateMethod(symbol, _) if *symbol == setter));
+                if has_getter && !has_setter {
+                    plan.push(Init::Field(FieldKey::Private(setter), None));
+                }
+                if has_setter && !has_getter {
+                    plan.push(Init::Field(FieldKey::Private(key), None));
                 }
             }
         }

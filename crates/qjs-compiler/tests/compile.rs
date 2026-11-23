@@ -30,23 +30,36 @@ fn has_op(insns: &[Instruction], expected: Opcode) -> bool {
 
 #[test]
 fn computed_reference_order() {
-    for (js, before_value, after_value) in [
-        ("obj[key()] = rhs()", Opcode::ToPropkey, Opcode::PutArrayEl),
-        ("obj[key()] += rhs()", Opcode::ToPropkey, Opcode::PutArrayEl),
+    for (js, before_value, after_value, conversions) in [
+        (
+            "obj[key()] = rhs()",
+            Opcode::CallMethod,
+            Opcode::PutArrayEl,
+            0,
+        ),
+        (
+            "obj[key()] += rhs()",
+            Opcode::GetArrayEl,
+            Opcode::PutArrayEl,
+            0,
+        ),
         (
             "({ [sourceKey()]: obj[targetKey()] = rhs() } = source)",
             Opcode::GetArrayEl,
             Opcode::PutArrayEl,
+            1,
         ),
         (
             "[obj[targetKey()] = rhs()] = source",
             Opcode::ForOfNext,
             Opcode::PutArrayEl,
+            0,
         ),
         (
             "({ [key()]: rhs() })",
             Opcode::ToPropkey,
             Opcode::DefineArrayEl,
+            1,
         ),
     ] {
         let image = script(js);
@@ -60,10 +73,127 @@ fn computed_reference_order() {
             .unwrap();
         assert!(has_op(&insns[..rhs], before_value), "{js}");
         assert!(has_op(&insns[rhs + 1..], after_value), "{js}");
-        if js.contains("targetKey") {
-            assert!(has_op(&insns[rhs + 1..], Opcode::ToPropkey), "{js}");
-        }
+        assert_eq!(
+            insns
+                .iter()
+                .filter(|i| i.opcode == Opcode::ToPropkey)
+                .count(),
+            conversions,
+            "{js}"
+        );
     }
+}
+
+#[test]
+fn super_reference_reads_the_base_after_evaluating_the_key() {
+    let image = script(
+        "class Child extends Parent { m() { super[key()] = rhs(); delete super[other()]; } }",
+    );
+    let method = instructions(&image, 2);
+    let events: Vec<_> = method
+        .iter()
+        .map(|i| i.opcode)
+        .filter(|op| {
+            matches!(
+                op,
+                Opcode::CallMethod
+                    | Opcode::GetSuper
+                    | Opcode::PutSuperValue
+                    | Opcode::ToPropkey
+                    | Opcode::ThrowError
+            )
+        })
+        .collect();
+    assert_eq!(
+        events,
+        [
+            Opcode::CallMethod,
+            Opcode::GetSuper,
+            Opcode::CallMethod,
+            Opcode::PutSuperValue,
+            Opcode::CallMethod,
+            Opcode::GetSuper,
+            Opcode::ThrowError
+        ]
+    );
+}
+
+#[test]
+fn literal_holes_and_prototype_setters() {
+    let image = script("[,,]; ({__proto__: function(){}, ['__proto__']: 1});");
+    let entry = instructions(&image, 0);
+    assert!(entry.iter().any(|i| matches!(i, Instruction { opcode: Opcode::PutField, operands: Operands::Atom(a) } if *a == qjs_bytecode::BuiltinAtom::Length.id())));
+    assert!(has_op(&entry, Opcode::SetProto));
+    assert!(has_op(&entry, Opcode::DefineArrayEl));
+    assert_eq!(
+        image.functions[1].name,
+        qjs_bytecode::BuiltinAtom::EmptyString.id()
+    );
+}
+
+#[test]
+fn class_private_initializer_order_is_stable() {
+    let js = "class C { get #x() {} get #y() {} get #z() {} }";
+    let expected = script(js);
+    for _ in 0..8 {
+        assert!(
+            script(js) == expected,
+            "Class bytes changed between compilations"
+        );
+    }
+}
+
+#[test]
+fn constructor_fields_run_before_parameter_defaults() {
+    let image = script("class C { field = markField(); constructor(a = markParameter()) {} }");
+    let constructor = instructions(&image, 1);
+    let calls: Vec<_> = constructor
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.opcode == Opcode::CallMethod)
+        .map(|(pc, _)| pc)
+        .collect();
+    let default_branch = constructor
+        .iter()
+        .position(|i| i.opcode == Opcode::IsUndefined)
+        .unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[0] < default_branch && default_branch < calls[1]);
+}
+
+#[test]
+fn body_var_starts_with_the_matching_parameter_value() {
+    let image = script("function f(x = 3) { var x; return x; }");
+    let function = &image.functions[1];
+    let arg_name = function.vars.iter().find(|var| matches!(image.atom(var.name), Some(qjs_bytecode::AtomName::Dynamic(qjs_bytecode::ConstString::Latin1(s))) if s == b"x")).unwrap().name;
+    let locals: Vec<_> = function
+        .vars
+        .iter()
+        .skip(usize::from(function.arg_count))
+        .enumerate()
+        .filter(|(_, var)| var.name == arg_name)
+        .map(|(i, _)| i as u16)
+        .collect();
+    let [parameter, body] = locals.as_slice() else {
+        panic!("Expected one parameter and one body variable")
+    };
+    let insns = instructions(&image, 1);
+    assert!(
+        insns
+            .windows(2)
+            .any(|ops| ops[0].opcode == Opcode::GetLocCheck
+                && ops[0].operands == Operands::Local(*parameter)
+                && ops[1].opcode.info().name.starts_with("put_loc")
+                && ops[1].operands == Operands::Local(*body))
+    );
+}
+
+#[test]
+fn private_names_do_not_probe_with_environments() {
+    let image = script("with (proxy) { class C { #x; [#x in {}](){} } }");
+    let entry = instructions(&image, 0);
+    assert!(has_op(&entry, Opcode::PrivateIn));
+    assert!(!has_op(&entry, Opcode::WithGetVar));
 }
 
 #[test]

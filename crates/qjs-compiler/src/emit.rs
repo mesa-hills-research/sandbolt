@@ -568,6 +568,32 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    fn copy_parameter_bindings(&mut self, parameters: u16, body: u16) {
+        let f = self.f();
+        let param_names = &f.scopes[usize::from(parameters)].names;
+        let mut copies: Vec<_> = f.scopes[usize::from(body)]
+            .names
+            .iter()
+            .filter_map(|(&name, &slot)| {
+                if let Slot::Local(slot) = slot
+                    && f.local(slot).kind == VarKind::Var
+                    && param_names.contains_key(&name)
+                {
+                    return Some((name, slot));
+                }
+                None
+            })
+            .collect();
+        copies.sort_unstable_by_key(|&(_, slot)| slot);
+        for (name, slot) in copies {
+            self.ir(IrOp::ScopeGetVar(ScopedName {
+                name,
+                scope: parameters,
+            }));
+            self.put(slot);
+        }
+    }
+
     pub(crate) fn function(
         &mut self,
         function: &Function,
@@ -636,8 +662,18 @@ impl<'a> Emitter<'a> {
         if !function.is_arrow {
             self.function_environment(method, ctor == Some(true), self_name)?;
         }
+        if ctor == Some(false) {
+            self.initialize_instance_fields()?;
+        }
+        let mut parameter_expressions = false;
+        for &id in &function.params {
+            if self.parameter_expressions(id)? {
+                parameter_expressions = true;
+                break;
+            }
+        }
         let params = self.start_scope(Some(0))?;
-        self.fm().scopes[usize::from(params)].parameter_end = !simple;
+        self.fm().scopes[usize::from(params)].parameter_end = parameter_expressions;
         for (i, &p) in function.params.iter().enumerate() {
             if let Pattern::Identifier(name) = &self.ast().pattern(p).kind {
                 let atom = self.atom(&name.name)?;
@@ -681,18 +717,22 @@ impl<'a> Emitter<'a> {
                 self.bind_value(p, true)?;
             }
         }
-        if ctor == Some(false) {
-            self.initialize_instance_fields()?;
-        }
         if matches!(kind, FunctionKind::Generator | FunctionKind::AsyncGenerator) {
             self.plain(Opcode::InitialYield);
         }
         let body_scope = self.start_scope(Some(params))?;
-        self.fm().vars_scope = if simple { params } else { body_scope };
+        self.fm().vars_scope = if parameter_expressions {
+            body_scope
+        } else {
+            params
+        };
         match &function.body {
             FunctionBody::Block(body) => {
                 self.predeclare_vars(body, self.f().vars_scope)?;
                 self.predeclare_block(body, true)?;
+                if parameter_expressions {
+                    self.copy_parameter_bindings(params, body_scope);
+                }
                 self.scoped_body(body, true)?;
                 self.plain(Opcode::Undefined);
             }

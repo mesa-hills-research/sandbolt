@@ -238,8 +238,17 @@ impl Emitter<'_> {
 
     fn name_op(&mut self, name: ScopedName, action: Access, out: &mut Vec<IrOp>) -> Result {
         use Opcode::*;
-        let internal = name.name.builtin().is_some_and(|a| a.as_str().starts_with('<'))
-            || name.name.dynamic_index().is_some_and(|i| matches!(&self.atoms[i as usize], ConstString::Latin1(bytes) if bytes.first() == Some(&b'<')));
+        let internal = name
+            .name
+            .builtin()
+            .is_some_and(|a| a.as_str().starts_with(['<', '#']))
+            || name
+                .name
+                .dynamic_index()
+                .is_some_and(|i| match &self.atoms[i as usize] {
+                    ConstString::Latin1(bytes) => matches!(bytes.first(), Some(b'<' | b'#')),
+                    ConstString::Utf16(units) => matches!(units.first(), Some(60 | 35)),
+                });
         let dynamic = !matches!(action, Access::Init) && !internal;
         let (slot, with) = self.lookup(name, dynamic)?;
         let done = (!with.is_empty()).then(|| self.label());

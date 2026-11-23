@@ -315,8 +315,8 @@ impl Emitter<'_> {
             match prop {
                 Property::Value { key, value } => {
                     let key = self.property_key(key)?;
-                    if key == Some(BuiltinAtom::Proto.id()) {
-                        self.expression_named(*value, key)?;
+                    if self.options.annex_b && key == Some(BuiltinAtom::Proto.id()) {
+                        self.expression(*value)?;
                         self.plain(SetProto);
                     } else if let Some(key) = key {
                         self.expression_named(*value, Some(key))?;
@@ -389,7 +389,8 @@ impl Emitter<'_> {
             }
         }
         if holes && trailing_hole {
-            self.named(DefineField, BuiltinAtom::Length.id());
+            self.plain(Dup1);
+            self.named(PutField, BuiltinAtom::Length.id());
         } else {
             self.plain(Drop);
         }
@@ -533,6 +534,7 @@ impl Emitter<'_> {
                 optional,
             } => {
                 if self.is_super(*object) {
+                    self.super_base(key)?;
                     self.flag(ThrowError, BuiltinAtom::Super.id(), 3);
                     return Ok(());
                 }
@@ -540,7 +542,7 @@ impl Emitter<'_> {
                 if *optional && let Some(short) = chain {
                     self.null_guard(short, false);
                 }
-                if let Some(atom) = self.property_key(key)? {
+                if let Some(atom) = self.member_key(key)? {
                     self.named(PushAtomValue, atom);
                 }
                 self.plain(Delete);
@@ -621,7 +623,7 @@ impl Emitter<'_> {
                 let atom = self.private_atom(id)?;
                 self.read(atom);
                 self.get_private(self.private_member(atom));
-            } else if let Some(key) = self.property_key(key)? {
+            } else if let Some(key) = self.member_key(key)? {
                 self.named(GetField, key);
             } else {
                 self.plain(GetArrayEl);
@@ -630,13 +632,23 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    fn member_key(&mut self, key: &Name) -> Result<Option<UnitAtom>> {
+        if let Name::Computed(expression) = key {
+            self.expression(*expression)?;
+            Ok(None)
+        } else {
+            self.property_key(key)
+        }
+    }
+
     fn super_base(&mut self, key: &Name) -> Result {
         self.read_internal("<this>")?;
-        self.read_internal("<home_object>")?;
-        self.plain(Opcode::GetSuper);
-        if let Some(atom) = self.property_key(key)? {
+        if let Some(atom) = self.member_key(key)? {
             self.named(Opcode::PushAtomValue, atom);
         }
+        self.read_internal("<home_object>")?;
+        self.plain(Opcode::GetSuper);
+        self.plain(Opcode::Swap);
         Ok(())
     }
 
@@ -768,23 +780,13 @@ impl Emitter<'_> {
         Ok(Reference::Dynamic(binding, self.stash()?))
     }
 
-    pub(crate) fn reference(&mut self, id: ExprId, defer_key: bool) -> Result<Reference> {
+    pub(crate) fn reference(&mut self, id: ExprId) -> Result<Reference> {
         use Opcode::*;
         let node = self.ast().expr(self.unparen(id));
         Ok(match &node.kind {
             Expr::Identifier(name) => return self.reference_name(name, false),
             Expr::Member { object, key, .. } if self.is_super(*object) => {
-                self.read_internal("<this>")?;
-                self.read_internal("<home_object>")?;
-                self.plain(GetSuper);
-                match key {
-                    Name::Computed(id) if defer_key => self.expression(*id)?,
-                    _ => {
-                        if let Some(name) = self.property_key(key)? {
-                            self.named(PushAtomValue, name);
-                        }
-                    }
-                }
+                self.super_base(key)?;
                 Reference::Super
             }
             Expr::Member { object, key, .. } => {
@@ -795,15 +797,8 @@ impl Emitter<'_> {
                         self.read(name);
                         Reference::Private(name, self.private_member(name))
                     }
-                    Name::Computed(id) => {
-                        self.expression(*id)?;
-                        if !defer_key {
-                            self.plain(ToPropkey);
-                        }
-                        Reference::Element
-                    }
                     _ => {
-                        if let Some(name) = self.property_key(key)? {
+                        if let Some(name) = self.member_key(key)? {
                             Reference::Field(name)
                         } else {
                             Reference::Element
@@ -872,19 +867,8 @@ impl Emitter<'_> {
         }
     }
 
-    pub(crate) fn store_reference(
-        &mut self,
-        r: Reference,
-        init: bool,
-        keep: bool,
-        defer_key: bool,
-    ) {
+    pub(crate) fn store_reference(&mut self, r: Reference, init: bool, keep: bool) {
         use Opcode::*;
-        if defer_key && matches!(r, Reference::Element | Reference::Super) {
-            self.plain(Swap);
-            self.plain(ToPropkey);
-            self.plain(Swap);
-        }
         if keep {
             self.plain(match r.width() {
                 0 => Dup,
@@ -950,7 +934,7 @@ impl Emitter<'_> {
         let pattern = &self.ast().pattern(target).kind;
         let (r, name) = match pattern {
             Pattern::Identifier(i) => (self.reference_name(i, false)?, Some(self.atom(&i.name)?)),
-            Pattern::Reference(id) => (self.reference(*id, false)?, None),
+            Pattern::Reference(id) => (self.reference(*id)?, None),
             _ => {
                 self.expression(expr)?;
                 self.plain(Opcode::Dup);
@@ -961,7 +945,7 @@ impl Emitter<'_> {
         match op {
             Assign => {
                 self.expression_named(expr, name)?;
-                self.store_reference(r, false, true, false);
+                self.store_reference(r, false, true);
             }
             And | Or | Nullish => {
                 self.load_reference(r);
@@ -978,7 +962,7 @@ impl Emitter<'_> {
                 }
                 self.plain(Opcode::Drop);
                 self.expression_named(expr, name)?;
-                self.store_reference(r, false, true, false);
+                self.store_reference(r, false, true);
                 self.jump(done);
                 self.mark(short);
                 for _ in 0..r.width() {
@@ -1005,7 +989,7 @@ impl Emitter<'_> {
                     _ => unreachable!(),
                 };
                 self.plain(binary(op));
-                self.store_reference(r, false, true, false);
+                self.store_reference(r, false, true);
             }
         }
         Ok(())
@@ -1013,7 +997,7 @@ impl Emitter<'_> {
 
     fn update(&mut self, op: UpdateOp, id: ExprId, prefix: bool) -> Result {
         use Opcode::*;
-        let reference = self.reference(id, false)?;
+        let reference = self.reference(id)?;
         self.load_reference(reference);
         self.plain(match (prefix, op) {
             (true, UpdateOp::Inc) => Inc,
@@ -1022,11 +1006,11 @@ impl Emitter<'_> {
             (false, UpdateOp::Dec) => PostDec,
         });
         if prefix {
-            self.store_reference(reference, false, true, false);
+            self.store_reference(reference, false, true);
         } else {
             self.plain(Swap);
             let old = self.stash()?;
-            self.store_reference(reference, false, false, false);
+            self.store_reference(reference, false, false);
             self.get(old);
         }
         Ok(())
