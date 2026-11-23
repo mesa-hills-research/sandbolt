@@ -1014,6 +1014,75 @@ fn returned(ran: &Ran) -> String {
     }
 }
 
+#[cfg(feature = "gc_stress")]
+#[test]
+fn code_mode_survives_collection_across_host_turns() {
+    for fail in [false, true] {
+        let messages = Rc::new(RefCell::new(Vec::new()));
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        engine
+            .install_host_bridge(Box::new({
+                let messages = messages.clone();
+                move |text| {
+                    messages.borrow_mut().push(text.to_owned());
+                    String::new()
+                }
+            }))
+            .unwrap();
+        eval_strict(&mut engine, PRELUDE_FILE, PRELUDE).unwrap();
+        engine.call_global("__setup", r#"["timer"]"#).unwrap();
+        engine.collect_garbage();
+        eval_strict(
+            &mut engine,
+            CODE_FILE,
+            r#"__run(async () => {
+                if (['__host', '__setup', 'setTimeout', 'fetch', 'process'].some(k => k in globalThis)) {
+                    throw new Error('unexpected global');
+                }
+                const live = new Map([['answer', {value: 42}]]);
+                await new Promise(resolve => queueMicrotask(resolve));
+                const tick = await tools.timer({delay: 0});
+                console.log(tick);
+                return live.get('answer');
+            });"#,
+        )
+        .unwrap();
+        engine.run_jobs().unwrap();
+        assert_eq!(
+            messages.borrow().as_slice(),
+            [r#"{"t":"call","id":1,"tool":"timer","args":{"delay":0}}"#]
+        );
+
+        // The host advances its timer by delivering the reply on a later turn.
+        engine.collect_garbage();
+        let answer = if fail {
+            r#"{"id":1,"ok":false,"text":"timer failed","refused":true}"#
+        } else {
+            r#"{"id":1,"ok":true,"text":"tick","refused":false}"#
+        };
+        engine.call_global("__settle", answer).unwrap();
+        engine.collect_garbage();
+        engine.run_jobs().unwrap();
+        engine.collect_garbage();
+
+        if fail {
+            assert_eq!(
+                &messages.borrow()[1..],
+                [r#"{"t":"failed","refused":true,"tool":"timer"}"#]
+            );
+            assert!(matches!(
+                engine.call_global("__rethrow", ""),
+                Err(EngineError::Thrown { message, .. }) if message == "Error: timer failed"
+            ));
+        } else {
+            assert_eq!(
+                &messages.borrow()[1..],
+                [r#"{"t":"log","line":"tick"}"#, r#"{"t":"done","value":"{\"value\":42}","unread":[]}"#]
+            );
+        }
+    }
+}
+
 #[test]
 fn the_code_returns_a_value() {
     assert_eq!(returned(&run("return 6 * 7;")), "42");

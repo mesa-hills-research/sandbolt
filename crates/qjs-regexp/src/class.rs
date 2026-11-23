@@ -497,11 +497,13 @@ impl<'p> Compiler<'p, '_> {
             }
             b'&' | b'!' | b'#' | b'$' | b'%' | b'*' | b'+' | b',' | b'.' | b':' | b';' | b'<'
             | b'=' | b'>' | b'?' | b'@' | b'^' | b'`' | b'~'
-                if self.sets() && self.at(1) == c =>
+                if in_class && self.sets() && self.at(1) == c =>
             {
                 return Err(syntax("invalid class set operation in regular expression"));
             }
-            b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'/' | b'-' | b'|' if self.sets() => {
+            b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'/' | b'-' | b'|'
+                if in_class && self.sets() =>
+            {
                 return Err(syntax("invalid character in class in regular expression"));
             }
             _ => {}

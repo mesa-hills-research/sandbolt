@@ -814,7 +814,7 @@ fn module_graph_links_live_bindings_and_waits_for_cycle_roots() {
                     "import {f} from 'a'; globalThis.events.push(f()); await 1; globalThis.events.push('b')"
                 }
                 ("c", None) => "import 'b'; globalThis.events.push('c')",
-                ("data", Some("json")) => {
+                ("data" | "./data", None | Some("json")) => {
                     return Ok(ResolvedModule::Json {
                         name: "data".into(),
                         source: "{\"n\":42}".into(),
@@ -854,7 +854,15 @@ fn module_graph_links_live_bindings_and_waits_for_cycle_roots() {
             r#"
         import 'a'; import 'c';
         import data from 'data' with { type: 'json' };
+        import plain from 'data';
         import text from 'text' with { type: 'text' };
+        if (data === plain) throw new Error('different attributes shared one module');
+        if ((await import('./data', { with: { type: 'json' } })).default !== data) {
+            throw new Error('equal attributes loaded a second module');
+        }
+        if ((await import('./data', { with: {} })).default !== plain) {
+            throw new Error('empty attributes loaded a second module');
+        }
         import bytes from 'bytes' with { type: 'bytes' };
         events.push(data.n, text, bytes[0]);
         (await import('a')).f && events.push(import.meta.url);
@@ -896,6 +904,110 @@ fn direct_eval_shares_lexical_bindings_and_sloppy_variables() {
         f()
     "#),
         "42,undefined"
+    );
+}
+
+#[test]
+fn direct_eval_distinguishes_parameter_and_body_environments() {
+    assert_eq!(
+        run(r#"
+        function body(p = 3) { var p = 4; return eval('p'); }
+        function strictBody() {
+            'use strict';
+            return (function(p = 5) { var local = p + 1; return eval('local'); })();
+        }
+        function introduced(p = 3, read = () => p) {
+            return [eval('var p = 4; p'), p, read()].join(':');
+        }
+        function parameters(p = eval('var x = 7; x'), read = (a = eval('x')) => a) {
+            var x = 8;
+            return [p, eval('x'), read()].join(':');
+        }
+        let outer = 'outside';
+        function afterDefault(p = outer, read = () => outer) {
+            eval('var outer = 9');
+            return [outer, p, read()].join(':');
+        }
+        function readDefault(value = eval('typeof onlyInBody')) { var onlyInBody; return value; }
+        function destructured([value]) { eval('var value = 2'); return value; }
+        const named = function self(self) { eval('var self = 6'); return [self, arguments[0]].join(':'); };
+        [body(), strictBody(), introduced(), parameters(), afterDefault(), readDefault(),
+         destructured([1]), named(5)].join(',')
+        "#),
+        "4,6,4:4:3,7:8:7,9:outside:outside,undefined,2,6:6"
+    );
+}
+
+#[test]
+fn direct_eval_checks_redeclarations_only_through_its_variable_environment() {
+    assert_eq!(
+        run(r#"
+        function attempt(callback) {
+            try { return callback(); }
+            catch (error) { return error.name; }
+        }
+        function outer() {
+            let x = 1;
+            const y = 3;
+            return (() => { eval('var x = 2, y = 4'); return [x, y].join(':'); })();
+        }
+        function arrowInBlock() {
+            { const value = 1; return (() => { eval('var value = 2'); return value; })(); }
+        }
+        function localLet() { { let x = 1; return eval('var x = 2'); } }
+        function localConst() { const x = 1; return eval('var x = 2'); }
+        function nestedLocal() { return eval('let x = 1; eval("var x = 2")'); }
+        function nestedVar() { return eval('eval("var x = 2"); x'); }
+        function nestedFunction() {
+            return eval('let x = 1; (() => { eval("var x = 2"); return x; })()');
+        }
+        function strictEval() {
+            let x = 1;
+            return [eval('"use strict"; var x = 2; x'), x, typeof local,
+                    eval('"use strict"; var local = 3; eval("local")')].join(':');
+        }
+        let globalBlock;
+        { const x = 1; try { eval('var x = 2'); } catch (error) { globalBlock = error.name; } }
+        [outer(), arrowInBlock(), attempt(localLet), attempt(localConst), attempt(nestedLocal),
+         nestedVar(), nestedFunction(), strictEval(), globalBlock].join(',')
+        "#),
+        "2:4,2,SyntaxError,SyntaxError,SyntaxError,2,2,2:1:undefined:3,SyntaxError"
+    );
+}
+
+#[test]
+fn direct_eval_respects_catch_and_with_scopes() {
+    assert_eq!(
+        run(r#"
+        function inCatch() {
+            try { throw 1; }
+            catch (x) {
+                eval('var x = 2');
+                eval('function x() { return 3; }');
+                return [x, eval('x')].join(':');
+            }
+        }
+        function inDestructuredCatch() {
+            try { throw [1]; }
+            catch ([x]) {
+                try { eval('var x = 2'); }
+                catch (error) { return error.name; }
+            }
+        }
+        function withObject() {
+            var x = 1;
+            const object = { x: 2, y: 3, [Symbol.unscopables]: { y: true } };
+            const y = 4;
+            let read;
+            with (object) {
+                eval('var x = 5');
+                read = (() => [eval('x'), eval('y')].join(':'))();
+            }
+            return [x, object.x, read].join(':');
+        }
+        [inCatch(), inDestructuredCatch(), withObject()].join(',')
+        "#),
+        "2:2,SyntaxError,1:5:5:4"
     );
 }
 

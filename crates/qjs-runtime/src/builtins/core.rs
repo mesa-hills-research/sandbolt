@@ -11,6 +11,7 @@ mod errors;
 mod function;
 pub(crate) use function::THROW_TYPE_ERROR;
 mod object;
+pub use object::object_to_string;
 mod proxy;
 mod reflect;
 #[cfg(test)]

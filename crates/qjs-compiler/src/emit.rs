@@ -683,17 +683,25 @@ impl<'a> Emitter<'a> {
         let params = self.start_scope(Some(0))?;
         self.fm().scopes[usize::from(params)].parameter_end = parameter_expressions;
         for (i, &p) in function.params.iter().enumerate() {
-            if let Pattern::Identifier(name) = &self.ast().pattern(p).kind {
+            if simple && let Pattern::Identifier(name) = &self.ast().pattern(p).kind {
                 let atom = self.atom(&name.name)?;
-                self.fm().bytecode.vars[i].name = atom;
-                if simple {
-                    self.fm().scopes[usize::from(params)]
-                        .names
-                        .insert(atom, Slot::Arg(i as u16));
-                    continue;
-                }
+                let arg = &mut self.fm().bytecode.vars[i];
+                arg.name = atom;
+                arg.scope_level = params;
+                self.fm().scopes[usize::from(params)]
+                    .names
+                    .insert(atom, Slot::Arg(i as u16));
+                continue;
             }
             self.bind_pattern(p, VarKind::Let, params)?;
+        }
+        if !simple && !parameter_expressions {
+            // These parameters need TDZ checks during initialization but share the var scope.
+            let f = self.fm();
+            for &slot in &f.scopes[usize::from(params)].lexical {
+                f.bytecode.vars[usize::from(f.bytecode.arg_count) + usize::from(slot)].kind =
+                    VarKind::Var;
+            }
         }
         if !function.is_arrow
             && !self
@@ -709,6 +717,16 @@ impl<'a> Emitter<'a> {
                 Operands::Unsigned(u32::from(mapped)),
                 false,
             )?;
+            if parameter_expressions
+                && let Some(&Slot::Local(slot)) =
+                    self.f().scope().names.get(&BuiltinAtom::ArgumentsName.id())
+            {
+                // Direct eval in parameter initializers cannot redeclare this binding.
+                let arguments = &mut self.fm().bytecode.vars[usize::from(argc) + usize::from(slot)];
+                arguments.kind = VarKind::Let;
+                arguments.lexical_tdz = true;
+                self.fm().scopes[usize::from(params)].lexical.push(slot);
+            }
             if mapped {
                 for index in 0..argc {
                     self.capture_frame_slot(child, Slot::Arg(index))?;

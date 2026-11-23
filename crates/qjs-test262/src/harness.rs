@@ -4,11 +4,12 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use qjs_runtime::api::JsEngine;
+use qjs_runtime::builtins::core::object_to_string;
 use qjs_runtime::builtins::make_native_fn;
 use qjs_runtime::ops::convert::{to_string, to_uint32};
 use qjs_runtime::ops::property::{PropertyDescriptor, define_own_property};
 use qjs_runtime::realm::NativeFn;
-use qjs_runtime::{Args, ExecCtx, Handle, JsResult, NativeFnId, Value, ValueKind};
+use qjs_runtime::{Abrupt, Args, ExecCtx, Handle, JsResult, NativeFnId, Value, ValueKind};
 
 #[cfg(feature = "integrated-runtime")]
 mod agents;
@@ -64,6 +65,7 @@ impl Budget {
 struct Host {
     budget: Budget,
     capture: bool,
+    local: bool,
     printed: RefCell<Printed>,
     #[cfg(feature = "integrated-runtime")]
     agents: agents::Group,
@@ -80,10 +82,11 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    pub(crate) fn new(budget: Budget, capture: bool) -> Self {
+    pub(crate) fn new(budget: Budget, capture: bool, local: bool) -> Self {
         Self::enter(Host {
             budget,
             capture,
+            local,
             printed: RefCell::default(),
             #[cfg(feature = "integrated-runtime")]
             agents: agents::Group::main(),
@@ -305,7 +308,29 @@ fn print<'s>(ctx: &mut ExecCtx<'_, 's>, _: Handle<'s>, args: Args<'s>) -> JsResu
     let host = current();
     let mut values = Vec::with_capacity(args.len());
     for index in 0..args.len() {
-        values.push(string_arg(ctx, args.get(index).unwrap())?);
+        let value = args.get(index).unwrap();
+        let text = match string_arg(ctx, value) {
+            Err(Abrupt::Thrown) if host.local && !ctx.is_oom() => {
+                ctx.take_exception();
+                if ctx.get(value).as_object().is_some() {
+                    match object_to_string(ctx, value) {
+                        Ok(tag) => {
+                            let tag = ctx.root(tag)?;
+                            string_arg(ctx, tag)?
+                        }
+                        Err(Abrupt::Thrown) if !ctx.is_oom() => {
+                            ctx.take_exception();
+                            "<exception>".into()
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    "<exception>".into()
+                }
+            }
+            result => result?,
+        };
+        values.push(text);
     }
     host.printed.borrow_mut().observe(values, host.capture);
     Ok(Value::UNDEFINED)
@@ -426,7 +451,7 @@ mod tests {
     #[test]
     fn installs_global_and_captures_async_prints() {
         let mut engine = JsEngine::new(Default::default()).unwrap();
-        let session = Session::new(Budget::new(Duration::from_secs(1)), true);
+        let session = Session::new(Budget::new(Duration::from_secs(1)), true, false);
         session.install(&mut engine).unwrap();
         let realm = engine.default_realm();
         engine.runtime_mut().with_scope(realm, |ctx| {
@@ -467,11 +492,36 @@ mod tests {
     }
 
     #[test]
+    fn local_print_falls_back_to_intrinsic_object_tags() {
+        let mut engine = JsEngine::new(Default::default()).unwrap();
+        let session = Session::new(Budget::new(Duration::from_secs(1)), true, true);
+        session.install(&mut engine).unwrap();
+        engine
+            .eval(
+                r#"
+                const tagged = Object.create(null);
+                tagged[Symbol.toStringTag] = 'Custom';
+                const exotic = Proxy.revocable({}, {});
+                exotic.revoke();
+                print(Object.create(null), tagged, Symbol('x'), exotic.proxy, 42);
+                print('Test262:AsyncTestComplete');
+                "#,
+                Default::default(),
+            )
+            .unwrap();
+        assert_eq!(session.async_result(), Ok(()));
+        assert_eq!(
+            session.output(),
+            ["[object Object] [object Custom] <exception> <exception> 42", COMPLETE]
+        );
+    }
+
+    #[test]
     fn host_interrupts_and_range() {
         let mut engine = JsEngine::new(Default::default()).unwrap();
         let budget = Budget::new(Duration::from_secs(1));
         let countdown = Rc::new(Countdown::default());
-        let session = Session::new(budget.clone(), false);
+        let session = Session::new(budget.clone(), false, false);
         session.install(&mut engine).unwrap();
         interrupt(&mut engine, budget, countdown.clone());
         let realm = engine.default_realm();
@@ -508,7 +558,7 @@ mod tests {
     fn run_script(source: &str) {
         let mut engine = JsEngine::new(Default::default()).unwrap();
         let budget = Budget::new(Duration::from_secs(5));
-        let session = Session::new(budget.clone(), true);
+        let session = Session::new(budget.clone(), true, false);
         session.install(&mut engine).unwrap();
         interrupt(&mut engine, budget, Rc::default());
         engine.eval(source, Default::default()).unwrap();

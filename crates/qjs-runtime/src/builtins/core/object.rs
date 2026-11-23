@@ -308,7 +308,8 @@ fn lookup_accessor<'s>(
     }
 }
 
-fn object_to_string<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>) -> JsResult<Value> {
+/// Apply the intrinsic `Object.prototype.toString` without looking up the method.
+pub fn object_to_string<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>) -> JsResult<Value> {
     match ctx.get(this) {
         Value::UNDEFINED => return ctx.new_string("[object Undefined]").map(|s| ctx.get(s)),
         Value::NULL => return ctx.new_string("[object Null]").map(|s| ctx.get(s)),

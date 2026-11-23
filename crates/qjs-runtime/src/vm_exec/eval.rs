@@ -10,7 +10,7 @@ use crate::ops::{call, convert, property};
 use crate::root::{Args, ExecCtx, Handle};
 use crate::symbol::WellKnown;
 use crate::value::*;
-use crate::vm::{CallFrame, EvalBinding, EvalEnvironment};
+use crate::vm::{CallFrame, EvalBinding, EvalDeclarations, EvalEnvironment};
 
 use super::{bindings, compiled, key, load, well_known};
 
@@ -129,7 +129,7 @@ pub(super) fn execute(
         let eval = ctx.allocate(|rt| {
             Ok(EvalEnvironment {
                 bindings: TrackedVec::from_slice(&rt.heap.ledger, &environment.bindings)?,
-                declarations: environment.declarations,
+                declarations: if entry { environment.declarations } else { None },
                 special: entry.then_some(specials),
             })
         })?;
@@ -172,7 +172,11 @@ fn environment(
     };
     let f = compiled(ctx, code);
     let args = f.arg_count as usize;
-    let locals = f.var_count as usize;
+    let mut arg_scope = f
+        .vars
+        .first()
+        .filter(|var| args != 0 && !var.name.is_none())
+        .map(|var| var.scope_level);
     let arg_base = frame.base as usize + 2;
     let var_base = arg_base + frame.arg_slots as usize;
     let mut next = match scope {
@@ -180,51 +184,22 @@ fn environment(
         u16::MAX => ScopeLink::ParameterEnd,
         n => ScopeLink::Local(n - 1),
     };
-    let mut variable_scope = None;
-    let mut parameter_scope = None;
     while let ScopeLink::Local(index) = next {
         let index = index as usize;
         let Some(var) = compiled(ctx, code).vars.get(args + index).cloned() else {
             break;
         };
         next = var.scope_next;
-        if matches!(
-            var.name.builtin(),
-            Some(BuiltinAtom::InternalVar | BuiltinAtom::InternalArgVar)
-        ) {
-            variable_scope.get_or_insert(var.name);
-        }
-        if next == ScopeLink::ParameterEnd {
-            parameter_scope = Some(var.scope_level);
+        if arg_scope.is_some_and(|scope| var.scope_level <= scope) {
+            add_arguments(ctx, &mut env, frame, code, arg_base, args)?;
+            arg_scope = None;
         }
         add_local(ctx, &mut env, frame, code, var_base + index, &var)?;
     }
-    let in_parameters =
-        next == ScopeLink::ParameterEnd && variable_scope != Some(BuiltinAtom::InternalVar.id());
-    if !in_parameters {
-        for index in (0..args).rev() {
-            if let Some(var) = compiled(ctx, code).vars.get(index).cloned() {
-                add_local(ctx, &mut env, frame, code, arg_base + index, &var)?;
-            }
-        }
+    if arg_scope.is_some() && next == ScopeLink::End {
+        add_arguments(ctx, &mut env, frame, code, arg_base, args)?;
     }
-    for index in 0..locals {
-        let Some(mut var) = compiled(ctx, code).vars.get(args + index).cloned() else {
-            continue;
-        };
-        if var.lexical_tdz || has_env_object(var.name) {
-            continue;
-        }
-        if in_parameters {
-            if var.scope_level > parameter_scope.unwrap_or(0) {
-                continue;
-            }
-            // Parameter eval may read the implicit arguments binding but cannot redeclare it.
-            var.lexical_tdz = var.name == BuiltinAtom::ArgumentsName.id()
-                && parameter_scope == Some(var.scope_level);
-        }
-        add_local(ctx, &mut env, frame, code, var_base + index, &var)?;
-    }
+    let local_end = env.bindings.len();
     for index in 0..compiled(ctx, code).closures.len() {
         let def = compiled(ctx, code).closures[index].clone();
         let value = bindings::captured(ctx, frame, index as u16);
@@ -241,13 +216,38 @@ fn environment(
     }
     if let Some(inherited) = compiled(ctx, code).eval.as_ref() {
         let len = inherited.bindings.len();
-        env.declarations = env.declarations.or(inherited.declarations);
+        if env.declarations.is_none() {
+            env.declarations = inherited.declarations.map(|target| EvalDeclarations {
+                end: env.bindings.len() + target.end,
+                object: target.object,
+            });
+        }
         for index in 0..len {
             let binding = compiled(ctx, code).eval.as_ref().unwrap().bindings[index];
             ctx.allocate(|rt| env.bindings.push(&rt.heap.ledger, binding))?;
         }
     }
+    env.declarations.get_or_insert(EvalDeclarations {
+        end: local_end,
+        object: None,
+    });
     Ok(env)
+}
+
+fn add_arguments(
+    ctx: &mut ExecCtx<'_, '_>,
+    env: &mut EvalEnvironment,
+    frame: CallFrame,
+    code: BcId,
+    arg_base: usize,
+    args: usize,
+) -> JsResult<()> {
+    // The last occurrence of a duplicate formal is the visible binding.
+    for index in (0..args).rev() {
+        let var = compiled(ctx, code).vars[index].clone();
+        add_local(ctx, env, frame, code, arg_base + index, &var)?;
+    }
+    Ok(())
 }
 
 fn has_env_object(name: UnitAtom) -> bool {
@@ -272,13 +272,25 @@ fn add_local(
     let ValueKind::VarRef(id) = value.decode() else {
         unreachable!()
     };
+    if env.declarations.is_none()
+        && matches!(
+            var.name.builtin(),
+            Some(BuiltinAtom::InternalVar | BuiltinAtom::InternalArgVar)
+        )
+        && let Some(object) = bindings::read_ref(ctx, id).as_object()
+    {
+        env.declarations = Some(EvalDeclarations {
+            end: env.bindings.len(),
+            object: Some(object),
+        });
+    }
     append(
         ctx,
         env,
         code,
         var.name,
         id,
-        (var.kind, var.lexical_tdz, !var.is_const),
+        (var.kind, var.lexical_tdz && var.kind != VarKind::Var, !var.is_const),
     )
 }
 
@@ -295,9 +307,6 @@ fn append(
         let Some(object) = bindings::read_ref(ctx, id).as_object() else {
             return Ok(());
         };
-        if !with && env.declarations.is_none() {
-            env.declarations = Some(object);
-        }
         EvalBinding::Object { id: object, with }
     } else {
         EvalBinding::Cell {
@@ -443,14 +452,16 @@ pub(super) fn declaration<'s>(
     let Some(target) = env.declarations else {
         return Ok(false);
     };
-    for binding in env.bindings.iter() {
+    for binding in &env.bindings[..target.end] {
         if let EvalBinding::Cell {
             name: key,
             id,
             lexical,
+            kind,
             ..
         } = *binding
             && key == name
+            && kind != VarKind::Catch
         {
             if lexical {
                 return Err(ctx.throw_error(ErrorKind::Syntax, "redeclaration of lexical binding"));
@@ -461,10 +472,13 @@ pub(super) fn declaration<'s>(
             return Ok(true);
         }
     }
+    let Some(object) = target.object else {
+        return Ok(false);
+    };
     if op == Opcode::CheckDefineVar {
         return Ok(true);
     }
-    let target = ctx.root(Value::object(target))?;
+    let target = ctx.root(Value::object(object))?;
     if let Some(function) = function {
         super::define_default(ctx, target, name, function)?;
     } else if !property::has_property(ctx, target, name)? {

@@ -164,6 +164,7 @@ pub(super) fn start<'s>(
     let (messages, receiver) = mpsc::channel();
     let budget = host.budget.clone();
     let capture = host.capture;
+    let local = host.local;
     let reports = main.reports.clone();
     let cancelled = main.cancelled.clone();
     let thread = thread::Builder::new()
@@ -172,6 +173,7 @@ pub(super) fn start<'s>(
             let worker = Host {
                 budget,
                 capture,
+                local,
                 printed: RefCell::default(),
                 agents: Group::Worker(Worker {
                     messages: receiver,

@@ -276,6 +276,25 @@ fn escapes_and_predefined_classes() {
 }
 
 #[test]
+fn unicode_sets_punctuators_are_reserved_only_inside_a_class() {
+    for pattern in ["/", "-", "a&&b", "==", "[a&&b]"] {
+        assert!(
+            compile(pattern.as_bytes(), F(F::UNICODE_SETS), &mut UnlimitedRegExpHost).is_ok(),
+            "{pattern}"
+        );
+    }
+    for pattern in ["[a&&]", "[&&]"] {
+        assert!(
+            matches!(
+                compile(pattern.as_bytes(), F(F::UNICODE_SETS), &mut UnlimitedRegExpHost),
+                Err(RegExpError::Syntax(_))
+            ),
+            "{pattern}"
+        );
+    }
+}
+
+#[test]
 fn diagnostics() {
     for (pattern, flags, error) in [
         ("(?", 0, "invalid group"),
@@ -310,9 +329,19 @@ fn diagnostics() {
         ("(?=a)?", F::UNICODE, "nothing to repeat"),
         ("\\", 0, "unexpected end"),
         (
-            "a&&b",
+            "[a==b]",
             F::UNICODE_SETS,
             "invalid class set operation in regular expression",
+        ),
+        (
+            "[a-]",
+            F::UNICODE_SETS,
+            "invalid character in class in regular expression",
+        ),
+        (
+            "[/]",
+            F::UNICODE_SETS,
+            "invalid character in class in regular expression",
         ),
         (r"\p", F::UNICODE, "expecting '{' after \\p"),
         (r"[\q]", F::UNICODE_SETS, "expecting '{' after \\q"),
