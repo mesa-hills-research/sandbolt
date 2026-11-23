@@ -131,6 +131,7 @@ object_data!(
     AsyncFunction(AsyncFunctionData),
     AsyncGenerator(AsyncGeneratorData),
     Iterator(IteratorData),
+    ForInIterator(ForInIteratorData),
     StringIterator(StringIteratorData),
     RegExpStringIterator(RegExpStringIteratorData),
     DisposableStack(DisposableStackData),
