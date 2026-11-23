@@ -393,7 +393,7 @@ pub(crate) fn drive(ctx: &mut ExecCtx<'_, '_>, depth: usize) -> JsResult<()> {
             Ok(ctx.runtime.vm.stack.last().copied())
         } else if let Some(code) = frame.code {
             if ctx.heap().bytecode.get(code).unwrap().compiled.is_some() {
-                exec::step(ctx, frame, index, code)
+                exec::run_frame(ctx, index, code)
             } else {
                 ctx.check_interrupt()
                     .and_then(|()| execute_mini(ctx, frame, index, code))
