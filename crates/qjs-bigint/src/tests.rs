@@ -43,6 +43,73 @@ fn normalized_limbs_and_wrapping() {
 }
 
 #[test]
+fn u32_magnitude_bridge_handles_sign_boundaries_and_charges() {
+    for (words, text) in [
+        (&[][..], "0"),
+        (&[0, 0][..], "0"),
+        (&[u32::MAX][..], "ffffffff"),
+        (&[0, 0x80000000][..], "8000000000000000"),
+        (&[1, 0x80000000][..], "8000000000000001"),
+        (&[u32::MAX, u32::MAX, 0][..], "ffffffffffffffff"),
+        (&[0, 0, 3][..], "30000000000000000"),
+    ] {
+        for negative in [false, true] {
+            let text = if negative {
+                format!("-{text}")
+            } else {
+                text.to_owned()
+            };
+            let mut host = TestHost::default();
+            let value = BigInt::from_sign_and_u32_limbs(negative, words, &mut host).unwrap();
+            assert_eq!(value, hex(&text));
+            assert_eq!(host.used, value.byte_size());
+            let len = words
+                .iter()
+                .rposition(|&word| word != 0)
+                .map_or(0, |i| i + 1);
+            assert!(value.magnitude_u32_limbs().eq(words[..len].iter().copied()));
+            for n in 1..=host.charges {
+                let mut failing = TestHost {
+                    fail_at: Some(n),
+                    ..TestHost::default()
+                };
+                assert_eq!(
+                    BigInt::from_sign_and_u32_limbs(negative, words, &mut failing),
+                    Err(BigIntError::OutOfMemory)
+                );
+                assert_eq!(failing.used, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn u32_magnitude_bridge_checks_size_and_interrupts_copying() {
+    let mut words = vec![0; MAX_BITS / u32::BITS as usize];
+    *words.last_mut().unwrap() = 1 << 31;
+    let mut host = TestHost::default();
+    let value = BigInt::from_sign_and_u32_limbs(true, &words, &mut host).unwrap();
+    assert_eq!(value.bit_len(), MAX_BITS);
+    assert!(value.magnitude_u32_limbs().eq(words.iter().copied()));
+    words.push(1);
+    assert_eq!(
+        BigInt::from_sign_and_u32_limbs(false, &words, &mut host),
+        Err(TOO_LARGE)
+    );
+    words.pop();
+    let mut host = TestHost {
+        interrupt_at: Some(2),
+        ..TestHost::default()
+    };
+    assert_eq!(
+        BigInt::from_sign_and_u32_limbs(false, &words, &mut host),
+        Err(BigIntError::Interrupted)
+    );
+    assert_eq!(host.used, 0);
+    assert!(host.peak > 0);
+}
+
+#[test]
 fn integer_comparisons_and_carries() {
     let host = &mut UnlimitedBigIntHost;
     let samples = [

@@ -2,7 +2,7 @@ use qjs_bigint::{BigInt, BigIntError, BigIntHost};
 use qjs_bytecode::Opcode;
 
 use crate::heap::{BigIntData, Heap};
-use crate::ledger::{AllocError, HeapLedger, TrackedVec};
+use crate::ledger::{AllocError, AllocResult, HeapLedger, TrackedVec};
 use crate::object::ErrorKind;
 use crate::ops::convert::{self, PreferredType};
 use crate::root::{ExecCtx, Handle};
@@ -89,60 +89,38 @@ fn with_host<R>(
 
 fn read(heap: &Heap, host: &mut Host<'_>, value: Value) -> Result<BigInt, BigIntError> {
     let data = match value.decode() {
-        ValueKind::ShortBigInt(n) => {
-            host.charge(size_of::<u64>())?;
-            return Ok(BigInt::from_i64(n));
-        }
+        ValueKind::ShortBigInt(n) => return BigInt::from_i64_charged(n, host),
         ValueKind::BigInt(id) => heap.bigints.get(id).unwrap(),
         _ => unreachable!(),
     };
-    let mut bytes = TrackedVec::new();
-    bytes
-        .try_reserve_exact(&heap.ledger, data.limbs.len() * 8 + 1)
-        .map_err(|e| host.map_alloc(e))?;
-    if data.negative {
-        bytes.push_reserved(b'-');
-    }
-    if data.limbs.is_empty() {
-        bytes.push_reserved(b'0');
-    }
-    for &word in data.limbs.iter().rev() {
-        for shift in (0..32).step_by(4).rev() {
-            bytes.push_reserved(b"0123456789abcdef"[((word >> shift) & 15) as usize]);
-        }
-    }
-    BigInt::parse_radix(std::str::from_utf8(&bytes).unwrap(), 16, host)
+    BigInt::from_sign_and_u32_limbs(data.negative, &data.limbs, host)
 }
 
-fn store(heap: &mut Heap, host: &mut Host<'_>, bigint: &BigInt) -> Result<Value, BigIntError> {
+pub(crate) fn store_bigint(heap: &mut Heap, bigint: &BigInt) -> AllocResult<Value> {
     if let Some(value) = bigint.to_i64_exact().and_then(Value::short_bigint) {
         return Ok(value);
     }
-    let negative = bigint.is_negative();
-    let mut carry = negative;
+    store_magnitude(heap, bigint.is_negative(), bigint.magnitude_u32_limbs())
+}
+
+fn store_magnitude(
+    heap: &mut Heap,
+    negative: bool,
+    words: impl ExactSizeIterator<Item = u32>,
+) -> AllocResult<Value> {
     let mut limbs = TrackedVec::new();
-    limbs
-        .try_reserve_exact(&heap.ledger, bigint.limbs().len() * 2)
-        .map_err(|e| host.map_alloc(e))?;
-    for &word in bigint.limbs() {
-        let word = if negative {
-            let (word, next) = (!word).overflowing_add(u64::from(carry));
-            carry = next;
-            word
-        } else {
-            word
-        };
-        limbs.push_reserved(word as u32);
-        limbs.push_reserved((word >> 32) as u32);
-    }
-    while limbs.last() == Some(&0) {
-        limbs.pop();
+    limbs.try_reserve_exact(&heap.ledger, words.len())?;
+    for word in words {
+        limbs.push_reserved(word);
     }
     let id = heap
         .bigints
-        .insert(&heap.ledger, BigIntData { negative, limbs })
-        .map_err(|e| host.map_alloc(e))?;
+        .insert(&heap.ledger, BigIntData { negative, limbs })?;
     Ok(Value::bigint(id))
+}
+
+fn store(heap: &mut Heap, host: &mut Host<'_>, bigint: &BigInt) -> Result<Value, BigIntError> {
+    store_bigint(heap, bigint).map_err(|e| host.map_alloc(e))
 }
 
 pub(super) fn parse_bigint(ctx: &mut ExecCtx<'_, '_>, text: &str) -> JsResult<Value> {
@@ -153,17 +131,46 @@ pub(super) fn parse_bigint(ctx: &mut ExecCtx<'_, '_>, text: &str) -> JsResult<Va
 }
 
 pub(crate) fn bigint_text(ctx: &mut ExecCtx<'_, '_>, value: Value) -> JsResult<Value> {
+    bigint_radix_text(ctx, value, 10)
+}
+
+pub(crate) fn bigint_radix_text(
+    ctx: &mut ExecCtx<'_, '_>,
+    value: Value,
+    radix: u32,
+) -> JsResult<Value> {
     with_host(ctx, |heap, host| {
         let value = read(heap, host, value)?;
-        let text = value.to_string_radix(10, host)?;
-        let string = crate::string::JsString::from_str(&heap.ledger, &text)
-            .map_err(|_| BigIntError::OutOfMemory)?;
+        let text = value.to_string_radix(radix, host)?;
+        let string = crate::string::JsString::from_latin1(&heap.ledger, text.as_bytes())
+            .map_err(|e| host.map_alloc(e))?;
         let id = heap
             .strings
             .insert(&heap.ledger, string)
-            .map_err(|_| BigIntError::OutOfMemory)?;
+            .map_err(|e| host.map_alloc(e))?;
         Ok(Value::string(id))
     })
+}
+
+pub(crate) fn bigint_as_n(
+    ctx: &mut ExecCtx<'_, '_>,
+    value: Value,
+    signed: bool,
+    bits: u64,
+) -> JsResult<Value> {
+    with_host(ctx, |heap, host| {
+        let value = read(heap, host, value)?;
+        let result = if signed {
+            value.as_int_n(bits, host)?
+        } else {
+            value.as_uint_n(bits, host)?
+        };
+        store(heap, host, &result)
+    })
+}
+
+pub(crate) fn bigint_to_number(ctx: &mut ExecCtx<'_, '_>, value: Value) -> JsResult<f64> {
+    with_host(ctx, |heap, host| Ok(read(heap, host, value)?.to_f64()))
 }
 
 pub(crate) fn compare_big_string(
@@ -242,9 +249,7 @@ pub(super) fn binary<'s>(
     if let (Some(a), Some(b)) = (a.as_number(), b.as_number()) {
         return Ok(number_binary(op, a, b));
     }
-    if matches!(a.decode(), ValueKind::ShortBigInt(_))
-        && matches!(b.decode(), ValueKind::ShortBigInt(_))
-    {
+    if bigint(a) && bigint(b) {
         return bigint_binary(ctx, op, a, b);
     }
     let (left, right) = if op == Add {
@@ -311,6 +316,77 @@ pub(super) fn short_binary(op: Opcode, a: i64, b: i64, has_interrupt: bool) -> O
     Value::short_bigint(result)
 }
 
+fn small_bigint(heap: &Heap, value: Value) -> Option<i128> {
+    match value.decode() {
+        ValueKind::ShortBigInt(n) => Some(i128::from(n)),
+        ValueKind::BigInt(id) => {
+            let data = heap.bigints.get(id).unwrap();
+            if data.limbs.len() > 4 {
+                return None;
+            }
+            let magnitude = data
+                .limbs
+                .iter()
+                .rev()
+                .fold(0u128, |n, &word| (n << 32) | u128::from(word));
+            if data.negative {
+                (magnitude <= i128::MIN.unsigned_abs()).then(|| magnitude.wrapping_neg() as i128)
+            } else {
+                i128::try_from(magnitude).ok()
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn small_bigint_binary(op: Opcode, a: i128, b: i128) -> Option<(bool, u128)> {
+    use Opcode::*;
+    let value = match op {
+        Add => a.checked_add(b)?,
+        Sub => a.checked_sub(b)?,
+        Mul => {
+            return Some((
+                (a < 0) ^ (b < 0),
+                a.unsigned_abs().checked_mul(b.unsigned_abs())?,
+            ));
+        }
+        Div => a.checked_div(b)?,
+        Mod => a.checked_rem(b)?,
+        Pow => a.checked_pow(u32::try_from(b).ok()?)?,
+        And => a & b,
+        Or => a | b,
+        Xor => a ^ b,
+        Shl | Sar => {
+            let shift = b.unsigned_abs();
+            if (op == Sar) ^ (b < 0) {
+                a >> shift.min(127)
+            } else if a == 0 {
+                0
+            } else {
+                let shift = u32::try_from(shift).ok()?;
+                a.checked_shl(shift).filter(|result| result >> shift == a)?
+            }
+        }
+        _ => return None,
+    };
+    Some((value < 0, value.unsigned_abs()))
+}
+
+fn store_small_bigint(
+    ctx: &mut ExecCtx<'_, '_>,
+    negative: bool,
+    magnitude: u128,
+) -> JsResult<Value> {
+    if let Ok(magnitude) = i64::try_from(magnitude)
+        && let Some(value) = Value::short_bigint(if negative { -magnitude } else { magnitude })
+    {
+        return Ok(value);
+    }
+    let bits = (u128::BITS - magnitude.leading_zeros()) as usize;
+    let words = (0..bits.div_ceil(32)).map(|i| (magnitude >> (i * 32)) as u32);
+    ctx.allocate(|rt| store_magnitude(&mut rt.heap, negative, words.clone()))
+}
+
 fn bigint_binary(ctx: &mut ExecCtx<'_, '_>, op: Opcode, a: Value, b: Value) -> JsResult<Value> {
     use Opcode::*;
     if op == Shr {
@@ -320,6 +396,12 @@ fn bigint_binary(ctx: &mut ExecCtx<'_, '_>, op: Opcode, a: Value, b: Value) -> J
         && let Some(result) = short_binary(op, a, b, ctx.runtime.vm.interrupt_handler.is_some())
     {
         return Ok(result);
+    }
+    if ctx.runtime.vm.interrupt_handler.is_none()
+        && let (Some(a), Some(b)) = (small_bigint(ctx.heap(), a), small_bigint(ctx.heap(), b))
+        && let Some((negative, magnitude)) = small_bigint_binary(op, a, b)
+    {
+        return store_small_bigint(ctx, negative, magnitude);
     }
     with_host(ctx, |heap, host| {
         let a = read(heap, host, a)?;
@@ -396,11 +478,11 @@ pub(super) fn unary<'s>(
                 Neg => integer.neg(host)?,
                 Not => integer.bitnot(host)?,
                 Inc | PostInc | Dec | PostDec => {
-                    host.charge(size_of::<u64>())?;
-                    integer.add(
-                        &BigInt::from_i64(if matches!(op, Inc | PostInc) { 1 } else { -1 }),
+                    let one = BigInt::from_i64_charged(
+                        if matches!(op, Inc | PostInc) { 1 } else { -1 },
                         host,
-                    )?
+                    )?;
+                    integer.add(&one, host)?
                 }
                 _ => unreachable!(),
             };
@@ -437,4 +519,33 @@ pub(super) fn number_unary(op: Opcode, number: f64) -> (Value, Value) {
         _ => unreachable!(),
     };
     (Value::number(number), Value::number(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::EngineLimits;
+    use crate::api::{EvalOptions, JsEngine};
+
+    #[test]
+    fn bigint_binary_crosses_signed_128_bit_boundary() {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        let result = engine
+            .eval_to_string(
+                r#"
+            const x = 1n << 63n;
+            const y = 1n << 127n;
+            const z = 1n << 255n;
+            [x*x === (1n<<126n), (-y)/(-1n) === y, (-y)%(-1n) === 0n,
+             x<<64n === y, -x>>999n === -1n, (z+1n).toString(16).length,
+             BigInt.asIntN(128, y) === -y, BigInt.asUintN(128, -y) === y,
+             Number((1n<<53n)+1n), Number((1n<<53n)+3n)].join('|');
+        "#,
+                EvalOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            "true|true|true|true|true|64|true|true|9007199254740992|9007199254740996"
+        );
+    }
 }
