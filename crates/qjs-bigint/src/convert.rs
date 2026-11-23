@@ -14,6 +14,46 @@ const BAD_RADIX: BigIntError = BigIntError::RangeError("BigInt radix must be bet
 const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
 impl BigInt {
+    /// Copies a sign and little-endian 32-bit magnitude into charged storage.
+    pub fn from_sign_and_u32_limbs(
+        negative: bool,
+        limbs: &[u32],
+        host: &mut dyn BigIntHost,
+    ) -> Result<Self, BigIntError> {
+        let scope = Scope::new(host);
+        scope.poll()?;
+        let mut limbs = limbs;
+        while let Some((&0, rest)) = limbs.split_last() {
+            scope.step()?;
+            limbs = rest;
+        }
+        if limbs.is_empty() {
+            return Self::small(0, &scope);
+        }
+        if limbs.len() > MAX_BITS / u32::BITS as usize {
+            return Err(TOO_LARGE);
+        }
+        let mut words = scope.filled(limbs.len().div_ceil(2), 0)?;
+        for (word, chunk) in words.iter_mut().zip(limbs.chunks(2)) {
+            scope.step()?;
+            *word = u64::from(chunk[0]) | (u64::from(chunk.get(1).copied().unwrap_or(0)) << 32);
+        }
+        apply_sign(&mut words, negative, &scope)?;
+        Self::finish(words)
+    }
+
+    /// Iterates over the little-endian 32-bit words of the absolute value.
+    pub fn magnitude_u32_limbs(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
+        let magnitude = Magnitude::new(&self.limbs);
+        let len = magnitude.bit_len().div_ceil(u32::BITS as usize);
+        (0..len).map(move |i| (magnitude.word(i / 2) >> (32 * (i % 2))) as u32)
+    }
+
+    /// Copies a signed 64-bit integer into charged storage.
+    pub fn from_i64_charged(v: i64, host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
+        Self::small(v, &Scope::new(host))
+    }
+
     /// Converts a finite number to an integer by rounding toward zero.
     pub fn from_f64_trunc(v: f64, host: &mut dyn BigIntHost) -> Result<Self, BigIntError> {
         if !v.is_finite() {

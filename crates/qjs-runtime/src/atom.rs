@@ -129,15 +129,35 @@ struct DynamicAtom {
     hash: u64,
 }
 
-#[derive(Default)]
 pub struct AtomTable {
     dynamic: TrackedVec<DynamicAtom>,
     by_content: HashIndex,
     seed: RandomState,
     issued: u32,
+    ascii_strings: [Option<StrId>; 129],
+}
+
+impl Default for AtomTable {
+    fn default() -> Self {
+        Self {
+            dynamic: TrackedVec::new(),
+            by_content: HashIndex::default(),
+            seed: RandomState::new(),
+            issued: 0,
+            ascii_strings: [None; 129],
+        }
+    }
 }
 
 impl AtomTable {
+    pub(crate) fn ascii_string(&self, slot: usize) -> Option<StrId> {
+        self.ascii_strings[slot]
+    }
+
+    pub(crate) fn cache_ascii_string(&mut self, slot: usize, id: StrId) {
+        self.ascii_strings[slot] = Some(id);
+    }
+
     pub fn builtin(atom: Atom) -> Option<&'static str> {
         BUILTIN_ATOMS.get(atom.0.checked_sub(1)? as usize).copied()
     }
@@ -166,9 +186,32 @@ impl AtomTable {
         hasher.finish()
     }
 
+    pub(crate) fn find_str(&self, strings: &Arena<JsString>, text: &str) -> Option<PropKey> {
+        let units = || text.encode_utf16();
+        if let Some(key) =
+            Self::builtin_key(text).or_else(|| parse_index(units()).and_then(PropKey::index))
+        {
+            return Some(key);
+        }
+        let ascii = text.is_ascii();
+        let len = units().count();
+        let hash = self.content_hash(units());
+        let row = self.by_content.find(hash, |row| {
+            let id = self.dynamic[row].id;
+            let s = strings.get(id).unwrap();
+            if s.len() as usize != len {
+                return false;
+            }
+            if ascii && let Some(bytes) = s.as_latin1() {
+                return bytes == text.as_bytes();
+            }
+            units().eq(StringUnits::new(strings, id))
+        })?;
+        Some(PropKey::atom(self.dynamic[row].atom))
+    }
+
     pub(crate) fn find(&self, strings: &Arena<JsString>, id: StrId) -> Option<PropKey> {
-        if let JsString::Latin1 { data, .. } = strings.get(id).unwrap() {
-            let bytes = &data[..];
+        if let Some(bytes) = strings.get(id).unwrap().as_latin1() {
             if !bytes.is_empty()
                 && bytes[0].is_ascii_digit()
                 && let Some(index) =
@@ -185,17 +228,20 @@ impl AtomTable {
             let hash = self.content_hash(bytes.iter().map(|&b| u16::from(b)));
             let row = self.by_content.find(hash, |row| {
                 let other = self.dynamic[row].id;
-                other == id
-                    || match strings.get(other).unwrap() {
-                        JsString::Latin1 { data: ob, .. } => &ob[..] == bytes,
-                        s => {
+                other == id || {
+                    let s = strings.get(other).unwrap();
+                    s.as_latin1().map_or_else(
+                        || {
                             s.len() as usize == bytes.len()
                                 && bytes
                                     .iter()
-                                    .map(|&b| u16::from(b))
+                                    .copied()
+                                    .map(u16::from)
                                     .eq(StringUnits::new(strings, other))
-                        }
-                    }
+                        },
+                        |other| other == bytes,
+                    )
+                }
             })?;
             return Some(PropKey::atom(self.dynamic[row].atom));
         }
@@ -241,6 +287,11 @@ impl AtomTable {
     }
 
     pub(crate) fn prune(&mut self, strings: &Arena<JsString>) {
+        for entry in &mut self.ascii_strings {
+            if entry.is_some_and(|id| !strings.is_marked(id)) {
+                *entry = None;
+            }
+        }
         let mut to = 0;
         for from in 0..self.dynamic.len() {
             let entry = self.dynamic[from];
@@ -605,6 +656,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(atoms.find(&strings, rope), Some(kept));
+        assert_eq!(atoms.find_str(&strings, "α😀"), Some(kept));
+        assert_eq!(atoms.find_str(&strings, "discard"), Some(old));
+        assert_eq!(atoms.find_str(&strings, "123"), PropKey::index(123));
         strings.mark(live);
         atoms.prune(&strings);
         assert_eq!(atoms.find(&strings, rope), Some(kept));

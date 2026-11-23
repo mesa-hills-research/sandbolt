@@ -1,5 +1,3 @@
-use std::fmt::{self, Write};
-
 use crate::atom::{Atom, AtomTable, KeyKind, PropKey};
 use crate::heap::Heap;
 use crate::ledger::{TrackedBox, TrackedVec};
@@ -249,19 +247,18 @@ pub fn to_length<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<u
 }
 
 pub fn to_string<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<Handle<'s>> {
+    if matches!(ctx.get(value).decode(), ValueKind::String(_)) {
+        return Ok(value);
+    }
     let raw = to_primitive(ctx, value, PreferredType::String)?;
     match raw.decode() {
         ValueKind::String(_) => ctx.root(raw),
         ValueKind::Undefined => ctx.new_string("undefined"),
         ValueKind::Null => ctx.new_string("null"),
         ValueKind::Bool(v) => ctx.new_string(if v { "true" } else { "false" }),
-        ValueKind::Int32(n) => number_text(ctx, n as f64),
+        ValueKind::Int32(n) => integer_text(ctx, i64::from(n)),
         ValueKind::Float64(n) => number_text(ctx, n),
-        ValueKind::ShortBigInt(n) => {
-            let mut text = TextBuffer::new();
-            write!(text, "{n}").unwrap();
-            ctx.new_string(text.as_str())
-        }
+        ValueKind::ShortBigInt(n) => integer_text(ctx, n),
         ValueKind::BigInt(_) => {
             ctx.root(raw)?;
             let result = crate::vm::exec::numeric::bigint_text(ctx, raw)?;
@@ -272,7 +269,30 @@ pub fn to_string<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<H
     }
 }
 
+fn integer_text<'s>(ctx: &mut ExecCtx<'_, 's>, n: i64) -> JsResult<Handle<'s>> {
+    let mut bytes = [0; 20];
+    let mut i = bytes.len();
+    let mut magnitude = n.unsigned_abs();
+    loop {
+        i -= 1;
+        bytes[i] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if n < 0 {
+        i -= 1;
+        bytes[i] = b'-';
+    }
+    ctx.new_latin1(&bytes[i..])
+}
+
 fn number_text<'s>(ctx: &mut ExecCtx<'_, 's>, n: f64) -> JsResult<Handle<'s>> {
+    let i = n as i32;
+    if n == f64::from(i) {
+        return integer_text(ctx, i64::from(i));
+    }
     let options = qjs_dtoa::DtoaOptions::default();
     let bytes = qjs_dtoa::dtoa_max_len(n, 10, 0, options);
     let ledger = ctx.heap().ledger.clone();
@@ -304,7 +324,7 @@ pub fn to_property_key<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsRe
 
 pub(crate) fn key_value<'s>(ctx: &mut ExecCtx<'_, 's>, key: PropKey) -> JsResult<Handle<'s>> {
     match key.decode() {
-        KeyKind::Index(index) => number_text(ctx, f64::from(index)),
+        KeyKind::Index(index) => integer_text(ctx, i64::from(index)),
         KeyKind::String(atom) if AtomTable::builtin(atom).is_some() => {
             ctx.new_string(AtomTable::builtin(atom).unwrap())
         }
@@ -479,31 +499,4 @@ fn wrapper_to_string<'s>(
     }
     let text = to_string(ctx, value)?;
     Ok(ctx.get(text))
-}
-
-struct TextBuffer {
-    data: [u8; 128],
-    len: usize,
-}
-impl TextBuffer {
-    fn new() -> Self {
-        Self {
-            data: [0; 128],
-            len: 0,
-        }
-    }
-    fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.data[..self.len]).unwrap()
-    }
-}
-impl Write for TextBuffer {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        let end = self.len + text.len();
-        self.data
-            .get_mut(self.len..end)
-            .ok_or(fmt::Error)?
-            .copy_from_slice(text.as_bytes());
-        self.len = end;
-        Ok(())
-    }
 }

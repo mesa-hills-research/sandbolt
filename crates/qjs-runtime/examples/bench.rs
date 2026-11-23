@@ -178,7 +178,8 @@ fn print_memory_breakdown(label: &str, engine: &JsEngine) {
                 str_bytes += data.capacity() * 2;
                 str_wide += 1;
             }
-            JsString::Rope { .. } => {}
+            JsString::InlineUtf16 { .. } => str_wide += 1,
+            JsString::InlineLatin1 { .. } | JsString::Slice { .. } | JsString::Rope { .. } => {}
         }
         if len <= 1 {
             str_le1 += 1;

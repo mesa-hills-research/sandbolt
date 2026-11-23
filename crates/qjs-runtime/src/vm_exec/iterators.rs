@@ -1,23 +1,24 @@
 use qjs_bytecode::{Instruction, Opcode, Operands};
 
-use crate::atom::{Atom, KeyKind, PropKey};
+use crate::atom::{Atom, INLINE_INDEX_LIMIT, KeyKind, PropKey};
 use crate::builtins::promise_json_extras::{
     new_promise_capability, perform_promise_then, promise_resolve,
 };
 use crate::builtins::vm_internal::{ASYNC_CLOSE_REJECT, ASYNC_UNWRAP, SYNC_DISPOSER};
-use crate::ledger::TrackedBox;
-use crate::object::{IteratorData, IteratorKind, IteratorRecordData, ObjectData, ObjectFlags};
+use crate::heap::Heap;
+use crate::ledger::{TrackedBox, TrackedVec};
+use crate::object::{
+    ARRAY_ITERATOR_NEXT, ArrayIteratorKind, DenseForIn, ForInIteratorData, IteratorData,
+    IteratorKind, IteratorRecordData, ObjectData, ObjectFlags,
+};
 use crate::ops::{call, convert, property};
 use crate::root::{Args, ExecCtx, Handle};
+use crate::shape::PropFlags;
 use crate::symbol::WellKnown;
 use crate::value::*;
 use crate::vm::CallFrame;
 
 use super::{define_default, load, objects::get_method, replace, well_known};
-
-fn state_key(index: u32) -> PropKey {
-    PropKey::index(index).unwrap()
-}
 
 pub(super) fn iterator_op(
     ctx: &mut ExecCtx<'_, '_>,
@@ -27,6 +28,21 @@ pub(super) fn iterator_op(
     use Opcode::*;
     let op = inst.opcode;
     let tail = ctx.runtime.vm.stack.len();
+    if op == ForOfNext && ctx.runtime.vm.interrupt_handler.is_none() {
+        let Operands::Unsigned(skip) = inst.operands else {
+            unreachable!()
+        };
+        let pos = tail - skip as usize - 3;
+        let iterator = ctx.runtime.vm.stack[pos];
+        let method = ctx.runtime.vm.stack[pos + 1];
+        if let Some((value, done)) = dense_array_next(ctx, iterator, method) {
+            if done {
+                ctx.runtime.vm.stack[pos] = Value::UNDEFINED;
+            }
+            replace(ctx, 0, &[value, Value::bool(done)]);
+            return Ok(());
+        }
+    }
     let mut mark_done = None;
     let result = ctx.with_scope(|ctx| {
         let h = |n: usize| Handle::at(tail - n);
@@ -368,6 +384,68 @@ pub(crate) fn iterator_result<'s>(
     Ok(ctx.get(object))
 }
 
+fn dense_array_next(
+    ctx: &mut ExecCtx<'_, '_>,
+    iterator: Value,
+    method: Value,
+) -> Option<(Value, bool)> {
+    if iterator == Value::UNDEFINED {
+        return Some((Value::UNDEFINED, true));
+    }
+    let id = iterator.as_object()?;
+    let heap = ctx.heap();
+    let ObjectData::Iterator(data) = &heap.object(id).data else {
+        return None;
+    };
+    let IteratorKind::Array {
+        kind: ArrayIteratorKind::Value,
+        target,
+        index,
+    } = data.kind
+    else {
+        return None;
+    };
+    let ObjectData::NativeFunction(next) = &heap.object(method.as_object()?).data else {
+        return None;
+    };
+    if next.function != ARRAY_ITERATOR_NEXT {
+        return None;
+    }
+    let (value, done) = if target == Value::UNDEFINED {
+        return Some((Value::UNDEFINED, true));
+    } else {
+        let object = heap.object(target.as_object().unwrap());
+        let ObjectData::Array(array) = &object.data else {
+            return None;
+        };
+        if !object.flags.contains(ObjectFlags::FAST_ARRAY) {
+            return None;
+        }
+        if index >= u64::from(array.length) {
+            (Value::UNDEFINED, true)
+        } else {
+            // An own dense element cannot invoke an inherited getter.
+            let value = *array.elements.get(index as usize)?;
+            if value == Value::EMPTY {
+                return None;
+            }
+            (value, false)
+        }
+    };
+    let ObjectData::Iterator(data) = &mut ctx.runtime.heap.objects.get_mut(id).unwrap().data else {
+        unreachable!()
+    };
+    let IteratorKind::Array { target, index, .. } = &mut data.kind else {
+        unreachable!()
+    };
+    if done {
+        *target = Value::UNDEFINED;
+    } else {
+        *index += 1;
+    }
+    Some((value, done))
+}
+
 fn iterator_next<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     iterator: Handle<'s>,
@@ -456,94 +534,271 @@ pub(super) fn append<'s>(
 }
 
 fn for_in_start<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<Value> {
-    let proto = ctx.root(Value::object(ctx.realm().for_in_iterator_proto))?;
-    let iterator = ctx.new_object_with_proto(Some(proto))?;
     let raw = ctx.get(value);
-    let target = if raw == Value::NULL || raw == Value::UNDEFINED {
-        ctx.root(Value::NULL)?
+    let target = if matches!(raw, Value::NULL | Value::UNDEFINED) {
+        None
     } else {
-        convert::to_object(ctx, value)?
+        let target = convert::to_object(ctx, value)?;
+        ctx.get(target).as_object()
     };
-    let visited = ctx.new_object_with_proto(None)?;
-    let index = ctx.root(Value::int32(0))?;
-    let undefined = ctx.root(Value::UNDEFINED)?;
-    for (i, value) in [target, visited, undefined, index].into_iter().enumerate() {
-        define_default(ctx, iterator, state_key(i as u32), value)?;
-    }
+    let proto = ctx.realm().for_in_iterator_proto;
+    let iterator = ctx.make_object(Some(proto), ObjectFlags::EXTENSIBLE, |ledger| {
+        let mut state = ForInIteratorData::default();
+        state.target = target;
+        Ok(ObjectData::ForInIterator(TrackedBox::new(ledger, state)?))
+    })?;
     Ok(ctx.get(iterator))
+}
+
+fn for_in_data(heap: &Heap, iterator: ObjId) -> &ForInIteratorData {
+    let ObjectData::ForInIterator(data) = &heap.object(iterator).data else {
+        unreachable!()
+    };
+    data
+}
+
+fn for_in_data_mut(heap: &mut Heap, iterator: ObjId) -> &mut ForInIteratorData {
+    let ObjectData::ForInIterator(data) = &mut heap.objects.get_mut(iterator).unwrap().data else {
+        unreachable!()
+    };
+    data
+}
+
+fn dense_for_in(heap: &Heap, target: ObjId) -> Option<DenseForIn> {
+    let object = heap.object(target);
+    let ObjectData::Array(array) = &object.data else {
+        return None;
+    };
+    if object.flags.contains(ObjectFlags::FAST_ARRAY)
+        && array.elements.len() == array.length as usize
+        && array.length <= INLINE_INDEX_LIMIT
+        && heap.shape(object.shape).props.is_empty()
+        && !array.elements.contains(&Value::EMPTY)
+    {
+        Some(DenseForIn {
+            length: array.length,
+            active: true,
+            absent: TrackedVec::new(),
+        })
+    } else {
+        None
+    }
+}
+
+fn might_enumerate(heap: &Heap, mut target: Option<ObjId>) -> bool {
+    while let Some(id) = target {
+        let object = heap.object(id);
+        match &object.data {
+            ObjectData::Ordinary => (),
+            ObjectData::Array(array) if array.elements.is_empty() => (),
+            _ => return true,
+        }
+        let shape = heap.shape(object.shape);
+        if shape
+            .props
+            .iter()
+            .any(|prop| prop.flags.contains(PropFlags::ENUMERABLE))
+        {
+            return true;
+        }
+        target = shape.proto;
+    }
+    false
 }
 
 pub(crate) fn for_in_next<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     iterator: Handle<'s>,
 ) -> JsResult<[Value; 2]> {
-    let value = ctx.get(iterator);
+    let iterator = ctx.object_id(iterator)?;
+    if !matches!(
+        ctx.heap().object(iterator).data,
+        ObjectData::ForInIterator(_)
+    ) {
+        return Err(ctx.throw_type_error("expected a for-in iterator"));
+    }
     loop {
-        let result = ctx.with_scope(|ctx| {
-            let iterator = ctx.root(value)?;
-            let target = property::get_property(ctx, iterator, state_key(0))?;
-            if target == Value::NULL {
-                return Ok(Some([Value::UNDEFINED, Value::bool(true)]));
-            }
-            let target = ctx.root(target)?;
-            let visited = property::get_property(ctx, iterator, state_key(1))?;
-            let visited = ctx.root(visited)?;
-            let keys = property::get_property(ctx, iterator, state_key(2))?;
-            let mut index = property::get_property(ctx, iterator, state_key(3))?
-                .as_number()
-                .unwrap() as u64;
-            let keys = if keys == Value::UNDEFINED {
-                let list = property::own_property_keys(ctx, target)?;
-                let keys = ctx.new_array()?;
-                for (i, &key) in list
-                    .iter()
-                    .filter(|k| !matches!(k.decode(), KeyKind::Symbol(_)))
-                    .enumerate()
+        let data = for_in_data(ctx.heap(), iterator);
+        let Some(target) = data.target else {
+            return Ok([Value::UNDEFINED, Value::bool(true)]);
+        };
+        let index = data.index;
+        if let Some(dense) = data.dense.as_ref().filter(|dense| dense.active) {
+            if index < dense.length as usize {
+                let key = PropKey::index(index as u32).unwrap();
+                for_in_data_mut(&mut ctx.runtime.heap, iterator).index += 1;
+                let target_object = ctx.heap().object(target);
+                let (exists, enumerable) = if target_object.flags.contains(ObjectFlags::FAST_ARRAY)
                 {
-                    let value = convert::key_value(ctx, key)?;
-                    let n = load::index_key(ctx, i as u64)?;
-                    define_default(ctx, keys, n, value)?;
+                    let ObjectData::Array(array) = &target_object.data else {
+                        unreachable!()
+                    };
+                    let present = array
+                        .elements
+                        .get(index)
+                        .is_some_and(|&v| v != Value::EMPTY);
+                    (present, present)
+                } else {
+                    ctx.with_scope(|ctx| {
+                        let target = ctx.root(Value::object(target))?;
+                        let desc = property::get_own_property_descriptor(ctx, target, key)?;
+                        Ok((
+                            desc.is_some(),
+                            desc.is_some_and(|desc| desc.enumerable == Some(true)),
+                        ))
+                    })?
+                };
+                if enumerable {
+                    let name = convert::key_value(ctx, key)?;
+                    return Ok([ctx.get(name), Value::bool(false)]);
                 }
-                property::set_property(ctx, iterator, state_key(2), keys)?;
-                keys
+                if !exists {
+                    ctx.allocate(|rt| {
+                        let heap = &mut rt.heap;
+                        let ledger = heap.ledger.clone();
+                        for_in_data_mut(heap, iterator)
+                            .dense
+                            .as_mut()
+                            .unwrap()
+                            .absent
+                            .push(&ledger, index as u32)
+                    })?;
+                }
             } else {
-                ctx.root(keys)?
-            };
-            let len = property::get_property(ctx, keys, Atom::get("length"))?
-                .as_number()
-                .unwrap() as u64;
-            if index < len {
-                let current = load::index_key(ctx, index)?;
-                let name = property::get_property(ctx, keys, current)?;
-                let name = ctx.root(name)?;
-                index += 1;
-                let next = ctx.root(Value::number(index as f64))?;
-                property::set_property(ctx, iterator, state_key(3), next)?;
-                let key = convert::to_property_key(ctx, name)?;
-                if !property::has_property(ctx, visited, key)?
-                    && let Some(desc) = property::get_own_property_descriptor(ctx, target, key)?
+                let heap = ctx.heap();
+                let target = heap.shape(heap.object(target).shape).proto;
+                let next = target.filter(|_| might_enumerate(heap, target));
+                let data = for_in_data_mut(&mut ctx.runtime.heap, iterator);
+                data.dense.as_mut().unwrap().active = false;
+                data.target = next;
+                data.index = 0;
+            }
+        } else {
+            if data.keys.is_none() {
+                if data.dense.is_none()
+                    && let Some(dense) = dense_for_in(ctx.heap(), target)
                 {
-                    let marker = ctx.root(Value::UNDEFINED)?;
-                    define_default(ctx, visited, key, marker)?;
-                    if desc.enumerable == Some(true) {
-                        return Ok(Some([ctx.get(name), Value::bool(false)]));
+                    for_in_data_mut(&mut ctx.runtime.heap, iterator).dense = Some(dense);
+                    continue;
+                }
+                ctx.with_scope(|ctx| {
+                    let target = ctx.root(Value::object(target))?;
+                    let mut keys = property::own_property_keys(ctx, target)?;
+                    keys.retain(|key| !matches!(key.decode(), KeyKind::Symbol(_)));
+                    for_in_data_mut(&mut ctx.runtime.heap, iterator).keys = Some(keys);
+                    Ok(())
+                })?;
+            }
+            if let Some(&key) = for_in_data(ctx.heap(), iterator)
+                .keys
+                .as_ref()
+                .unwrap()
+                .get(index)
+            {
+                let data = for_in_data_mut(&mut ctx.runtime.heap, iterator);
+                data.index += 1;
+                if !data.has_seen(key) {
+                    let enumerable = ctx.with_scope(|ctx| {
+                        let target = ctx.root(Value::object(target))?;
+                        let Some(desc) = property::get_own_property_descriptor(ctx, target, key)?
+                        else {
+                            return Ok(false);
+                        };
+                        ctx.allocate(|rt| {
+                            let heap = &mut rt.heap;
+                            let ledger = heap.ledger.clone();
+                            for_in_data_mut(heap, iterator).visit(&ledger, key)
+                        })?;
+                        Ok(desc.enumerable == Some(true))
+                    })?;
+                    if enumerable {
+                        let name = convert::key_value(ctx, key)?;
+                        return Ok([ctx.get(name), Value::bool(false)]);
                     }
                 }
             } else {
-                let next =
-                    property::get_prototype_of(ctx, target)?.map_or(Value::NULL, Value::object);
-                let next = ctx.root(next)?;
-                let zero = ctx.root(Value::int32(0))?;
-                let undefined = ctx.root(Value::UNDEFINED)?;
-                property::set_property(ctx, iterator, state_key(0), next)?;
-                property::set_property(ctx, iterator, state_key(2), undefined)?;
-                property::set_property(ctx, iterator, state_key(3), zero)?;
+                ctx.with_scope(|ctx| {
+                    let target = ctx.root(Value::object(target))?;
+                    let proto = property::get_prototype_of(ctx, target)?;
+                    let data = for_in_data_mut(&mut ctx.runtime.heap, iterator);
+                    data.target = proto;
+                    data.index = 0;
+                    data.keys = None;
+                    Ok(())
+                })?;
             }
-            Ok(None)
-        })?;
-        if let Some(result) = result {
-            return Ok(result);
         }
         ctx.check_interrupt()?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::EngineLimits;
+    use crate::api::{EvalOptions, JsEngine};
+
+    fn run(script: &str) -> String {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        engine
+            .eval_to_string(script, EvalOptions::default())
+            .unwrap()
+    }
+
+    #[test]
+    fn for_of_keeps_captured_next_and_reads_inherited_holes() {
+        assert_eq!(
+            run(r#"
+            const proto = Object.getPrototypeOf([][Symbol.iterator]());
+            const next = proto.next;
+            let seen = '';
+            for (const value of [1, 2]) {
+                seen += value;
+                proto.next = function () { return { done: true }; };
+            }
+            for (const value of [3]) seen += value;
+            proto.next = next;
+            const parent = Object.create(Array.prototype, { 1: { get() { return 8; } } });
+            const holes = [0, , 2];
+            Object.setPrototypeOf(holes, parent);
+            for (const value of holes) seen += value;
+            const a = [4, 5];
+            for (const value of a) { seen += value; if (value === 4) a.push(6); }
+            seen;
+        "#),
+            "12082456"
+        );
+    }
+
+    #[test]
+    fn for_in_checks_deletions_shadowing_and_proxy_descriptors() {
+        assert_eq!(
+            run(r#"
+            let dense = [0, 1, 2];
+            const own = [];
+            for (const key in dense) {
+                own.push(key);
+                if (key === '0') { delete dense[1]; dense[3] = 3; }
+            }
+            const parent = { hidden: 0, inherited: 1 };
+            const sparse = [, 1];
+            Object.setPrototypeOf(sparse, parent);
+            Object.defineProperty(sparse, 'hidden', { value: 2 });
+            const keys = [];
+            for (const key in sparse) keys.push(key);
+            const calls = [];
+            const proxy = new Proxy({ a: 1, b: 2 }, {
+                ownKeys() { calls.push('keys'); return ['b', 'a']; },
+                getOwnPropertyDescriptor(target, key) {
+                    calls.push(key);
+                    return Object.getOwnPropertyDescriptor(target, key);
+                },
+                getPrototypeOf() { calls.push('proto'); return null; },
+            });
+            const order = [];
+            for (const key in proxy) order.push(key);
+            [own.join(''), keys.join(','), order.join(''), calls.join(',')].join('|');
+        "#),
+            "02|1,inherited|ba|keys,b,a,proto"
+        );
     }
 }

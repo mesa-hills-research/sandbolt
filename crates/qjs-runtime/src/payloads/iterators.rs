@@ -1,13 +1,76 @@
 use crate::atom::PropKey;
 use crate::gc::{Trace, Tracer};
-use crate::ledger::TrackedVec;
-use crate::value::{CoroId, Value};
+use crate::ledger::{AllocResult, HeapLedger, TrackedVec};
+use crate::object::HashIndex;
+use crate::realm::NativeFnId;
+use crate::value::{CoroId, ObjId, Value};
+
+pub(crate) const ARRAY_NEXT_OFFSET: u16 = 22;
+pub(crate) const ARRAY_ITERATOR_NEXT: NativeFnId =
+    NativeFnId(crate::builtins::ARRAY_ITER_BASE + 128 + ARRAY_NEXT_OFFSET);
 
 payloads!(
     GeneratorData { state: Option<CoroId> },
     AsyncFunctionData { state: Option<CoroId> }, AsyncGeneratorData { state: Option<CoroId> },
     IteratorData { kind: IteratorKind },
 );
+
+#[derive(Debug, Default)]
+pub struct ForInIteratorData {
+    pub(crate) target: Option<ObjId>,
+    pub(crate) keys: Option<TrackedVec<PropKey>>,
+    pub(crate) index: usize,
+    pub(crate) dense: Option<DenseForIn>,
+    visited: TrackedVec<PropKey>,
+    by_key: HashIndex,
+}
+
+#[derive(Debug)]
+pub(crate) struct DenseForIn {
+    pub(crate) length: u32,
+    pub(crate) active: bool,
+    pub(crate) absent: TrackedVec<u32>,
+}
+
+impl ForInIteratorData {
+    pub(crate) fn has_seen(&self, key: PropKey) -> bool {
+        if let Some(dense) = &self.dense {
+            if key == PropKey::atom(crate::atom::Atom::LENGTH) {
+                return true;
+            }
+            if let crate::atom::KeyKind::Index(i) = key.decode()
+                && i < dense.length
+                && dense.absent.binary_search(&i).is_err()
+            {
+                return true;
+            }
+        }
+        self.by_key
+            .find(key_hash(key), |i| self.visited[i] == key)
+            .is_some()
+    }
+
+    pub(crate) fn visit(&mut self, ledger: &HeapLedger, key: PropKey) -> AllocResult<()> {
+        self.visited.try_reserve(ledger, 1)?;
+        self.by_key.reserve(ledger)?;
+        self.by_key.insert(key_hash(key), self.visited.len());
+        self.visited.push_reserved(key);
+        Ok(())
+    }
+}
+
+fn key_hash(key: PropKey) -> u64 {
+    let bits = key.bits();
+    u64::from(bits ^ (bits >> 16))
+}
+
+impl Trace for ForInIteratorData {
+    fn trace(&self, tracer: &Tracer<'_>) {
+        self.target.trace(tracer);
+        self.keys.trace(tracer);
+        self.visited.trace(tracer);
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum ArrayIteratorKind {

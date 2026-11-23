@@ -193,6 +193,9 @@ pub(super) fn entries<'a>(ctx: &'a ExecCtx<'_, '_>, id: ObjId) -> &'a OrderedCol
 
 pub(super) fn lookup(ctx: &ExecCtx<'_, '_>, id: ObjId, key: Value) -> Option<Value> {
     let data = entries(ctx, id);
+    if data.len() == 0 {
+        return None;
+    }
     data.locate(ctx.heap(), key, data.hash(ctx.heap(), key))
         .map(|row| data.value(row))
 }
@@ -203,8 +206,10 @@ pub(super) fn insert<'s>(
     key: Handle<'s>,
     value: Handle<'s>,
 ) -> JsResult<()> {
-    let key = ctx.get(key);
-    let value = ctx.get(value);
+    insert_raw(ctx, id, ctx.get(key), ctx.get(value))
+}
+
+fn insert_raw(ctx: &mut ExecCtx<'_, '_>, id: ObjId, key: Value, value: Value) -> JsResult<()> {
     let data = entries(ctx, id);
     let hash = data.hash(ctx.heap(), key);
     if let Some(row) = data.locate(ctx.heap(), key, hash) {
@@ -220,11 +225,14 @@ pub(super) fn insert<'s>(
 
 pub(super) fn delete(ctx: &mut ExecCtx<'_, '_>, id: ObjId, key: Value) -> bool {
     let data = entries(ctx, id);
+    if data.len() == 0 {
+        return false;
+    }
     let hash = data.hash(ctx.heap(), key);
-    let Some(row) = data.locate(ctx.heap(), key, hash) else {
+    let Some(bucket) = data.locate_bucket(ctx.heap(), key, hash) else {
         return false;
     };
-    collection_mut(&mut ctx.runtime.heap.objects.get_mut(id).unwrap().data).remove(hash, row);
+    collection_mut(&mut ctx.runtime.heap.objects.get_mut(id).unwrap().data).remove_bucket(bucket);
     true
 }
 
@@ -259,22 +267,22 @@ pub(super) fn method<'s>(
             iterator(ctx, id, is_set, kind)
         }
         _ => {
-            let key = arg(ctx, args, 0)?;
-            let raw = ctx.get(key);
+            let raw = args.get(0).map_or(Value::UNDEFINED, |key| ctx.get(key));
             match op {
                 MAP_GET => Ok(lookup(ctx, id, raw).unwrap_or(Value::UNDEFINED)),
                 MAP_HAS | SET_HAS => Ok(Value::bool(lookup(ctx, id, raw).is_some())),
                 MAP_DELETE | SET_DELETE => Ok(Value::bool(delete(ctx, id, raw))),
                 MAP_SET | SET_ADD => {
                     let value = if is_set {
-                        ctx.root(Value::UNDEFINED)?
+                        Value::UNDEFINED
                     } else {
-                        arg(ctx, args, 1)?
+                        args.get(1).map_or(Value::UNDEFINED, |value| ctx.get(value))
                     };
-                    insert(ctx, id, key, value)?;
+                    insert_raw(ctx, id, raw, value)?;
                     Ok(ctx.get(this))
                 }
                 MAP_UPSERT | MAP_UPSERT_COMPUTED => {
+                    let key = arg(ctx, args, 0)?;
                     let value = arg(ctx, args, 1)?;
                     let computed = op == MAP_UPSERT_COMPUTED;
                     if computed {
@@ -444,4 +452,39 @@ pub(super) fn group_by<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>) -> JsResul
         Ok(true)
     })? {}
     Ok(ctx.get(groups))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::EngineLimits;
+    use crate::api::{EvalOptions, JsEngine};
+
+    #[test]
+    fn collection_keys_match_across_string_storage_and_compaction() {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        let result = engine
+            .eval_to_string(
+                r#"
+            const part = 'áx'.repeat(30);
+            const latin = part.repeat(2);
+            const rope = part + part;
+            const wide = part.concat(part);
+            const map = new Map([[latin, 1], [-0, 2], [NaN, 3]]);
+            const both = map.get(rope) === 1 && map.has(wide);
+            const keys = map.keys();
+            keys.next();
+            map.delete(wide);
+            map.delete(0);
+            const last = keys.next().value;
+            map.set(undefined);
+            const done = keys.next().value === undefined && keys.next().done;
+            const set = new Set([rope]);
+            [both, Number.isNaN(last), done, map.has(), map.delete(),
+             set.has(wide), set.delete(latin), set.size].join('|');
+        "#,
+                EvalOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(result, "true|true|true|true|true|true|true|0");
+    }
 }

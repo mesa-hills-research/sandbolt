@@ -1,11 +1,11 @@
 use std::marker::PhantomData;
 
-use crate::atom::{AtomTable, PropKey};
+use crate::atom::PropKey;
 use crate::heap::{Heap, PersistentRoot};
 use crate::ledger::{AllocError, AllocResult, HeapLedger, TrackedBox, TrackedVec};
 use crate::object::*;
 use crate::realm::{NativeFnId, Realm, Runtime, bootstrap_error_message};
-use crate::string::{JsString, MAX_ROPE_DEPTH};
+use crate::string::{INLINE_LATIN1_CAPACITY, JsString, MAX_ROPE_DEPTH};
 use crate::symbol::SymbolDescription;
 use crate::value::*;
 use crate::vm::{BytecodeFunc, Job, MiniOp};
@@ -155,7 +155,11 @@ impl<'s> ExecCtx<'_, 's> {
         self.realm
     }
     pub fn new_target(&self) -> Option<ObjId> {
-        self.runtime.vm.frames.last().and_then(|frame| frame.new_target)
+        self.runtime
+            .vm
+            .frames
+            .last()
+            .and_then(|frame| frame.new_target)
     }
     pub fn can_block(&self) -> bool {
         self.runtime.vm.can_block
@@ -370,75 +374,148 @@ impl<'s> ExecCtx<'_, 's> {
     }
 
     pub fn new_string(&mut self, text: &str) -> JsResult<Handle<'s>> {
-        self.make_string(|ledger| JsString::from_str(ledger, text))
+        if text.is_ascii() {
+            return self.new_latin1(text.as_bytes());
+        }
+        self.make_string(|heap| JsString::from_str(&heap.ledger, text))
     }
 
     pub fn new_utf16(&mut self, units: &[u16]) -> JsResult<Handle<'s>> {
-        self.make_string(|ledger| JsString::from_utf16(ledger, units))
+        match units {
+            [] => self.new_latin1(&[]),
+            [unit] if *unit <= 255 => self.new_latin1(&[*unit as u8]),
+            _ => self.make_string(|heap| JsString::from_utf16(&heap.ledger, units)),
+        }
     }
 
-    fn make_string(
+    pub(crate) fn new_latin1(&mut self, bytes: &[u8]) -> JsResult<Handle<'s>> {
+        let slot = match bytes {
+            [] => Some(128),
+            [byte] if byte.is_ascii() => Some(usize::from(*byte)),
+            _ => None,
+        };
+        if let Some(id) = slot.and_then(|slot| self.heap().atoms.ascii_string(slot)) {
+            return self.root(Value::string(id));
+        }
+        let string = self.make_string(|heap| JsString::from_latin1(&heap.ledger, bytes))?;
+        if let Some(slot) = slot {
+            let ValueKind::String(id) = self.get(string).decode() else {
+                unreachable!()
+            };
+            self.runtime.heap.atoms.cache_ascii_string(slot, id);
+        }
+        Ok(string)
+    }
+
+    pub(crate) fn make_string(
         &mut self,
-        f: impl Fn(&HeapLedger) -> AllocResult<JsString>,
+        f: impl Fn(&Heap) -> AllocResult<JsString>,
     ) -> JsResult<Handle<'s>> {
         let id = self.allocate(|runtime| {
             let heap = &mut runtime.heap;
-            let string = f(&heap.ledger)?;
+            let string = f(heap)?;
             heap.strings.insert(&heap.ledger, string)
         })?;
         self.root(Value::string(id))
     }
 
+    pub(crate) fn string_slice(
+        &mut self,
+        source: Handle<'s>,
+        start: usize,
+        end: usize,
+    ) -> JsResult<Handle<'s>> {
+        let ValueKind::String(id) = self.get(source).decode() else {
+            unreachable!()
+        };
+        if start == 0 && end == self.heap().string(id).len() as usize {
+            return Ok(source);
+        }
+        match end - start {
+            0 => return self.new_latin1(&[]),
+            1 => {
+                let unit = JsString::unit_at(&self.heap().strings, id, start as u32).unwrap();
+                return self.new_utf16(&[unit]);
+            }
+            _ => (),
+        }
+        if matches!(self.heap().string(id), JsString::Rope { .. }) {
+            self.flatten_string(source)?;
+        }
+        let (base, offset) = match self.heap().string(id) {
+            JsString::Slice { base, start, .. } => (*base, *start as usize),
+            _ => (id, 0),
+        };
+        let len = end - start;
+        let backing = self.heap().string(base);
+        if len >= 4096 && backing.len() as usize <= len.saturating_mul(4) {
+            let is_wide = backing.is_wide();
+            return self.make_string(|_| {
+                Ok(JsString::Slice {
+                    base,
+                    start: (offset + start) as u32,
+                    len: len as u32,
+                    is_wide,
+                })
+            });
+        }
+        let range = offset + start..offset + end;
+        self.make_string(|heap| {
+            let s = heap.string(base);
+            if let Some(bytes) = s.as_latin1() {
+                JsString::from_latin1(&heap.ledger, &bytes[range.clone()])
+            } else {
+                JsString::from_utf16(&heap.ledger, &s.as_utf16().unwrap()[range.clone()])
+            }
+        })
+    }
+
     pub fn concat_strings(&mut self, left: Handle<'s>, right: Handle<'s>) -> JsResult<Handle<'s>> {
-        let (ValueKind::String(left), ValueKind::String(right)) =
+        let (ValueKind::String(a), ValueKind::String(b)) =
             (self.get(left).decode(), self.get(right).decode())
         else {
             return Err(self.throw_type_error("expected strings"));
         };
-        let id = self.allocate(|runtime| {
-            let heap = &mut runtime.heap;
-            let (a, b) = (heap.string(left), heap.string(right));
-            let len = a.len().checked_add(b.len()).ok_or(AllocError::Limit)?;
-            let is_wide = a.is_wide() || b.is_wide();
-            let depth = a.depth().max(b.depth()) + 1;
-            let string = match (a, b) {
-                (
-                    JsString::Latin1 {
-                        data: da,
-                        is_ascii: ia,
-                    },
-                    JsString::Latin1 {
-                        data: db,
-                        is_ascii: ib,
-                    },
-                ) if len <= 16 => {
-                    let mut data = TrackedVec::new();
-                    data.try_reserve_exact(&heap.ledger, len as usize)?;
-                    for &byte in da.iter().chain(db.iter()) {
-                        data.push_reserved(byte);
-                    }
-                    JsString::Latin1 {
-                        data,
-                        is_ascii: *ia && *ib,
-                    }
-                }
-                _ if depth > MAX_ROPE_DEPTH => JsString::from_units(
+        let (left_string, right_string) = (self.heap().string(a), self.heap().string(b));
+        if left_string.is_empty() {
+            return Ok(right);
+        }
+        if right_string.is_empty() {
+            return Ok(left);
+        }
+        self.make_string(|heap| {
+            let (left, right) = (heap.string(a), heap.string(b));
+            let len = left
+                .len()
+                .checked_add(right.len())
+                .ok_or(AllocError::Limit)?;
+            let is_wide = left.is_wide() || right.is_wide();
+            let depth = left.depth().max(right.depth()) + 1;
+            if !is_wide
+                && len as usize <= INLINE_LATIN1_CAPACITY
+                && let (Some(left), Some(right)) = (left.as_latin1(), right.as_latin1())
+            {
+                let mut bytes = [0; INLINE_LATIN1_CAPACITY];
+                bytes[..left.len()].copy_from_slice(left);
+                bytes[left.len()..len as usize].copy_from_slice(right);
+                return JsString::from_latin1(&heap.ledger, &bytes[..len as usize]);
+            }
+            if depth > MAX_ROPE_DEPTH {
+                return JsString::from_units(
                     &heap.ledger,
                     len as usize,
                     is_wide,
-                    heap.string_units(left).chain(heap.string_units(right)),
-                )?,
-                _ => JsString::Rope {
-                    left,
-                    right,
-                    len,
-                    is_wide,
-                    depth,
-                },
-            };
-            heap.strings.insert(&heap.ledger, string)
-        })?;
-        self.root(Value::string(id))
+                    heap.string_units(a).chain(heap.string_units(b)),
+                );
+            }
+            Ok(JsString::Rope {
+                left: a,
+                right: b,
+                len,
+                is_wide,
+                depth,
+            })
+        })
     }
 
     pub fn flatten_string(&mut self, value: Handle<'s>) -> JsResult<()> {
@@ -480,7 +557,11 @@ impl<'s> ExecCtx<'_, 's> {
     }
 
     pub fn intern_str(&mut self, text: &str) -> JsResult<PropKey> {
-        if let Some(key) = AtomTable::builtin_key(text) {
+        let heap = self.heap();
+        if let Some(key) = heap.atoms.find_str(&heap.strings, text) {
+            if let Some(backing) = heap.dynamic_key_value(key) {
+                self.root(backing)?;
+            }
             return Ok(key);
         }
         let string = self.new_string(text)?;
@@ -707,5 +788,70 @@ mod tests {
     #[test]
     fn handles_are_four_bytes() {
         assert_eq!(size_of::<Handle<'_>>(), 4);
+    }
+
+    #[test]
+    fn long_string_slices_share_a_live_flat_base() {
+        let mut runtime = Runtime::new(crate::EngineLimits::default()).unwrap();
+        runtime.with_scope(runtime.default_realm(), |ctx| {
+            let (value, base) = ctx.with_scope(|ctx| {
+                let text = "0123456789".repeat(2048);
+                let source = ctx.new_string(&text).unwrap();
+                let ValueKind::String(base) = ctx.get(source).decode() else { unreachable!() };
+                let first = ctx.string_slice(source, 7, text.len() - 7).unwrap();
+                let second = ctx.string_slice(first, 8, text.len() - 22).unwrap();
+                (ctx.get(second), base)
+            });
+            let result = ctx.root(value).unwrap();
+            ctx.collect();
+            let ValueKind::String(id) = ctx.get(result).decode() else { unreachable!() };
+            assert!(matches!(ctx.heap().string(id), JsString::Slice { base: actual, start: 15, .. } if *actual == base));
+            assert_eq!(JsString::unit_at(&ctx.heap().strings, id, 0), Some(u16::from(b'5')));
+            assert_eq!(JsString::unit_at(&ctx.heap().strings, id, ctx.heap().string(id).len()), None);
+            assert!(ctx.heap().string_units(id).take(4).eq("5678".encode_utf16()));
+            let independent = ctx.string_slice(result, 2, 10).unwrap();
+            let ValueKind::String(id) = ctx.get(independent).decode() else { unreachable!() };
+            assert_eq!(ctx.heap().string(id).as_latin1(), Some(b"78901234".as_slice()));
+        });
+    }
+
+    #[test]
+    fn interning_live_text_does_not_allocate_another_string() {
+        let mut runtime = Runtime::new(crate::EngineLimits::default()).unwrap();
+        runtime.with_scope(runtime.default_realm(), |ctx| {
+            let key = ctx
+                .intern_str("name outside the builtin atom table")
+                .unwrap();
+            let count = ctx.heap().strings.len();
+            assert_eq!(
+                ctx.intern_str("name outside the builtin atom table")
+                    .unwrap(),
+                key
+            );
+            assert_eq!(ctx.heap().strings.len(), count);
+        });
+    }
+
+    #[test]
+    fn ascii_string_cache_is_weak_and_shared_by_constructors() {
+        let mut runtime = Runtime::new(crate::EngineLimits::default()).unwrap();
+        let realm = runtime.default_realm();
+        let before = runtime.with_scope(realm, |ctx| {
+            let text = ctx.new_string("\u{7}").unwrap();
+            ctx.collect();
+            let utf16 = ctx.new_utf16(&[7]).unwrap();
+            let latin1 = ctx.new_latin1(&[7]).unwrap();
+            let empty = ctx.new_utf16(&[]).unwrap();
+            let joined = ctx.concat_strings(empty, utf16).unwrap();
+            assert_eq!(ctx.get(utf16), ctx.get(text));
+            assert_eq!(ctx.get(latin1), ctx.get(text));
+            assert_eq!(ctx.get(joined), ctx.get(text));
+            ctx.get(text)
+        });
+        runtime.with_scope(realm, |ctx| {
+            ctx.collect();
+            let text = ctx.new_string("\u{7}").unwrap();
+            assert_ne!(ctx.get(text), before);
+        });
     }
 }

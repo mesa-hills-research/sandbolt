@@ -99,7 +99,11 @@ impl HashIndex {
         hash: u64,
         matches: impl FnMut(usize) -> bool,
     ) -> Option<usize> {
-        let mut hole = self.locate(hash, matches)?;
+        let hole = self.locate(hash, matches)?;
+        Some(self.remove_at(hole))
+    }
+
+    fn remove_at(&mut self, mut hole: usize) -> usize {
         let removed = self.buckets[hole].unwrap();
         let mask = self.buckets.len() - 1;
         let mut offset = (hole + 1) & mask;
@@ -114,7 +118,7 @@ impl HashIndex {
         }
         self.buckets[hole] = None;
         self.len -= 1;
-        Some(removed.row)
+        removed.row
     }
 }
 
@@ -156,16 +160,30 @@ impl OrderedCollection {
 
     pub(crate) fn hash(&self, heap: &Heap, key: Value) -> u64 {
         let mut hasher = self.seed.build_hasher();
-        let key = canonical_key(key);
         match key.decode() {
-            ValueKind::Int32(_) | ValueKind::Float64(_) => {
+            ValueKind::Int32(n) => {
                 0u8.hash(&mut hasher);
-                key.as_number().unwrap().to_bits().hash(&mut hasher);
+                f64::from(n).to_bits().hash(&mut hasher);
+            }
+            ValueKind::Float64(n) => {
+                0u8.hash(&mut hasher);
+                (if n == 0.0 { 0 } else { n.to_bits() }).hash(&mut hasher);
             }
             ValueKind::String(id) => {
                 1u8.hash(&mut hasher);
-                for unit in heap.string_units(id) {
-                    unit.hash(&mut hasher);
+                let string = heap.string(id);
+                if let Some(bytes) = string.as_latin1() {
+                    for &byte in bytes {
+                        hasher.write_u16(u16::from(byte));
+                    }
+                } else if let Some(units) = string.as_utf16() {
+                    for &unit in units {
+                        hasher.write_u16(unit);
+                    }
+                } else {
+                    for unit in heap.string_units(id) {
+                        hasher.write_u16(unit);
+                    }
                 }
             }
             ValueKind::ShortBigInt(n) => {
@@ -189,8 +207,13 @@ impl OrderedCollection {
     }
 
     pub(crate) fn locate(&self, heap: &Heap, key: Value, hash: u64) -> Option<usize> {
+        self.locate_bucket(heap, key, hash)
+            .map(|bucket| self.index.buckets[bucket].unwrap().row)
+    }
+
+    pub(crate) fn locate_bucket(&self, heap: &Heap, key: Value, hash: u64) -> Option<usize> {
         let key = canonical_key(key);
-        self.index.find(hash, |row| {
+        self.index.locate(hash, |row| {
             same_value_raw(heap, key, self.entries[row].pair.unwrap().0)
         })
     }
@@ -223,10 +246,8 @@ impl OrderedCollection {
         Ok(())
     }
 
-    pub(crate) fn remove(&mut self, hash: u64, row: usize) {
-        self.index
-            .remove(hash, |candidate| candidate == row)
-            .unwrap();
+    pub(crate) fn remove_bucket(&mut self, bucket: usize) {
+        let row = self.index.remove_at(bucket);
         self.entries[row].pair = None;
         if self.entries.len() - self.len() > self.len() {
             self.compact();

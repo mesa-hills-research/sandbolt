@@ -4,7 +4,8 @@ use crate::builtins::typed_atomics::{typed_array_get_index, typed_array_length};
 use crate::builtins::{configure_ctor, define_data, install_accessor, install_method};
 use crate::ledger::TrackedBox;
 use crate::object::{
-    HelperData, HelperOp, HelperState, IteratorData, IteratorKind, IteratorRecordData,
+    ARRAY_NEXT_OFFSET as ARRAY_NEXT, HelperData, HelperOp, HelperState, IteratorData, IteratorKind,
+    IteratorRecordData,
 };
 use crate::ops::convert::{to_number, to_object};
 use crate::ops::property::{get_own_property_descriptor, get_prototype_of, set_property};
@@ -36,7 +37,6 @@ const FOR_EACH: u16 = 18;
 const SOME: u16 = 19;
 const EVERY: u16 = 20;
 const FIND: u16 = 21;
-const ARRAY_NEXT: u16 = 22;
 const WRAP_NEXT: u16 = 23;
 const WRAP_RETURN: u16 = 24;
 const HELPER_NEXT: u16 = 25;
