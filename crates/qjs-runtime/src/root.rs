@@ -446,7 +446,10 @@ impl<'s> ExecCtx<'_, 's> {
             }
             return Ok(key);
         }
-        self.allocate(|runtime| runtime.heap.atoms.insert(&runtime.heap.ledger, id))
+        self.allocate(|runtime| {
+            let heap = &mut runtime.heap;
+            heap.atoms.insert(&heap.ledger, &heap.strings, id)
+        })
     }
 
     pub fn intern_str(&mut self, text: &str) -> JsResult<PropKey> {
