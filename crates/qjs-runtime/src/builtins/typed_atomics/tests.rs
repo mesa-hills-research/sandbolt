@@ -396,6 +396,68 @@ fn typed_array_methods_use_snapshot_lengths_and_live_elements() {
 }
 
 #[test]
+fn typed_slice_copies_overlapping_species_in_increasing_order() {
+    let mut rt = runtime();
+    rt.with_scope(rt.default_realm(), |ctx| {
+        let ctor = global(ctx, "Int32Array");
+        let a = [10, 20, 30, 40, 50, 60].map(|i| root(ctx, Value::int32(i)));
+        let ta = call_method(ctx, ctor, "of", &a);
+        let buf = get(ctx, ta, "buffer");
+        let byte_offset = root(ctx, number(8));
+        let dest = construct(ctx, "Int32Array", &[buf, byte_offset]);
+        let constants = ctx.args(&[dest]).unwrap();
+        let ctor = ctx
+            .new_bytecode(
+                &[MiniOp::Constant(0), MiniOp::Return],
+                constants,
+                Args::empty(),
+                true,
+            )
+            .unwrap();
+        let pair = ctx.new_object().unwrap();
+        let key = symbol(ctx, WellKnown::Species);
+        define_data(ctx, pair, key, ctor, PropFlags::DEFAULT_DATA).unwrap();
+        put(
+            ctx,
+            ta,
+            "constructor",
+            ctx.get(pair),
+            PropFlags::DEFAULT_DATA,
+        )
+        .unwrap();
+        let start = root(ctx, number(1));
+        let end = root(ctx, number(4));
+        let result = call_method(ctx, ta, "slice", &[start, end]);
+        assert_eq!(ctx.get(result), ctx.get(dest));
+        let output = invoke(ctx, result, "join", &[]).unwrap();
+        assert_eq!(text(ctx, output), "20,20,20,60");
+    });
+}
+
+#[test]
+fn same_type_copies_preserve_nan_payloads_but_loads_canonicalize() {
+    let mut rt = runtime();
+    rt.with_scope(rt.default_realm(), |ctx| {
+        let eight = root(ctx, number(8));
+        let buf = construct(ctx, "ArrayBuffer", &[eight]);
+        let view = construct(ctx, "DataView", &[buf]);
+        let nan = ctx.new_string("0xfff8000000001234").unwrap();
+        let zero = root(ctx, number(0));
+        let yes = root(ctx, Value::bool(true));
+        call_method(ctx, view, "setBigUint64", &[zero, nan, yes]);
+        let ta = construct(ctx, "Float64Array", &[buf]);
+        let copied = construct(ctx, "Float64Array", &[ta]);
+        for arr in [ta, copied] {
+            let id = ctx.object_id(arr).unwrap();
+            let raw = invoke(ctx, arr, "at", &[zero]).unwrap();
+            assert_eq!(raw.bits(), Value::number(f64::NAN).bits());
+            let info = typed::data(ctx.heap(), id).unwrap();
+            assert_eq!(typed::raw(ctx.heap(), info, 0), 0xfff8_0000_0000_1234);
+        }
+    });
+}
+
+#[test]
 fn base64_and_hex_enforce_alphabet_chunk_and_target_bounds() {
     let mut rt = runtime();
     rt.with_scope(rt.default_realm(), |ctx| {
