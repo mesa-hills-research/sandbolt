@@ -5,6 +5,10 @@ const TAG_BASE: u64 = 0xfff8_0000_0000_0000;
 const TAG_SHIFT: u32 = 47;
 const PAYLOAD_MASK: u64 = (1 << TAG_SHIFT) - 1;
 const INDEX_MASK: u64 = (1 << 31) - 1;
+const AUTO_NATIVE_BIT: u64 = 1 << 46;
+const AUTO_NATIVE_PREFIX: u64 = TAG_BASE | (5 << TAG_SHIFT) | AUTO_NATIVE_BIT;
+const AUTO_NATIVE_MASK: u64 = 0xffff_c000_0000_0000;
+pub(crate) const AUTO_NATIVE_MAX_REALM: u32 = (1 << 22) - 1;
 
 pub trait ArenaId: Copy + Eq + Hash + fmt::Debug {
     fn from_parts(index: u32, generation: u16) -> Self;
@@ -123,6 +127,32 @@ impl Value {
     }
     pub const fn accessor(value: AccId) -> Self {
         Self::tag(15, value.0)
+    }
+    /// Internal sentinel stored only in property slots for lazily materialized builtin methods.
+    pub(crate) const fn auto_native(fn_id: u16, length: u8, realm_index: u32) -> Option<Self> {
+        if realm_index > AUTO_NATIVE_MAX_REALM {
+            return None;
+        }
+        let payload = AUTO_NATIVE_BIT
+            | (fn_id as u64)
+            | ((length as u64) << 16)
+            | ((realm_index as u64) << 24);
+        Some(Self::tag(5, payload))
+    }
+    #[inline]
+    pub(crate) const fn is_auto_native(self) -> bool {
+        (self.0 & AUTO_NATIVE_MASK) == AUTO_NATIVE_PREFIX
+    }
+    #[inline]
+    pub(crate) const fn as_auto_native(self) -> Option<(u16, u8, u32)> {
+        if !self.is_auto_native() {
+            return None;
+        }
+        let payload = self.0 & (AUTO_NATIVE_BIT - 1);
+        let fn_id = (payload & 0xffff) as u16;
+        let length = ((payload >> 16) & 0xff) as u8;
+        let realm_index = (payload >> 24) as u32;
+        Some((fn_id, length, realm_index))
     }
     pub const fn bits(self) -> u64 {
         self.0
@@ -269,5 +299,25 @@ mod tests {
         }
         assert_eq!(Value::short_bigint(Value::SHORT_BIGINT_MIN - 1), None);
         assert_eq!(Value::short_bigint(Value::SHORT_BIGINT_MAX + 1), None);
+    }
+
+    #[test]
+    fn auto_native_sentinel_round_trip() {
+        assert!(!Value::EMPTY.is_auto_native());
+        assert_eq!(Value::EMPTY.as_auto_native(), None);
+        for &(fn_id, length, realm) in &[
+            (0u16, 0u8, 0u32),
+            (0x1000, 1, 0),
+            (0x1fff, 7, 1),
+            (u16::MAX, u8::MAX, AUTO_NATIVE_MAX_REALM),
+        ] {
+            let v = Value::auto_native(fn_id, length, realm).unwrap();
+            assert!(v.is_auto_native());
+            assert!(!v.is_number());
+            assert!(!v.is_gc());
+            assert_ne!(v, Value::EMPTY);
+            assert_eq!(v.as_auto_native(), Some((fn_id, length, realm)));
+        }
+        assert_eq!(Value::auto_native(0x1000, 0, AUTO_NATIVE_MAX_REALM + 1), None);
     }
 }

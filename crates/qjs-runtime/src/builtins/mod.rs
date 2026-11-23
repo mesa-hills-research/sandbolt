@@ -20,12 +20,15 @@ pub mod string_re;
 pub mod typed_atomics;
 pub mod vm_internal;
 
-use crate::atom::{Atom, PropKey};
-use crate::object::{ObjectData, ObjectFlags};
-use crate::ops::property::{PropertyDescriptor, define_own_property};
+use crate::atom::{Atom, AtomTable, KeyKind, PropKey};
+use crate::ledger::TrackedVec;
+use crate::object::{JsObject, NativeFunctionData, ObjectData, ObjectFlags};
+use crate::ops::property::{PropertyDescriptor, define_auto_native, define_own_property};
 use crate::realm::NativeFnId;
 use crate::root::{Args, ExecCtx, Handle};
 use crate::shape::PropFlags;
+use crate::string::JsString;
+use crate::symbol::SymbolDescription;
 use crate::value::{JsResult, ObjId, Value};
 
 pub const CORE_BASE: u16 = 0x1000;
@@ -56,14 +59,28 @@ fn stable_insertion_sort<T: Copy>(
 /// Installs all ECMAScript built-in constructors, prototypes, methods, and global
 /// properties onto `ctx.realm_id()`.
 pub fn install_all(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
-    core::install(ctx)?;
-    array_iter::install(ctx)?;
-    string_re::install(ctx)?;
-    num_date::install(ctx)?;
-    coll_weak::install(ctx)?;
-    typed_atomics::install(ctx)?;
-    promise_json_extras::install(ctx)?;
-    vm_internal::install(ctx)?;
+    ctx.runtime.heap.building_shapes = true;
+    let result = (|| {
+        core::install(ctx)?;
+        array_iter::install(ctx)?;
+        string_re::install(ctx)?;
+        num_date::install(ctx)?;
+        coll_weak::install(ctx)?;
+        typed_atomics::install(ctx)?;
+        promise_json_extras::install(ctx)?;
+        vm_internal::install(ctx)?;
+        Ok(())
+    })();
+    ctx.runtime.heap.finish_bootstrap_shapes();
+    result?;
+    ctx.allocate(|runtime| runtime.heap.ensure_bootstrap_lookups())?;
+    let realm = ctx.realm_id();
+    ctx.runtime
+        .heap
+        .realms
+        .get_mut(realm)
+        .unwrap()
+        .std_array_prototype_intact = true;
     Ok(())
 }
 
@@ -117,6 +134,24 @@ pub fn set_fn_metadata<'s>(
     Ok(())
 }
 
+fn alloc_fn_name(
+    heap: &mut crate::heap::Heap,
+    name: &str,
+    share_atom: bool,
+) -> crate::ledger::AllocResult<crate::value::StrId> {
+    let name_str = JsString::from_str(&heap.ledger, name)?;
+    let name_id = heap.strings.insert(&heap.ledger, name_str)?;
+    if share_atom && AtomTable::builtin_key(name).is_none() {
+        let key = heap.atoms.insert(&heap.ledger, &heap.strings, name_id)?;
+        if let KeyKind::String(atom) = key.decode()
+            && let Some(existing) = heap.atoms.dynamic_string(atom)
+        {
+            return Ok(existing);
+        }
+    }
+    Ok(name_id)
+}
+
 /// Creates a native function with standard `name` and `length` metadata.
 pub fn make_native_fn<'s>(
     ctx: &mut ExecCtx<'_, 's>,
@@ -125,9 +160,34 @@ pub fn make_native_fn<'s>(
     length: u32,
     is_constructor: bool,
 ) -> JsResult<Handle<'s>> {
-    let func = ctx.new_native(id, is_constructor)?;
-    set_fn_metadata(ctx, func, name, length)?;
-    Ok(func)
+    let realm = ctx.realm_id();
+    let flags = if is_constructor {
+        ObjectFlags::EXTENSIBLE | ObjectFlags::IS_CONSTRUCTOR
+    } else {
+        ObjectFlags::EXTENSIBLE
+    };
+    let obj = ctx.allocate(|runtime| {
+        let heap = &mut runtime.heap;
+        let name_id = alloc_fn_name(heap, name, is_constructor)?;
+        let shape = heap.realm(realm).native_fn_shape;
+        let mut props = TrackedVec::new();
+        props.try_reserve_exact(&heap.ledger, 2)?;
+        props.push_reserved(Value::int32(length as i32));
+        props.push_reserved(Value::string(name_id));
+        heap.objects.insert(
+            &heap.ledger,
+            JsObject {
+                shape,
+                props,
+                flags,
+                data: ObjectData::NativeFunction(NativeFunctionData {
+                    function: id,
+                    realm,
+                }),
+            },
+        )
+    })?;
+    ctx.root(Value::object(obj))
 }
 
 /// Updates an already-bootstrapped constructor object's `NativeFnId`, `name`, and `length`.
@@ -145,6 +205,34 @@ pub fn configure_ctor<'s>(
     }
     ctx.runtime.heap.objects.get_mut(ctor_id).unwrap().flags |= ObjectFlags::IS_CONSTRUCTOR;
     let ctor = ctx.root(Value::object(ctor_id))?;
+    let realm = ctx.realm_id();
+    let shape = ctx.heap().object(ctor_id).shape;
+    let ctor_shape = ctx.heap().realm(realm).ctor_shape;
+    let ctor_proto_shape = ctx.heap().realm(realm).ctor_proto_shape;
+    if shape == ctor_shape {
+        ctx.allocate(|runtime| {
+            let heap = &mut runtime.heap;
+            let name_id = alloc_fn_name(heap, name, true)?;
+            let obj = heap.objects.get_mut(ctor_id).unwrap();
+            obj.props[1] = Value::int32(length as i32);
+            obj.props[2] = Value::string(name_id);
+            Ok(())
+        })?;
+        return Ok(ctor);
+    }
+    if ctor_proto_shape == Some(shape) {
+        ctx.allocate(|runtime| {
+            let heap = &mut runtime.heap;
+            let name_id = alloc_fn_name(heap, name, true)?;
+            let obj = heap.objects.get_mut(ctor_id).unwrap();
+            obj.props.try_reserve_exact(&heap.ledger, 2)?;
+            obj.props.push_reserved(Value::int32(length as i32));
+            obj.props.push_reserved(Value::string(name_id));
+            obj.shape = ctor_shape;
+            Ok(())
+        })?;
+        return Ok(ctor);
+    }
     set_fn_metadata(ctx, ctor, name, length)?;
     Ok(ctor)
 }
@@ -168,6 +256,74 @@ pub fn define_data<'s>(
     Ok(())
 }
 
+fn name_matches_key(heap: &crate::heap::Heap, key: PropKey, name: &str) -> bool {
+    match key.decode() {
+        KeyKind::String(atom) => {
+            if let Some(text) = AtomTable::builtin(atom) {
+                text == name
+            } else if let Some(str_id) = heap.atoms.dynamic_string(atom) {
+                let mut units = heap.string_units(str_id);
+                name.encode_utf16().all(|u| units.next() == Some(u)) && units.next().is_none()
+            } else {
+                false
+            }
+        }
+        KeyKind::Symbol(token) => {
+            let Some(sym_id) = heap.symbol_registry.from_token(token) else {
+                return false;
+            };
+            match heap.symbols.get(sym_id).unwrap().description {
+                SymbolDescription::None => name.is_empty(),
+                SymbolDescription::WellKnown(wk) => {
+                    name.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+                        == Some(wk.description())
+                }
+                SymbolDescription::String(str_id) => {
+                    let Some(inner) = name.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+                    else {
+                        return false;
+                    };
+                    let mut units = heap.string_units(str_id);
+                    inner.encode_utf16().all(|u| units.next() == Some(u)) && units.next().is_none()
+                }
+            }
+        }
+        KeyKind::Index(_) => false,
+    }
+}
+
+/// Installs a method on `target` with explicit `PropFlags`, using lazy `AutoNative`
+/// storage when `target` is a normal object and the method name matches `key`.
+pub(crate) fn install_method_with_flags<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    target: Handle<'s>,
+    key: PropKey,
+    id: NativeFnId,
+    name: &str,
+    length: u32,
+    flags: PropFlags,
+) -> JsResult<()> {
+    let target_id = ctx.object_id(target)?;
+    let can_auto = {
+        let heap = ctx.heap();
+        let object = heap.object(target_id);
+        !matches!(
+            object.data,
+            ObjectData::Proxy(_) | ObjectData::TypedArray(_) | ObjectData::ModuleNamespace(_)
+        ) && key != PropKey::atom(Atom::LENGTH)
+            && heap.array_index(key).is_none()
+            && u8::try_from(length).is_ok()
+            && name_matches_key(heap, key, name)
+    };
+    if can_auto
+        && let Some(auto) = Value::auto_native(id.0, length as u8, ctx.realm_id().index())
+    {
+        return define_auto_native(ctx, target_id, key, flags, auto);
+    }
+    let func = make_native_fn(ctx, id, name, length, false)?;
+    define_data(ctx, target, key, func, flags)
+}
+
 /// Installs a non-enumerable writable+configurable method on `target`.
 pub fn install_method<'s>(
     ctx: &mut ExecCtx<'_, 's>,
@@ -177,12 +333,13 @@ pub fn install_method<'s>(
     name: &str,
     length: u32,
 ) -> JsResult<()> {
-    let func = make_native_fn(ctx, id, name, length, false)?;
-    define_data(
+    install_method_with_flags(
         ctx,
         target,
         key,
-        func,
+        id,
+        name,
+        length,
         PropFlags::WRITABLE | PropFlags::CONFIGURABLE,
     )
 }

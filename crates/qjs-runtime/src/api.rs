@@ -86,8 +86,8 @@ impl JsEngine {
         limits: EngineLimits,
         ledger: crate::ledger::HeapLedger,
     ) -> Result<Self, EngineError> {
-        let mut runtime =
-            Runtime::with_ledger(limits, ledger).map_err(|_| EngineError::OutOfMemory)?;
+        let mut runtime = Runtime::with_ledger_for_builtins(limits, ledger)
+            .map_err(|_| EngineError::OutOfMemory)?;
         let realm = runtime.default_realm();
         runtime
             .install_builtins(realm)
@@ -287,7 +287,10 @@ impl JsEngine {
 
 impl<'s> ExecCtx<'_, 's> {
     pub fn create_realm_with_builtins(&mut self) -> JsResult<RealmId> {
-        let realm = self.runtime.create_realm().map_err(|_| self.throw_oom())?;
+        let realm = self
+            .runtime
+            .create_realm_for_builtins()
+            .map_err(|_| self.throw_oom())?;
         let setup = (|| {
             self.runtime.install_builtins(realm)?;
             if self.runtime.vm.print_callback.is_some() {

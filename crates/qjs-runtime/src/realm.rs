@@ -34,11 +34,45 @@ pub(crate) struct EmergencyError {
 
 impl EmergencyError {
     fn new(heap: &mut Heap, proto: ObjId, kind: ErrorKind, text: &str) -> AllocResult<Self> {
-        let object = bootstrap_error(heap, proto, kind, text)?;
-        Ok(Self {
-            object,
-            shape: heap.object(object).shape,
-        })
+        let message = JsString::from_str(&heap.ledger, text)?;
+        let message = Value::string(heap.strings.insert(&heap.ledger, message)?);
+        let data = TrackedBox::new(
+            &heap.ledger,
+            ErrorData {
+                kind,
+                message,
+                stack: Value::UNDEFINED,
+                frames: TrackedVec::new(),
+            },
+        )?;
+        let shape = heap.shapes.insert(
+            &heap.ledger,
+            Shape::build(
+                &heap.ledger,
+                Some(proto),
+                1,
+                [ShapeProp {
+                    key: PropKey::atom(Atom::MESSAGE),
+                    flags: PropFlags::WRITABLE | PropFlags::CONFIGURABLE,
+                }]
+                .into_iter(),
+                0,
+                false,
+            )?,
+        )?;
+        let mut props = TrackedVec::new();
+        props.try_reserve_exact(&heap.ledger, 1)?;
+        props.push_reserved(message);
+        let object = heap.objects.insert(
+            &heap.ledger,
+            crate::object::JsObject {
+                shape,
+                props,
+                flags: ObjectFlags::EXTENSIBLE,
+                data: ObjectData::Error(data),
+            },
+        )?;
+        Ok(Self { object, shape })
     }
 
     pub(crate) fn prepare(self, heap: &mut Heap) -> Value {
@@ -94,6 +128,9 @@ macro_rules! intrinsics {
             pub time_origin_epoch_ms: f64,
             pub(crate) oom_error: EmergencyError,
             pub(crate) stack_error: EmergencyError,
+            pub(crate) native_fn_shape: ShapeId,
+            pub(crate) ctor_proto_shape: Option<ShapeId>,
+            pub(crate) ctor_shape: ShapeId,
         }
 
         impl Trace for Realm {
@@ -123,15 +160,62 @@ macro_rules! intrinsics {
                 self.error_prepare_stack.trace(tracer);
                 self.oom_error.trace(tracer);
                 self.stack_error.trace(tracer);
+                self.native_fn_shape.trace(tracer);
+                self.ctor_proto_shape.trace(tracer);
+                self.ctor_shape.trace(tracer);
             }
         }
 
-        fn bootstrap(heap: &mut Heap) -> AllocResult<RealmId> {
+        fn bootstrap(heap: &mut Heap, keep_building: bool) -> AllocResult<RealmId> {
             heap.realms.try_reserve_slot(&heap.ledger)?;
             let ordinary = ObjectFlags::EXTENSIBLE;
             let proto = ordinary | ObjectFlags::IS_PROTOTYPE;
             let $object = heap.insert_object(None, proto | ObjectFlags::IMMUTABLE_PROTO, ObjectData::Ordinary)?;
             let function_proto = heap.insert_object(Some($object), proto, ObjectData::Ordinary)?;
+            let native_fn_shape = heap.shapes.insert(
+                &heap.ledger,
+                Shape::build(
+                    &heap.ledger,
+                    Some(function_proto),
+                    2,
+                    [
+                        ShapeProp { key: PropKey::atom(Atom::LENGTH), flags: PropFlags::CONFIGURABLE },
+                        ShapeProp { key: PropKey::atom(Atom::NAME), flags: PropFlags::CONFIGURABLE },
+                    ].into_iter(),
+                    0,
+                    false,
+                )?,
+            )?;
+            let ctor_proto_shape = if keep_building {
+                None
+            } else {
+                Some(heap.shapes.insert(
+                    &heap.ledger,
+                    Shape::build(
+                        &heap.ledger,
+                        Some(function_proto),
+                        1,
+                        [ShapeProp { key: PropKey::atom(Atom::PROTOTYPE), flags: PropFlags::default() }].into_iter(),
+                        0,
+                        false,
+                    )?,
+                )?)
+            };
+            let ctor_shape = heap.shapes.insert(
+                &heap.ledger,
+                Shape::build(
+                    &heap.ledger,
+                    Some(function_proto),
+                    3,
+                    [
+                        ShapeProp { key: PropKey::atom(Atom::PROTOTYPE), flags: PropFlags::default() },
+                        ShapeProp { key: PropKey::atom(Atom::LENGTH), flags: PropFlags::CONFIGURABLE },
+                        ShapeProp { key: PropKey::atom(Atom::NAME), flags: PropFlags::CONFIGURABLE },
+                    ].into_iter(),
+                    0,
+                    false,
+                )?,
+            )?;
             let throw_type_error = heap.insert_object(Some(function_proto), ObjectFlags::default(), ObjectData::Ordinary)?;
             let global_object = heap.insert_object(Some($object), ordinary, ObjectData::Ordinary)?;
             $( let $proto = heap.insert_object(Some($parent), proto, ObjectData::Ordinary)?; )+
@@ -175,7 +259,10 @@ macro_rules! intrinsics {
                 time_origin_instant,
                 time_origin_epoch_ms,
                 oom_error, stack_error,
+                native_fn_shape, ctor_proto_shape, ctor_shape,
             });
+            let prev_building = heap.building_shapes;
+            heap.building_shapes = true;
             let constructors = (|| {
                 let data = native_payload(realm, NativeFnId::EMPTY);
                 heap.objects.get_mut(function_proto).unwrap().data = data;
@@ -189,9 +276,11 @@ macro_rules! intrinsics {
                 let array = heap.objects.get_mut($array).unwrap();
                 array.flags |= ObjectFlags::IS_EXOTIC | ObjectFlags::FAST_ARRAY;
                 array.data = ObjectData::Array(data);
-                let object_ctor = bootstrap_ctor(heap, realm, function_proto, $object)?;
-                let function_ctor = bootstrap_ctor(heap, realm, function_proto, function_proto)?;
-                $( let $ctor = bootstrap_ctor(heap, realm, function_proto, $proto)?; )+
+                let ctor_init_shape = ctor_proto_shape.unwrap_or(ctor_shape);
+                let init_empty = ctor_proto_shape.is_none().then_some(empty);
+                let object_ctor = bootstrap_ctor(heap, realm, ctor_init_shape, init_empty, $object)?;
+                let function_ctor = bootstrap_ctor(heap, realm, ctor_init_shape, init_empty, function_proto)?;
+                $( let $ctor = bootstrap_ctor(heap, realm, ctor_init_shape, init_empty, $proto)?; )+
                 let record = heap.realms.get_mut(realm).unwrap();
                 record.object_ctor = object_ctor;
                 record.function_ctor = function_ctor;
@@ -199,7 +288,17 @@ macro_rules! intrinsics {
                 bootstrap_methods(heap, realm)?;
                 Ok(())
             })();
+            if !keep_building && !prev_building {
+                heap.finish_bootstrap_shapes();
+            }
             if let Err(error) = constructors {
+                if keep_building && !prev_building {
+                    heap.finish_bootstrap_shapes();
+                }
+                heap.realms.remove(realm);
+                return Err(error);
+            }
+            if !keep_building && !prev_building && let Err(error) = heap.ensure_bootstrap_lookups() {
                 heap.realms.remove(realm);
                 return Err(error);
             }
@@ -253,21 +352,29 @@ impl Realm {
 fn bootstrap_ctor(
     heap: &mut Heap,
     realm: RealmId,
-    function_proto: ObjId,
+    ctor_init_shape: ShapeId,
+    empty_name: Option<Value>,
     instance_proto: ObjId,
 ) -> AllocResult<ObjId> {
     let payload = native_payload(realm, NativeFnId::UNIMPLEMENTED);
-    let ctor = heap.insert_object(
-        Some(function_proto),
-        ObjectFlags::EXTENSIBLE | ObjectFlags::IS_CONSTRUCTOR,
-        payload,
-    )?;
-    install_property(
-        heap,
-        ctor,
-        PropKey::atom(Atom::PROTOTYPE),
-        PropFlags::default(),
-        Value::object(instance_proto),
+    let mut props = TrackedVec::new();
+    if let Some(empty) = empty_name {
+        props.try_reserve_exact(&heap.ledger, 3)?;
+        props.push_reserved(Value::object(instance_proto));
+        props.push_reserved(Value::int32(0));
+        props.push_reserved(empty);
+    } else {
+        props.try_reserve_exact(&heap.ledger, 1)?;
+        props.push_reserved(Value::object(instance_proto));
+    }
+    let ctor = heap.objects.insert(
+        &heap.ledger,
+        crate::object::JsObject {
+            shape: ctor_init_shape,
+            props,
+            flags: ObjectFlags::EXTENSIBLE | ObjectFlags::IS_CONSTRUCTOR,
+            data: payload,
+        },
     )?;
     install_property(
         heap,
@@ -316,10 +423,15 @@ fn bootstrap_methods(heap: &mut Heap, realm: RealmId) -> AllocResult<()> {
         flags,
         Value::object(global),
     )?;
-    let mut method = |parent, key, id| {
-        let data = native_payload(realm, id);
-        let callee = heap.insert_object(Some(function), ObjectFlags::EXTENSIBLE, data)?;
-        install_property(heap, parent, key, flags, Value::object(callee))
+    let mut method = |parent, key, id: NativeFnId| {
+        let value = if let Some(auto) = Value::auto_native(id.0, 0, realm.index()) {
+            auto
+        } else {
+            let data = native_payload(realm, id);
+            let callee = heap.insert_object(Some(function), ObjectFlags::EXTENSIBLE, data)?;
+            Value::object(callee)
+        };
+        install_property(heap, parent, key, flags, value)
     };
     method(
         object,
@@ -347,15 +459,15 @@ fn bootstrap_methods(heap: &mut Heap, realm: RealmId) -> AllocResult<()> {
         .symbol_registry
         .well_known(crate::symbol::WellKnown::ToPrimitive);
     let key = heap.symbols.get(sym).unwrap().key();
-    let data = native_payload(realm, NativeFnId::WRAPPER_VALUE_OF);
-    let callee = heap.insert_object(Some(function), ObjectFlags::EXTENSIBLE, data)?;
-    install_property(
-        heap,
-        symbol,
-        key,
-        PropFlags::CONFIGURABLE,
-        Value::object(callee),
-    )?;
+    let to_prim_val =
+        if let Some(auto) = Value::auto_native(NativeFnId::WRAPPER_VALUE_OF.0, 0, realm.index()) {
+            auto
+        } else {
+            let data = native_payload(realm, NativeFnId::WRAPPER_VALUE_OF);
+            let callee = heap.insert_object(Some(function), ObjectFlags::EXTENSIBLE, data)?;
+            Value::object(callee)
+        };
+    install_property(heap, symbol, key, PropFlags::CONFIGURABLE, to_prim_val)?;
     let empty = heap
         .strings
         .insert(&heap.ledger, JsString::from_str(&heap.ledger, "")?)?;
@@ -390,34 +502,59 @@ fn install_property(
     value: Value,
 ) -> AllocResult<()> {
     let id = heap.object(object).shape;
+    let change = ShapeProp { key, flags };
+    if heap.shape(id).is_building() {
+        let ledger = heap.ledger.clone();
+        let shape = heap.shapes.get_mut(id).unwrap();
+        let obj = heap.objects.get_mut(object).unwrap();
+        return shape.push_building_prop(&ledger, &mut obj.props, change, value);
+    }
+    if heap.building_shapes {
+        let shape = heap.shape(id);
+        let next = Shape::build_building(
+            &heap.ledger,
+            shape.proto,
+            &shape.props,
+            Some(change),
+            shape.churn,
+        )?;
+        let new_id = heap.shapes.insert(&heap.ledger, next)?;
+        let obj = heap.objects.get_mut(object).unwrap();
+        obj.props.push(&heap.ledger, value)?;
+        obj.shape = new_id;
+        return Ok(());
+    }
     let shape = heap.shape(id);
-    let next = Shape::build(
-        &heap.ledger,
-        shape.proto,
-        shape.props.len() + 1,
-        shape
-            .props
-            .iter()
-            .copied()
-            .chain([ShapeProp { key, flags }]),
-        shape.churn,
-        shape.dictionary,
-    )?;
-    let new_id = heap.shapes.insert(&heap.ledger, next)?;
-    let object = heap.objects.get_mut(object).unwrap();
-    object.props.push(&heap.ledger, value)?;
-    object.shape = new_id;
+    let shared = !shape.is_mutable() && shape.props.len() < crate::shape::MAX_SHARED_SHAPE_PROPS;
+    let existing = if shared {
+        shape.find_transition(change, |target| heap.shapes.get_weak(target).is_some())
+    } else {
+        None
+    };
+    let new_id = if let Some(existing) = existing {
+        existing
+    } else {
+        let next = Shape::build(
+            &heap.ledger,
+            shape.proto,
+            shape.props.len() + 1,
+            shape.props.iter().copied().chain([change]),
+            shape.churn,
+            shape.is_dictionary(),
+        )?;
+        let new_id = heap.shapes.insert(&heap.ledger, next)?;
+        if shared {
+            heap.shapes
+                .get_mut(id)
+                .unwrap()
+                .add_transition(&heap.ledger, change, new_id)?;
+        }
+        new_id
+    };
+    let obj = heap.objects.get_mut(object).unwrap();
+    obj.props.push(&heap.ledger, value)?;
+    obj.shape = new_id;
     Ok(())
-}
-
-pub(crate) fn bootstrap_error(
-    heap: &mut Heap,
-    proto: ObjId,
-    kind: ErrorKind,
-    text: &str,
-) -> AllocResult<ObjId> {
-    let message = JsString::from_str(&heap.ledger, text)?;
-    bootstrap_error_message(heap, proto, kind, message)
 }
 
 pub(crate) fn bootstrap_error_message(
@@ -467,6 +604,21 @@ impl Runtime {
     }
 
     pub fn with_ledger(limits: EngineLimits, ledger: HeapLedger) -> AllocResult<Self> {
+        Self::with_ledger_inner(limits, ledger, false)
+    }
+
+    pub(crate) fn with_ledger_for_builtins(
+        limits: EngineLimits,
+        ledger: HeapLedger,
+    ) -> AllocResult<Self> {
+        Self::with_ledger_inner(limits, ledger, true)
+    }
+
+    fn with_ledger_inner(
+        limits: EngineLimits,
+        ledger: HeapLedger,
+        keep_building: bool,
+    ) -> AllocResult<Self> {
         let mut runtime = Self {
             heap: Heap::with_ledger(ledger)?,
             vm: VmState::new(limits),
@@ -480,11 +632,17 @@ impl Runtime {
             #[cfg(feature = "gc_stress")]
             stress_countdown: 1,
         };
-        runtime.create_realm()?;
-        runtime
+        runtime.create_realm_inner(keep_building)?;
+        if let Err(err) = runtime
             .vm
             .stack
-            .try_reserve_emergency(&runtime.heap.ledger, 8)?;
+            .try_reserve_emergency(&runtime.heap.ledger, 8)
+        {
+            if keep_building {
+                runtime.heap.finish_bootstrap_shapes();
+            }
+            return Err(err);
+        }
         Ok(runtime)
     }
 
@@ -517,9 +675,17 @@ impl Runtime {
     }
 
     pub fn create_realm(&mut self) -> AllocResult<RealmId> {
+        self.create_realm_inner(false)
+    }
+
+    pub(crate) fn create_realm_for_builtins(&mut self) -> AllocResult<RealmId> {
+        self.create_realm_inner(true)
+    }
+
+    fn create_realm_inner(&mut self, keep_building: bool) -> AllocResult<RealmId> {
         self.allocate(|runtime| {
             runtime.realms.try_reserve(&runtime.heap.ledger, 1)?;
-            let realm = bootstrap(&mut runtime.heap)?;
+            let realm = bootstrap(&mut runtime.heap, keep_building)?;
             runtime.realms.push_reserved(realm);
             Ok(realm)
         })

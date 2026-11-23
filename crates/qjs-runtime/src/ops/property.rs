@@ -1,9 +1,12 @@
 use crate::atom::{Atom, AtomTable, KeyKind, PropKey};
 use crate::heap::Heap;
 use crate::ledger::{TrackedBox, TrackedVec};
-use crate::object::{Accessor, ErrorKind, ObjectData, ObjectFlags, ProxyData};
+use crate::object::{
+    Accessor, ErrorKind, JsObject, NativeFunctionData, ObjectData, ObjectFlags, ProxyData,
+};
+use crate::realm::NativeFnId;
 use crate::root::{Args, ExecCtx, Handle};
-use crate::shape::{PropFlags, Shape, ShapeProp};
+use crate::shape::{LINEAR_LOOKUP_LIMIT, MAX_SHARED_SHAPE_PROPS, PropFlags, Shape, ShapeProp};
 use crate::string::JsString;
 use crate::symbol::SymbolDescription;
 use crate::value::*;
@@ -86,6 +89,123 @@ fn own(heap: &Heap, id: ObjId, key: PropKey) -> Option<(Value, PropFlags)> {
     }
     let (index, flags) = heap.shape(object.shape).find(key)?;
     Some((object.props[index], flags))
+}
+
+#[cold]
+fn materialize_auto_native(
+    ctx: &mut ExecCtx<'_, '_>,
+    obj_id: ObjId,
+    key: PropKey,
+    raw: Value,
+) -> JsResult<Value> {
+    let (fn_id_raw, length, realm_index) = raw.as_auto_native().expect("expected auto-native value");
+    ctx.with_scope(|ctx| {
+        ctx.root(Value::object(obj_id))?;
+        root_key(ctx, key)?;
+        let realm_id = ctx
+            .runtime
+            .realms
+            .iter()
+            .copied()
+            .find(|id| id.index() == realm_index)
+            .expect("missing auto-native realm");
+        ctx.allocate(|runtime| {
+            let heap = &mut runtime.heap;
+            let name_id = match key.decode() {
+                KeyKind::String(atom) => {
+                    if let Some(id) = heap.atoms.dynamic_string(atom) {
+                        id
+                    } else {
+                        let text = AtomTable::builtin(atom).expect("missing builtin atom");
+                        let s = JsString::from_str(&heap.ledger, text)?;
+                        heap.strings.insert(&heap.ledger, s)?
+                    }
+                }
+                KeyKind::Symbol(token) => {
+                    let sym_id = heap
+                        .symbol_registry
+                        .from_token(token)
+                        .expect("missing symbol");
+                    match heap.symbols.get(sym_id).unwrap().description {
+                        SymbolDescription::None => {
+                            let s = JsString::from_str(&heap.ledger, "")?;
+                            heap.strings.insert(&heap.ledger, s)?
+                        }
+                        SymbolDescription::WellKnown(wk) => {
+                            let desc = wk.description().as_bytes();
+                            let mut buf = [0u8; 64];
+                            debug_assert!(desc.len() + 2 <= buf.len());
+                            buf[0] = b'[';
+                            buf[1..1 + desc.len()].copy_from_slice(desc);
+                            buf[1 + desc.len()] = b']';
+                            let s = JsString::from_latin1(&heap.ledger, &buf[..desc.len() + 2])?;
+                            heap.strings.insert(&heap.ledger, s)?
+                        }
+                        SymbolDescription::String(str_id) => {
+                            let s = JsString::from_units(
+                                &heap.ledger,
+                                heap.string(str_id).len() as usize + 2,
+                                heap.string(str_id).is_wide(),
+                                std::iter::once(u16::from(b'['))
+                                    .chain(heap.string_units(str_id))
+                                    .chain(std::iter::once(u16::from(b']'))),
+                            )?;
+                            heap.strings.insert(&heap.ledger, s)?
+                        }
+                    }
+                }
+                KeyKind::Index(index) => {
+                    let text = index.to_string();
+                    let s = JsString::from_str(&heap.ledger, &text)?;
+                    heap.strings.insert(&heap.ledger, s)?
+                }
+            };
+            let shape = heap.realm(realm_id).native_fn_shape;
+            let mut props = TrackedVec::new();
+            props.try_reserve_exact(&heap.ledger, 2)?;
+            props.push_reserved(Value::int32(i32::from(length)));
+            props.push_reserved(Value::string(name_id));
+            let fn_obj = heap.objects.insert(
+                &heap.ledger,
+                JsObject {
+                    shape,
+                    props,
+                    flags: ObjectFlags::EXTENSIBLE,
+                    data: ObjectData::NativeFunction(NativeFunctionData {
+                        function: NativeFnId(fn_id_raw),
+                        realm: realm_id,
+                    }),
+                },
+            )?;
+            let value = Value::object(fn_obj);
+            let owner_shape = heap.object(obj_id).shape;
+            if let Some((slot, _)) = heap.shape(owner_shape).find(key) {
+                let slot_ref = &mut heap.objects.get_mut(obj_id).unwrap().props[slot];
+                if *slot_ref == raw {
+                    *slot_ref = value;
+                }
+            }
+            Ok(value)
+        })
+    })
+}
+
+pub(crate) fn define_auto_native(
+    ctx: &mut ExecCtx<'_, '_>,
+    id: ObjId,
+    key: PropKey,
+    flags: PropFlags,
+    auto: Value,
+) -> JsResult<()> {
+    ctx.with_scope(|ctx| {
+        ctx.root(Value::object(id))?;
+        root_key(ctx, key)?;
+        define_slot(ctx, id, ShapeProp { key, flags }, auto)?;
+        if !ctx.heap().building_shapes {
+            invalidate_array_prototypes(ctx, id);
+        }
+        Ok(())
+    })
 }
 
 fn describe(heap: &Heap, value: Value, flags: PropFlags) -> PropertyDescriptor {
@@ -251,7 +371,10 @@ fn own_descriptor(
         let value = crate::builtins::typed_atomics::typed_array_get_index(ctx, id, index.unwrap())?;
         return Ok(Some(PropertyDescriptor::data(value)));
     }
-    if let Some((value, flags)) = own(ctx.heap(), id, key) {
+    if let Some((mut value, flags)) = own(ctx.heap(), id, key) {
+        if value.is_auto_native() {
+            value = materialize_auto_native(ctx, id, key, value)?;
+        }
         let value = mapped_parameter(ctx.heap(), id, key)
             .map_or(value, |id| crate::vm::exec::read_ref(ctx, id));
         return Ok(Some(describe(ctx.heap(), value, flags)));
@@ -539,6 +662,9 @@ fn get_from<'s>(
             return read_string_property(ctx, string, index);
         }
         if let Some((value, _)) = own(ctx.heap(), id, key) {
+            if value.is_auto_native() {
+                return materialize_auto_native(ctx, id, key, value);
+            }
             if let ValueKind::Accessor(acc) = value.decode() {
                 if let Some(getter) = ctx.heap().accessors.get(acc).unwrap().getter {
                     let callee = ctx.root(Value::object(getter))?;
@@ -614,13 +740,73 @@ pub fn set_property_with_receiver<'s>(
     value: Handle<'s>,
     receiver: Handle<'s>,
 ) -> JsResult<bool> {
-    let object = ctx.object_id(object)?;
+    let id = ctx.object_id(object)?;
+    if ctx.get(receiver) == Value::object(id) {
+        let heap = ctx.heap();
+        let obj = heap.object(id);
+        if !obj.flags.contains(ObjectFlags::IS_EXOTIC)
+            && !matches!(obj.data, ObjectData::MappedArguments(_))
+            && !is_private(heap, key)
+        {
+            let shape = heap.shape(obj.shape);
+            if let Some((index, flags)) = shape.find(key) {
+                if !flags.contains(PropFlags::ACCESSOR) && flags.contains(PropFlags::WRITABLE) {
+                    let raw = ctx.get(value);
+                    let is_proto = obj.flags.contains(ObjectFlags::IS_PROTOTYPE);
+                    ctx.runtime.heap.objects.get_mut(id).unwrap().props[index] = raw;
+                    if is_proto {
+                        invalidate_array_prototypes(ctx, id);
+                    }
+                    return Ok(true);
+                }
+            } else if obj.flags.contains(ObjectFlags::EXTENSIBLE) {
+                let mut proto = shape.proto;
+                let mut clear_chain = true;
+                while let Some(parent_id) = proto {
+                    let parent = heap.object(parent_id);
+                    if parent.flags.contains(ObjectFlags::IS_EXOTIC)
+                        || matches!(parent.data, ObjectData::MappedArguments(_))
+                    {
+                        clear_chain = false;
+                        break;
+                    }
+                    let parent_shape = heap.shape(parent.shape);
+                    if parent_shape.find(key).is_some() {
+                        clear_chain = false;
+                        break;
+                    }
+                    proto = parent_shape.proto;
+                }
+                if clear_chain {
+                    let raw = ctx.get(value);
+                    let is_proto = obj.flags.contains(ObjectFlags::IS_PROTOTYPE);
+                    let needs_key_root = heap.dynamic_key_value(key).is_some();
+                    let prop = ShapeProp {
+                        key,
+                        flags: PropFlags::DEFAULT_DATA,
+                    };
+                    if needs_key_root {
+                        ctx.with_scope(|ctx| {
+                            root_key(ctx, key)?;
+                            define_new_slot(ctx, id, prop, raw)
+                        })?;
+                    } else {
+                        define_new_slot(ctx, id, prop, raw)?;
+                    }
+                    if is_proto {
+                        invalidate_array_prototypes(ctx, id);
+                    }
+                    return Ok(true);
+                }
+            }
+        }
+    }
     let value = ctx.get(value);
     let receiver = ctx.get(receiver);
     ctx.with_scope(|ctx| {
         let receiver = ctx.root(receiver)?;
         let value = ctx.root(value)?;
-        set_from(ctx, object, key, receiver, value)
+        set_from(ctx, id, key, receiver, value)
     })
 }
 
@@ -1120,13 +1306,23 @@ fn define_raw(
             return Ok(false);
         }
     }
-    let old = own(ctx.heap(), id, key);
+    let mut old = own(ctx.heap(), id, key);
     if old.is_none()
         && !is_private(ctx.heap(), key)
         && !object.flags.contains(ObjectFlags::EXTENSIBLE)
     {
         return Ok(false);
     }
+    if let Some((val, flags)) = old
+        && val.is_auto_native()
+        && (!flags.contains(PropFlags::CONFIGURABLE)
+            || (!desc.is_accessor() && desc.value.is_none()))
+    {
+        let materialized = materialize_auto_native(ctx, id, key, val)?;
+        old = Some((materialized, flags));
+    }
+    let extensible =
+        is_private(ctx.heap(), key) || ctx.heap().object(id).flags.contains(ObjectFlags::EXTENSIBLE);
     let parameter = mapped_parameter(ctx.heap(), id, key);
     let old_desc = old.map(|(val, flags)| {
         describe(
@@ -1135,12 +1331,7 @@ fn define_raw(
             flags,
         )
     });
-    if !compatible(
-        ctx.heap(),
-        is_private(ctx.heap(), key) || object.flags.contains(ObjectFlags::EXTENSIBLE),
-        desc,
-        old_desc,
-    ) {
+    if !compatible(ctx.heap(), extensible, desc, old_desc) {
         return Ok(false);
     }
     let previous = old_desc.unwrap_or_default();
@@ -1237,6 +1428,85 @@ fn define_raw(
     Ok(true)
 }
 
+fn define_new_slot(
+    ctx: &mut ExecCtx<'_, '_>,
+    id: ObjId,
+    change: ShapeProp,
+    value: Value,
+) -> JsResult<()> {
+    let old_shape = ctx.heap().object(id).shape;
+    if ctx.heap().shape(old_shape).is_dictionary() {
+        return ctx.allocate(|runtime| {
+            let heap = &mut runtime.heap;
+            let ledger = heap.ledger.clone();
+            let shape = heap.shapes.get_mut(old_shape).unwrap();
+            let object = heap.objects.get_mut(id).unwrap();
+            shape.dict_insert(&ledger, &mut object.props, change, value)
+        });
+    }
+    if ctx.heap().shape(old_shape).is_building() {
+        return ctx.allocate(|runtime| {
+            let heap = &mut runtime.heap;
+            let ledger = heap.ledger.clone();
+            let shape = heap.shapes.get_mut(old_shape).unwrap();
+            let object = heap.objects.get_mut(id).unwrap();
+            shape.push_building_prop(&ledger, &mut object.props, change, value)
+        });
+    }
+    if ctx.heap().building_shapes {
+        return ctx.allocate(|runtime| {
+            let heap = &mut runtime.heap;
+            let shape = heap.shape(old_shape);
+            let next = Shape::build_building(
+                &heap.ledger,
+                shape.proto,
+                &shape.props,
+                Some(change),
+                shape.churn,
+            )?;
+            let next = heap.shapes.insert(&heap.ledger, next)?;
+            let object = heap.objects.get_mut(id).unwrap();
+            object.props.push(&heap.ledger, value)?;
+            object.shape = next;
+            Ok(())
+        });
+    }
+    ctx.allocate(|runtime| {
+        let heap = &mut runtime.heap;
+        let shape = heap.shape(old_shape);
+        let shared = !shape.is_mutable() && shape.props.len() < MAX_SHARED_SHAPE_PROPS;
+        let existing = if shared {
+            shape.find_transition(change, |target| heap.shapes.get_weak(target).is_some())
+        } else {
+            None
+        };
+        let next = if let Some(existing) = existing {
+            existing
+        } else {
+            let next = Shape::build(
+                &heap.ledger,
+                shape.proto,
+                shape.props.len() + 1,
+                shape.props.iter().copied().chain([change]),
+                shape.churn,
+                false,
+            )?;
+            let next = heap.shapes.insert(&heap.ledger, next)?;
+            if shared {
+                heap.shapes
+                    .get_mut(old_shape)
+                    .unwrap()
+                    .add_transition(&heap.ledger, change, next)?;
+            }
+            next
+        };
+        let object = heap.objects.get_mut(id).unwrap();
+        object.props.push(&heap.ledger, value)?;
+        object.shape = next;
+        Ok(())
+    })
+}
+
 fn define_slot(
     ctx: &mut ExecCtx<'_, '_>,
     id: ObjId,
@@ -1245,63 +1515,55 @@ fn define_slot(
 ) -> JsResult<()> {
     let old_shape = ctx.heap().object(id).shape;
     let old = ctx.heap().shape(old_shape).find(change.key);
-    if let Some((index, flags)) = old
-        && flags == change.flags
-    {
+    let Some((index, flags)) = old else {
+        return define_new_slot(ctx, id, change, value);
+    };
+    if flags == change.flags {
         ctx.runtime.heap.objects.get_mut(id).unwrap().props[index] = value;
         return Ok(());
+    }
+    if ctx.heap().shape(old_shape).is_mutable() {
+        ctx.runtime.heap.shapes.get_mut(old_shape).unwrap().props[index].flags = change.flags;
+        ctx.runtime.heap.objects.get_mut(id).unwrap().props[index] = value;
+        return Ok(());
+    }
+    if ctx.heap().building_shapes {
+        return ctx.allocate(|runtime| {
+            let heap = &mut runtime.heap;
+            let shape = heap.shape(old_shape);
+            let mut next = Shape::build_building(
+                &heap.ledger,
+                shape.proto,
+                &shape.props,
+                None,
+                shape.churn,
+            )?;
+            next.props[index] = change;
+            let next = heap.shapes.insert(&heap.ledger, next)?;
+            let object = heap.objects.get_mut(id).unwrap();
+            object.props[index] = value;
+            object.shape = next;
+            Ok(())
+        });
     }
     ctx.allocate(|runtime| {
         let heap = &mut runtime.heap;
         let shape = heap.shape(old_shape);
-        let shared = !shape.dictionary && old.is_none() && shape.props.len() < 1024;
-        let existing = if shared {
-            shape.transitions.iter().find_map(|&(p, target)| {
-                (p == change && heap.shapes.get_weak(target).is_some()).then_some(target)
-            })
-        } else {
-            None
-        };
-        let next = if let Some(existing) = existing {
-            existing
-        } else {
-            let next = match old {
-                Some((index, _)) => Shape::build(
-                    &heap.ledger,
-                    shape.proto,
-                    shape.props.len(),
-                    shape
-                        .props
-                        .iter()
-                        .enumerate()
-                        .map(|(i, prop)| if i == index { change } else { *prop }),
-                    shape.churn.saturating_add(1),
-                    shape.dictionary,
-                )?,
-                None => Shape::build(
-                    &heap.ledger,
-                    shape.proto,
-                    shape.props.len() + 1,
-                    shape.props.iter().copied().chain([change]),
-                    shape.churn,
-                    shape.dictionary,
-                )?,
-            };
-            let next = heap.shapes.insert(&heap.ledger, next)?;
-            if shared {
-                heap.shapes
-                    .get_mut(old_shape)
-                    .unwrap()
-                    .transitions
-                    .push(&heap.ledger, (change, next))?;
-            }
-            next
-        };
+        let next = Shape::build(
+            &heap.ledger,
+            shape.proto,
+            shape.props.len(),
+            shape
+                .props
+                .iter()
+                .enumerate()
+                .map(|(i, prop)| if i == index { change } else { *prop }),
+            shape.churn.saturating_add(1),
+            false,
+        )?;
+        let next = heap.shapes.insert(&heap.ledger, next)?;
         let object = heap.objects.get_mut(id).unwrap();
-        match old {
-            Some((index, _)) => object.props[index] = value,
-            None => object.props.push(&heap.ledger, value)?,
-        }
+        object.props[index] = value;
         object.shape = next;
         Ok(())
     })
@@ -1323,15 +1585,14 @@ fn downgrade(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> JsResult<()> {
                 .enumerate()
                 .filter(|(_, val)| *val != Value::EMPTY)
         };
-        let count = indices().count() + shape.props.len();
+        let count = indices().count() + shape.live_count();
         let new_shape = Shape::build(
             &heap.ledger,
             shape.proto,
             count,
             shape
-                .props
-                .iter()
-                .copied()
+                .live_props()
+                .map(|(_, prop)| prop)
                 .chain(indices().map(|(i, _)| ShapeProp {
                     key: PropKey::index(i as u32).unwrap(),
                     flags: PropFlags::DEFAULT_DATA,
@@ -1341,10 +1602,9 @@ fn downgrade(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> JsResult<()> {
         )?;
         let mut props = TrackedVec::new();
         props.try_reserve_exact(&heap.ledger, count)?;
-        for value in object
-            .props
-            .iter()
-            .copied()
+        for value in shape
+            .live_props()
+            .map(|(i, _)| object.props[i])
             .chain(indices().map(|(_, val)| val))
         {
             props.push_reserved(value);
@@ -1392,7 +1652,7 @@ fn set_length(ctx: &mut ExecCtx<'_, '_>, id: ObjId, desc: PropertyDescriptor) ->
     if target < array.length && !object.flags.contains(ObjectFlags::FAST_ARRAY) {
         let old_shape = object.shape;
         let shape = ctx.heap().shape(old_shape);
-        for prop in shape.props.iter() {
+        for (_, prop) in shape.live_props() {
             if !prop.flags.contains(PropFlags::CONFIGURABLE)
                 && let Some(i) = ctx.heap().array_index(prop.key)
                 && i >= target
@@ -1404,25 +1664,28 @@ fn set_length(ctx: &mut ExecCtx<'_, '_>, id: ObjId, desc: PropertyDescriptor) ->
         ctx.allocate(|runtime| {
             let heap = &mut runtime.heap;
             let shape = heap.shape(old_shape);
-            let keep = |prop: &&ShapeProp| {
+            let keep = |prop: &ShapeProp| {
                 heap.array_index(prop.key)
                     .is_none_or(|index| index < target)
             };
-            let count = shape.props.iter().filter(keep).count();
-            if count == shape.props.len() {
+            let live = shape.live_count();
+            let count = shape.live_props().filter(|(_, p)| keep(p)).count();
+            if count == live {
                 return Ok(());
             }
             let next = Shape::build(
                 &heap.ledger,
                 shape.proto,
                 count,
-                shape.props.iter().filter(keep).copied(),
+                shape
+                    .live_props()
+                    .filter_map(|(_, p)| keep(&p).then_some(p)),
                 shape.churn.saturating_add(1),
-                shape.dictionary,
+                shape.is_dictionary(),
             )?;
             let mut props = TrackedVec::new();
             props.try_reserve_exact(&heap.ledger, count)?;
-            for (i, prop) in shape.props.iter().enumerate() {
+            for (i, prop) in shape.live_props() {
                 if keep(&prop) {
                     props.push_reserved(heap.object(id).props[i]);
                 }
@@ -1452,6 +1715,32 @@ pub fn delete_property<'s>(
     key: PropKey,
 ) -> JsResult<bool> {
     let id = ctx.object_id(object)?;
+    {
+        let heap = ctx.heap();
+        let obj = heap.object(id);
+        if !obj.flags.contains(ObjectFlags::IS_EXOTIC)
+            && !matches!(obj.data, ObjectData::MappedArguments(_))
+        {
+            let shape_id = obj.shape;
+            if heap.shape(shape_id).is_dictionary() {
+                let is_proto = obj.flags.contains(ObjectFlags::IS_PROTOTYPE);
+                let heap = &mut ctx.runtime.heap;
+                let ledger = heap.ledger.clone();
+                let shape = heap.shapes.get_mut(shape_id).unwrap();
+                let object = heap.objects.get_mut(id).unwrap();
+                return match shape.dict_delete_if_configurable(&ledger, &mut object.props, key) {
+                    Some(true) => {
+                        if is_proto {
+                            invalidate_array_prototypes(ctx, id);
+                        }
+                        Ok(true)
+                    }
+                    Some(false) => Ok(false),
+                    None => Ok(true),
+                };
+            }
+        }
+    }
     if is_proxy(ctx, id) && !is_private(ctx.heap(), key) {
         root_key(ctx, key)?;
         return proxy_operation(ctx, id, "deleteProperty", |ctx, target, handler, trap| {
@@ -1500,28 +1789,43 @@ pub fn delete_property<'s>(
         array.elements[index as usize] = Value::EMPTY;
     } else {
         let old_shape = object.shape;
-        let (index, _) = ctx.heap().shape(old_shape).find(key).unwrap();
-        ctx.allocate(|runtime| {
-            let heap = &mut runtime.heap;
-            let shape = heap.shape(old_shape);
-            let next = Shape::build(
-                &heap.ledger,
-                shape.proto,
-                shape.props.len() - 1,
-                shape
-                    .props
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, prop)| (i != index).then_some(*prop)),
-                shape.churn.saturating_add(1),
-                shape.dictionary,
-            )?;
-            let next = heap.shapes.insert(&heap.ledger, next)?;
+        if ctx.heap().shape(old_shape).is_dictionary() {
+            let heap = &mut ctx.runtime.heap;
+            let ledger = heap.ledger.clone();
+            let shape = heap.shapes.get_mut(old_shape).unwrap();
             let object = heap.objects.get_mut(id).unwrap();
-            object.props.remove(index);
-            object.shape = next;
-            Ok(())
-        })?;
+            shape.dict_delete(&ledger, &mut object.props, key);
+        } else if ctx.heap().shape(old_shape).is_building() {
+            let (index, _) = ctx.heap().shape(old_shape).find(key).unwrap();
+            let heap = &mut ctx.runtime.heap;
+            heap.shapes.get_mut(old_shape).unwrap().props.remove(index);
+            heap.objects.get_mut(id).unwrap().props.remove(index);
+        } else {
+            let (index, _) = ctx.heap().shape(old_shape).find(key).unwrap();
+            ctx.allocate(|runtime| {
+                let heap = &mut runtime.heap;
+                let shape = heap.shape(old_shape);
+                let churn = shape.churn.saturating_add(1);
+                let become_dict = shape.props.len() > LINEAR_LOOKUP_LIMIT || churn >= 4;
+                let next = Shape::build(
+                    &heap.ledger,
+                    shape.proto,
+                    shape.props.len() - 1,
+                    shape
+                        .props
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, prop)| (i != index).then_some(*prop)),
+                    churn,
+                    become_dict,
+                )?;
+                let next = heap.shapes.insert(&heap.ledger, next)?;
+                let object = heap.objects.get_mut(id).unwrap();
+                object.props.remove(index);
+                object.shape = next;
+                Ok(())
+            })?;
+        }
     }
     detach_parameter(ctx, id, key);
     invalidate_array_prototypes(ctx, id);
@@ -1545,16 +1849,15 @@ pub fn own_property_keys<'s>(
             for &(key, _) in module.namespace_bindings.iter() {
                 keys.push(&heap.ledger, key)?;
             }
-            for prop in shape.props.iter() {
+            for (_, prop) in shape.live_props() {
                 keys.push(&heap.ledger, prop.key)?;
             }
             return Ok(keys);
         }
         let entries = || {
             shape
-                .props
-                .iter()
-                .map(|p| p.key)
+                .live_props()
+                .map(|(_, p)| p.key)
                 .filter(|&key| !is_private(heap, key))
         };
         let string = if let ObjectData::StringObject(data) = &object.data {
@@ -1699,21 +2002,35 @@ pub fn set_prototype_of<'s>(
     invalidate_array_prototypes(ctx, id);
     ctx.allocate(|runtime| {
         let heap = &mut runtime.heap;
-        let shape = heap.shape(shape_id);
-        let next = if shape.props.is_empty() {
-            heap.empty_shape(proto)?
+        if heap.shape(shape_id).is_mutable() {
+            heap.shapes.get_mut(shape_id).unwrap().proto = proto;
         } else {
-            let next = Shape::build(
-                &heap.ledger,
-                proto,
-                shape.props.len(),
-                shape.props.iter().copied(),
-                shape.churn,
-                shape.dictionary,
-            )?;
-            heap.shapes.insert(&heap.ledger, next)?
-        };
-        heap.objects.get_mut(id).unwrap().shape = next;
+            let shape = heap.shape(shape_id);
+            let count = shape.live_count();
+            let next = if count == 0 {
+                heap.empty_shape(proto)?
+            } else if heap.building_shapes {
+                let next = Shape::build_building(
+                    &heap.ledger,
+                    proto,
+                    &shape.props,
+                    None,
+                    shape.churn,
+                )?;
+                heap.shapes.insert(&heap.ledger, next)?
+            } else {
+                let next = Shape::build(
+                    &heap.ledger,
+                    proto,
+                    count,
+                    shape.live_props().map(|(_, prop)| prop),
+                    shape.churn,
+                    false,
+                )?;
+                heap.shapes.insert(&heap.ledger, next)?
+            };
+            heap.objects.get_mut(id).unwrap().shape = next;
+        }
         if let Some(proto) = proto {
             heap.objects.get_mut(proto).unwrap().flags |= ObjectFlags::IS_PROTOTYPE;
         }

@@ -69,6 +69,7 @@ pub struct Heap {
     pub(crate) kept_objects: TrackedVec<WeakKey>,
     pub(crate) collections: usize,
     empty_shapes: EmptyShapeCache,
+    pub(crate) building_shapes: bool,
 }
 
 impl Heap {
@@ -97,6 +98,7 @@ impl Heap {
             kept_objects: TrackedVec::new(),
             collections: 0,
             empty_shapes: EmptyShapeCache::default(),
+            building_shapes: false,
         };
         for symbol in WellKnown::ALL {
             heap.symbol_registry.insert(
@@ -209,6 +211,32 @@ impl Heap {
                 data,
             },
         )
+    }
+
+    pub(crate) fn finish_bootstrap_shapes(&mut self) {
+        self.building_shapes = false;
+        let ledger = self.ledger.clone();
+        self.shapes
+            .for_each_live_mut(|shape, _| shape.clear_building(&ledger));
+        self.objects.for_each_live_mut(|object, _| {
+            object.props.shrink_to(&ledger, object.props.len());
+        });
+    }
+
+    pub(crate) fn ensure_bootstrap_lookups(&mut self) -> AllocResult<()> {
+        let ledger = self.ledger.clone();
+        let mut error = None;
+        self.shapes.for_each_live_mut(|shape, _| {
+            if error.is_none()
+                && let Err(err) = shape.ensure_lookup(&ledger)
+            {
+                error = Some(err);
+            }
+        });
+        match error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn dynamic_key_value(&self, key: PropKey) -> Option<Value> {

@@ -109,13 +109,23 @@ pub(super) fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
         ],
     )?;
     let key = symbol_key(ctx, WellKnown::ToPrimitive);
-    let function = make_native_fn(ctx, id(TO_PRIMITIVE), "[Symbol.toPrimitive]", 1, false)?;
-    define_data(ctx, proto, key, function, PropFlags::CONFIGURABLE)?;
+    crate::builtins::install_method_with_flags(
+        ctx,
+        proto,
+        key,
+        id(TO_PRIMITIVE),
+        "[Symbol.toPrimitive]",
+        1,
+        PropFlags::CONFIGURABLE,
+    )?;
     for (i, &(name, _, _, _)) in FORMATS.iter().enumerate() {
-        let function = make_native_fn(ctx, id(FORMAT + i as u16), name, 0, false)?;
-        define(ctx, proto, name, function, mutable())?;
         if i == 0 {
+            let function = make_native_fn(ctx, id(FORMAT), name, 0, false)?;
+            define(ctx, proto, name, function, mutable())?;
             define(ctx, proto, "toGMTString", function, mutable())?;
+        } else {
+            let key = ctx.intern_str(name)?;
+            crate::builtins::install_method(ctx, proto, key, id(FORMAT + i as u16), name, 0)?;
         }
     }
     for (i, &(local, utc)) in GETTERS.iter().enumerate() {

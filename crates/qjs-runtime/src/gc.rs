@@ -245,7 +245,7 @@ impl Runtime {
             });
         }
         heap.shapes
-            .for_each_live_mut(|shape, shapes| shape.transitions.retain(|(_, id)| shapes(*id)));
+            .for_each_live_mut(|shape, shapes| shape.retain_transitions(shapes));
 
         let mut slack = 0;
         macro_rules! shrink_all {

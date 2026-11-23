@@ -73,6 +73,7 @@ pub(super) fn own_slot(
         && entry.shape == object.shape
         && heap.shapes.get_weak(entry.shape).is_some()
         && (!writing || entry.flags.contains(PropFlags::WRITABLE))
+        && (writing || !object.props[entry.slot as usize].is_auto_native())
         && match name {
             Key::ResolvedRef(str) => entry.key == Value::string(str),
             _ => true,
@@ -124,8 +125,15 @@ fn fill(
         Key::ResolvedRef(str) => (heap.atoms.find(&heap.strings, str)?, Value::string(str)),
     };
     let object = heap.object(id);
-    let (slot, flags) = heap.shapes.get_weak(object.shape)?.find(key)?;
-    if flags.contains(PropFlags::ACCESSOR) || (writing && !flags.contains(PropFlags::WRITABLE)) {
+    let shape = heap.shapes.get_weak(object.shape)?;
+    if shape.is_mutable() {
+        return None;
+    }
+    let (slot, flags) = shape.find(key)?;
+    if flags.contains(PropFlags::ACCESSOR)
+        || (writing && !flags.contains(PropFlags::WRITABLE))
+        || (!writing && object.props[slot].is_auto_native())
+    {
         return None;
     }
     let entry = InlineCache {

@@ -862,11 +862,97 @@ fn collection_prunes_weak_atoms_and_shape_transitions() {
             let id = ctx.object_id(object).unwrap();
             (atom, ctx.heap().object(id).shape)
         });
-        assert_eq!(ctx.heap().shape(base).transitions.len(), 1);
+        assert_eq!(ctx.heap().shape(base).transitions_len(), 1);
         assert!(ctx.heap().atoms.dynamic_string(atom).is_some());
         ctx.collect();
-        assert!(ctx.heap().shape(base).transitions.is_empty());
+        assert_eq!(ctx.heap().shape(base).transitions_len(), 0);
         assert!(ctx.heap().shapes.get_weak(evolved).is_none());
         assert!(ctx.heap().atoms.dynamic_string(atom).is_none());
     });
+}
+
+#[test]
+fn lazy_auto_native_methods_materialize_once_in_owner_realm() {
+    let mut engine = crate::api::JsEngine::new(EngineLimits::default()).unwrap();
+    let count_auto_natives = |rt: &Runtime| -> usize {
+        rt.heap
+            .objects
+            .iter()
+            .flat_map(|(_, obj)| obj.props.iter())
+            .filter(|v| v.is_auto_native())
+            .count()
+    };
+    let initial_lazy = count_auto_natives(engine.runtime());
+    assert!(
+        initial_lazy > 300,
+        "expected >300 lazy builtin methods, got {initial_lazy}"
+    );
+
+    // Key enumeration and `in` checks should not eagerly materialize builtin methods.
+    engine
+        .eval(
+            "const before = Object.getOwnPropertyNames(Math).length;\n\
+             const hasSin = 'sin' in Math;\n\
+             if (!(before > 10 && hasSin)) throw new Error('expected Math keys');",
+            crate::api::EvalOptions::default(),
+        )
+        .unwrap();
+    assert!(count_auto_natives(engine.runtime()) >= initial_lazy - 5);
+
+    // First property read / partial defineProperty materializes once with exact metadata.
+    engine
+        .eval(
+            "const a = Math.sin;\n\
+             const b = Math.sin;\n\
+             Object.defineProperty(Math, 'cos', { enumerable: true });\n\
+             const desc = Object.getOwnPropertyDescriptor(Math, 'cos');\n\
+             if (!(a === b && a.name === 'sin' && a.length === 1\n\
+               && typeof desc.value === 'function' && desc.value.name === 'cos'\n\
+               && desc.value.length === 1 && desc.enumerable === true)) {\n\
+               throw new Error('auto-native metadata mismatch');\n\
+             }",
+            crate::api::EvalOptions::default(),
+        )
+        .unwrap();
+
+    // Cross-realm materialization uses the owning realm's Function.prototype.
+    let default_realm = engine.default_realm();
+    let other_realm = engine
+        .runtime_mut()
+        .with_scope(default_realm, |ctx| ctx.create_realm_with_builtins())
+        .unwrap();
+    let other_global = engine.runtime().heap().realm(other_realm).global_object;
+    let other_fn_proto = engine.runtime().heap().realm(other_realm).function_proto;
+    let same_proto = engine.runtime_mut().with_scope(default_realm, |ctx| {
+            let other = ctx.root(Value::object(other_global)).unwrap();
+            let math_key = ctx.intern_str("Math").unwrap();
+            let math = get_property(ctx, other, math_key).unwrap();
+            let math = ctx.root(math).unwrap();
+            let sin_key = ctx.intern_str("sin").unwrap();
+            let sin = get_property(ctx, math, sin_key).unwrap();
+            let sin_id = sin.as_object().unwrap();
+            ctx.heap().shape(ctx.heap().object(sin_id).shape).proto == Some(other_fn_proto)
+        });
+    assert!(same_proto);
+}
+
+#[test]
+fn dictionary_shapes_preserve_key_order_across_in_place_deletes_and_reinsertion() {
+    let mut engine = crate::api::JsEngine::new(EngineLimits::default()).unwrap();
+    engine
+        .eval(
+            "const obj = {};\n\
+             for (let i = 0; i < 200; i++) obj['k' + i] = i;\n\
+             for (let i = 0; i < 180; i++) delete obj['k' + i];\n\
+             obj.k5 = 500;\n\
+             obj.k0 = 999;\n\
+             const keys = Object.keys(obj);\n\
+             if (!(keys.length === 22 && keys[0] === 'k180' && keys[19] === 'k199'\n\
+               && keys[20] === 'k5' && keys[21] === 'k0'\n\
+               && obj.k5 === 500 && obj.k0 === 999 && obj.k1 === undefined)) {\n\
+               throw new Error('dictionary key order mismatch');\n\
+             }",
+            crate::api::EvalOptions::default(),
+        )
+        .unwrap();
 }

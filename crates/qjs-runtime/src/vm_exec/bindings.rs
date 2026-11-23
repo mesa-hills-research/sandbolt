@@ -293,7 +293,8 @@ fn global_data_slot(
     let object = ctx.heap().object(id);
     let (index, flags) = ctx.heap().shape(object.shape).find(key)?;
     let value = object.props[index];
-    (!matches!(value.decode(), ValueKind::Accessor(_))).then_some((id, index, value, flags))
+    (!matches!(value.decode(), ValueKind::Accessor(_)) && !value.is_auto_native())
+        .then_some((id, index, value, flags))
 }
 
 fn read_binding<'s>(

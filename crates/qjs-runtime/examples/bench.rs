@@ -155,7 +155,7 @@ fn print_memory_breakdown(label: &str, engine: &JsEngine) {
         } else if shape.props.len() <= 4 {
             shape_small += 1;
         }
-        if shape.dictionary {
+        if shape.is_dictionary() {
             shape_dict += 1;
         }
     }
