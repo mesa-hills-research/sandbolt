@@ -142,6 +142,26 @@ fn stack_hooks_keep_the_original_error_and_respect_the_limit() {
 }
 
 #[test]
+fn interrupt_during_stack_preparation_escapes_javascript_handlers() {
+    use std::{cell::Cell, rc::Rc};
+
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let interrupt = Rc::new(Cell::new(false));
+    engine.set_print_callback(Box::new({
+        let interrupt = interrupt.clone();
+        move |_| interrupt.set(true)
+    }));
+    engine.set_interrupt_handler(Some(Box::new(move || interrupt.replace(false))));
+    let result = engine.eval(
+        "Error.prepareStackTrace = () => { print('interrupt'); while (true) {} };
+         try { noSuchGlobal; } catch {}",
+        EvalOptions::default(),
+    );
+    assert_eq!(result, Err(EngineError::Interrupted));
+    assert!(engine.runtime_mut().pending_exception().is_none());
+}
+
+#[test]
 fn captured_stack_filters_frames_and_honors_own_stack() {
     assert_eq!(
         run(r#"

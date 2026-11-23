@@ -135,7 +135,9 @@ fn build_stack(
     let thrown_frames = std::mem::take(&mut ctx.runtime.vm.thrown_frames);
     let result = build_stack_inner(ctx, target, skip, parse, save_frames);
     ctx.take_exception();
-    if let Some((value, oom)) = pending {
+    if result != Err(Abrupt::Interrupted)
+        && let Some((value, oom)) = pending
+    {
         ctx.throw_value(value, oom);
     }
     ctx.runtime.vm.stack_capture = None;
@@ -497,21 +499,21 @@ pub(crate) fn capture_frames(ctx: &ExecCtx<'_, '_>) -> Vec<crate::Frame> {
         .collect()
 }
 
-pub(crate) fn capture_throw(ctx: &mut ExecCtx<'_, '_>) {
+pub(crate) fn capture_throw(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
     if ctx.runtime.vm.stack_capture.is_some() {
-        return;
+        return Ok(());
     }
     if ctx.runtime.vm.thrown_frames.is_empty() {
         ctx.runtime.vm.thrown_frames = capture_frames(ctx);
     }
     let Some(value) = ctx.pending_exception().filter(|_| !ctx.is_oom()) else {
-        return;
+        return Ok(());
     };
-    let Some(id) = value.as_object() else { return };
+    let Some(id) = value.as_object() else {
+        return Ok(());
+    };
     match &ctx.heap().object(id).data {
-        ObjectData::Error(_) => {
-            let _ = save_error_data(ctx, value, 0, None);
-        }
+        ObjectData::Error(_) => save_error_data(ctx, value, 0, None)?,
         ObjectData::DomException(_) => {
             let _ = ctx.with_scope(|ctx| {
                 let root = ctx.root(value)?;
@@ -521,4 +523,5 @@ pub(crate) fn capture_throw(ctx: &mut ExecCtx<'_, '_>) {
         }
         _ => {}
     }
+    Ok(())
 }
