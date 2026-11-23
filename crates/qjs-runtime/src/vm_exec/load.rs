@@ -93,6 +93,7 @@ pub(super) fn load_functions(
                     constants,
                     compiled: Some(CompiledFunc {
                         code: TrackedVec::from_slice(ledger, &function.code)?,
+                        inline_caches: super::cache::slots(ledger, &function.code)?,
                         atoms: TrackedVec::from_slice(ledger, &atoms)?,
                         name,
                         flags: function.flags,

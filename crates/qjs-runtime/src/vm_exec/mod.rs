@@ -1,4 +1,5 @@
 mod bindings;
+mod cache;
 pub(crate) mod coroutines;
 pub(crate) mod eval;
 mod iterators;
@@ -80,13 +81,22 @@ pub(super) fn well_known(ctx: &ExecCtx<'_, '_>, symbol: crate::symbol::WellKnown
 }
 
 fn key(ctx: &ExecCtx<'_, '_>, code: BcId, atom: qjs_bytecode::UnitAtom) -> PropKey {
+    compiled_key(ctx.heap(), compiled(ctx, code), atom)
+}
+
+fn compiled_key(
+    heap: &crate::heap::Heap,
+    function: &CompiledFunc,
+    atom: qjs_bytecode::UnitAtom,
+) -> PropKey {
     let index = atom
         .raw()
         .wrapping_sub(qjs_bytecode::BuiltinAtom::SymbolToPrimitive as u32) as usize;
-    if let Some(symbol) = crate::symbol::WellKnown::ALL.get(index) {
-        well_known(ctx, *symbol)
+    if let Some(&symbol) = crate::symbol::WellKnown::ALL.get(index) {
+        let id = heap.symbol_registry.well_known(symbol);
+        heap.symbols.get(id).unwrap().key()
     } else {
-        compiled(ctx, code).key(atom)
+        function.key(atom)
     }
 }
 
@@ -331,6 +341,172 @@ pub(crate) fn run_frame(
                 Lnot => {
                     stack[tail - 1] =
                         Value::bool(!convert::to_boolean_value(heap, stack[tail - 1]));
+                }
+                GetField | GetField2 | PutField => {
+                    let writing = op == PutField;
+                    let object_slot = tail - 1 - usize::from(writing);
+                    let Some(id) = stack[object_slot].as_object() else {
+                        break (at, op);
+                    };
+                    let name = cache::Key::Field(qjs_bytecode::UnitAtom(u32()));
+                    let Some(entry) = cache::own_slot(
+                        heap,
+                        function,
+                        at,
+                        id,
+                        writing,
+                        (0, name),
+                        (&[], frame.realm),
+                    ) else {
+                        break (at, op);
+                    };
+                    let slot = entry.slot as usize;
+                    match op {
+                        PutField => {
+                            heap.objects.get_mut(id).unwrap().props[slot] = stack[tail - 1];
+                            stack.truncate(tail - 2);
+                        }
+                        GetField2 => stack.push_reserved(heap.object(id).props[slot]),
+                        _ => stack[object_slot] = heap.object(id).props[slot],
+                    }
+                }
+                GetVar | GetVarUndef | PutVar | MakeVarRef => {
+                    if function.eval.is_some() {
+                        break (at, op);
+                    }
+                    let id = heap.realm(frame.realm).global_object;
+                    let atom = qjs_bytecode::UnitAtom(u32());
+                    let name = if op == MakeVarRef {
+                        cache::Key::GlobalRef(atom)
+                    } else {
+                        cache::Key::Global(atom)
+                    };
+                    let Some(entry) = cache::own_slot(
+                        heap,
+                        function,
+                        at,
+                        id,
+                        op == PutVar,
+                        (vm.global_lexical_epoch, name),
+                        (&ctx.runtime.modules, frame.realm),
+                    ) else {
+                        break (at, op);
+                    };
+                    let slot = entry.slot as usize;
+                    match op {
+                        PutVar => {
+                            heap.objects.get_mut(id).unwrap().props[slot] = stack.pop().unwrap()
+                        }
+                        MakeVarRef => {
+                            stack.push_reserved(Value::object(id));
+                            stack.push_reserved(entry.key);
+                        }
+                        _ => stack.push_reserved(heap.object(id).props[slot]),
+                    }
+                }
+                GetRefValue | PutRefValue => {
+                    let writing = op == PutRefValue;
+                    let source = tail - 2 - usize::from(writing);
+                    let global = heap.realm(frame.realm).global_object;
+                    if stack[source] != Value::object(global) {
+                        break (at, op);
+                    }
+                    let ValueKind::String(str) = stack[source + 1].decode() else {
+                        break (at, op);
+                    };
+                    let Some(entry) = cache::own_slot(
+                        heap,
+                        function,
+                        at,
+                        global,
+                        writing,
+                        (0, cache::Key::ResolvedRef(str)),
+                        (&[], frame.realm),
+                    ) else {
+                        break (at, op);
+                    };
+                    let slot = entry.slot as usize;
+                    if writing {
+                        heap.objects.get_mut(global).unwrap().props[slot] = stack[tail - 1];
+                        stack.truncate(source);
+                    } else {
+                        stack.push_reserved(heap.object(global).props[slot]);
+                    }
+                }
+                GetArrayEl | GetArrayEl2 | PutArrayEl => {
+                    let writing = op == PutArrayEl;
+                    let object_slot = tail - 2 - usize::from(writing);
+                    let Some(id) = stack[object_slot].as_object() else {
+                        break (at, op);
+                    };
+                    let ValueKind::Int32(index) = stack[object_slot + 1].decode() else {
+                        break (at, op);
+                    };
+                    let Ok(index) = usize::try_from(index) else {
+                        break (at, op);
+                    };
+                    let object = heap.object(id);
+                    if writing {
+                        let value = stack[tail - 1];
+                        match &object.data {
+                            ObjectData::Array(array)
+                                if object.flags.contains(
+                                    ObjectFlags::FAST_ARRAY | ObjectFlags::EXTENSIBLE,
+                                ) && !object.flags.contains(ObjectFlags::IS_PROTOTYPE)
+                                    && array
+                                        .elements
+                                        .get(index)
+                                        .is_some_and(|&v| v != Value::EMPTY) =>
+                            {
+                                let ObjectData::Array(array) =
+                                    &mut heap.objects.get_mut(id).unwrap().data
+                                else {
+                                    unreachable!()
+                                };
+                                array.elements[index] = value;
+                            }
+                            ObjectData::TypedArray(view) => {
+                                let view = **view;
+                                if crate::builtins::typed_atomics::fast_typed_array_set(
+                                    &mut heap.objects,
+                                    view,
+                                    index,
+                                    value,
+                                )
+                                .is_none()
+                                {
+                                    break (at, op);
+                                }
+                            }
+                            _ => break (at, op),
+                        }
+                        stack.truncate(object_slot);
+                    } else {
+                        let value = match &object.data {
+                            ObjectData::Array(array)
+                                if object.flags.contains(ObjectFlags::FAST_ARRAY) =>
+                            {
+                                array
+                                    .elements
+                                    .get(index)
+                                    .copied()
+                                    .filter(|&v| v != Value::EMPTY)
+                            }
+                            ObjectData::TypedArray(view) => {
+                                crate::builtins::typed_atomics::fast_typed_array_get(
+                                    heap, **view, index,
+                                )
+                            }
+                            _ => None,
+                        };
+                        let Some(value) = value else { break (at, op) };
+                        if op == GetArrayEl2 {
+                            stack[tail - 1] = value;
+                        } else {
+                            stack[object_slot] = value;
+                            stack.pop();
+                        }
+                    }
                 }
                 Goto | Goto8 | Goto16 | IfFalse | IfTrue | IfFalse8 | IfTrue8 => {
                     let conditional = !matches!(op, Goto | Goto8 | Goto16);

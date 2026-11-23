@@ -321,6 +321,131 @@ fn short_bigint_multiply_divide_remainder_and_power_keep_interrupt_checks() {
 }
 
 #[test]
+fn field_cache_does_not_keep_shapes_alive_or_skip_accessors() {
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let options = EvalOptions::default();
+    engine
+        .eval(
+            r#"
+        function read(o) { return o.slot; }
+        function write(o, x) { 'use strict'; o.slot = x; }
+        read({ extra: 0, slot: 1 });
+    "#,
+            options.clone(),
+        )
+        .unwrap();
+    let heap = engine.runtime().heap();
+    let cached_shape = heap
+        .bytecode
+        .iter()
+        .filter_map(|(_, code)| code.compiled.as_ref())
+        .flat_map(|code| code.inline_caches.iter().filter_map(|cell| cell.get()))
+        .find(|entry| entry.slot == 1)
+        .unwrap()
+        .shape;
+    assert!(heap.shapes.get_weak(cached_shape).is_some());
+    engine.collect_garbage();
+    assert!(
+        engine
+            .runtime()
+            .heap()
+            .shapes
+            .get_weak(cached_shape)
+            .is_none()
+    );
+    assert_eq!(
+        engine
+            .eval_to_string(
+                r#"
+        let data = { slot: 2 }, getter = { get slot() { return 3; } };
+        let result = [read(data), read(getter)];
+        write(data, 4);
+        result.push(read(data));
+        Object.defineProperty(data, 'slot', { writable: false });
+        try { write(data, 5); } catch (e) { result.push(e.name); }
+        result.push(read(data), read(new Proxy(data, { get() { return 6; } })));
+        result.join('|');
+    "#,
+                options
+            )
+            .unwrap(),
+        "2|3|4|TypeError|4|6"
+    );
+}
+
+#[test]
+fn global_cache_rechecks_new_lexical_bindings_across_scripts() {
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let options = EvalOptions::default();
+    assert_eq!(
+        engine
+            .eval_to_string(
+                r#"
+        globalThis.shadow = 1;
+        function read() { return shadow; }
+        function write(value) { 'use strict'; shadow = value; }
+        read(); write(2); read();
+    "#,
+                options.clone()
+            )
+            .unwrap(),
+        "2"
+    );
+    assert_eq!(
+        engine
+            .eval_to_string(
+                r#"
+        let shadow = 3;
+        let before = read();
+        write(4);
+        [before, read(), globalThis.shadow].join('|');
+    "#,
+                options
+            )
+            .unwrap(),
+        "3|4|2"
+    );
+}
+
+#[test]
+fn indexed_access_leaves_holes_and_invalid_typed_views_to_the_slow_path() {
+    assert_eq!(
+        run(r#"
+        function read(a, i) { return a[i]; }
+        function write(a, i, v) { 'use strict'; a[i] = v; }
+        let a = [1, 2];
+        write(a, 0, 3);
+        let before = read(a, 0);
+        delete a[0];
+        Object.defineProperty(Array.prototype, '0', {
+            configurable: true, get() { return 4; }
+        });
+        let hole = read(a, 0);
+        delete Array.prototype[0];
+        Object.freeze(a);
+        let frozen;
+        try { write(a, 1, 5); } catch (e) { frozen = e.name; }
+        let b = new ArrayBuffer(8, { maxByteLength: 16 });
+        let t = new Int32Array(b, 4, 1);
+        write(t, 0, -9);
+        let present = read(t, 0);
+        b.resize(4);
+        let calls = 0;
+        write(t, 0, { valueOf() { calls++; return 5; } });
+        let small = read(t, 0);
+        b.resize(8);
+        let restored = read(t, 0);
+        b.transfer();
+        let detached = read(t, 0);
+        let u = new BigUint64Array(1);
+        write(u, 0, -1n);
+        [before, hole, frozen, present, small, restored, detached, calls, read(u, 0)].join('|');
+    "#),
+        "3|4|TypeError|-9||0||1|18446744073709551615"
+    );
+}
+
+#[test]
 fn primitive_property_reads_keep_the_receiver_and_string_indices() {
     assert_eq!(
         run(r#"

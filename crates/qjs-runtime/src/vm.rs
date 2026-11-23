@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use crate::EngineLimits;
 use crate::arena::ArenaItem;
 use crate::gc::{Trace, Tracer};
@@ -8,6 +10,7 @@ use crate::value::*;
 pub(crate) mod exec;
 
 use crate::atom::PropKey;
+use crate::shape::PropFlags;
 use qjs_bytecode::{
     ClosureVarDef, ExceptionHandler, FunctionFlags, FunctionKind, PcSourceMap, VarDef,
 };
@@ -52,6 +55,7 @@ pub struct BytecodeFunc {
 #[derive(Debug)]
 pub(crate) struct CompiledFunc {
     pub code: TrackedVec<u8>,
+    pub(crate) inline_caches: TrackedVec<Cell<Option<InlineCache>>>,
     pub atoms: TrackedVec<PropKey>,
     pub name: Option<PropKey>,
     pub flags: FunctionFlags,
@@ -74,6 +78,16 @@ pub(crate) struct CompiledFunc {
     pub hoisted: TrackedVec<(u32, u32)>,
     pub eval: Option<EvalEnvironment>,
     pub class_field_context: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InlineCache {
+    pub pc: u32,
+    pub slot: u32,
+    pub shape: ShapeId,
+    pub flags: PropFlags,
+    pub key: Value,
+    pub epoch: usize,
 }
 
 impl CompiledFunc {
@@ -413,6 +427,7 @@ pub struct VmState {
     pub(crate) print_callback: Option<crate::api::PrintCallback>,
     pub(crate) module_loader: Option<Box<dyn crate::api::ModuleLoader>>,
     pub(crate) resolution_failed: bool,
+    pub(crate) global_lexical_epoch: usize,
 }
 
 impl VmState {
@@ -432,6 +447,7 @@ impl VmState {
             print_callback: None,
             module_loader: None,
             resolution_failed: false,
+            global_lexical_epoch: 0,
         }
     }
 

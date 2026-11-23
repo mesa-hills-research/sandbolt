@@ -318,6 +318,60 @@ pub(crate) fn typed_array_can_prevent_extensions(heap: &Heap, obj: ObjId) -> boo
     })
 }
 
+#[inline]
+fn ordinary_element_range(
+    buffer: &crate::object::ArrayBufferData,
+    view: TypedArrayData,
+    index: usize,
+) -> Option<std::ops::Range<usize>> {
+    if buffer.detached {
+        return None;
+    }
+    let size = view.kind.size();
+    let available = buffer.bytes.len().checked_sub(view.byte_offset)? / size;
+    let length = view.length.unwrap_or(available);
+    if index >= length || length > available {
+        return None;
+    }
+    let start = view.byte_offset + index * size;
+    Some(start..start + size)
+}
+
+#[inline]
+pub(crate) fn fast_typed_array_get(
+    heap: &Heap,
+    view: TypedArrayData,
+    index: usize,
+) -> Option<Value> {
+    let ObjectData::ArrayBuffer(buffer) = &heap.object(view.buffer).data else {
+        return None;
+    };
+    let range = ordinary_element_range(buffer, view, index)?;
+    let mut bytes = [0; 8];
+    bytes[..range.len()].copy_from_slice(&buffer.bytes[range]);
+    elements::decode_immediate(view.kind, u64::from_le_bytes(bytes))
+}
+
+#[inline]
+pub(crate) fn fast_typed_array_set(
+    objects: &mut crate::arena::Arena<crate::object::JsObject>,
+    view: TypedArrayData,
+    index: usize,
+    value: Value,
+) -> Option<()> {
+    let ObjectData::ArrayBuffer(buffer) = &mut objects.get_mut(view.buffer).unwrap().data else {
+        return None;
+    };
+    if buffer.immutable {
+        return None;
+    }
+    let range = ordinary_element_range(buffer, view, index)?;
+    let bits = elements::encode_immediate(view.kind, value)?;
+    let size = range.len();
+    buffer.bytes[range].copy_from_slice(&bits.to_le_bytes()[..size]);
+    Some(())
+}
+
 pub fn typed_array_get_index(
     ctx: &mut ExecCtx<'_, '_>,
     obj: ObjId,

@@ -1,6 +1,7 @@
 use qjs_bytecode::{ClosureKind, Instruction, Opcode, Operands};
 
 use crate::atom::{Atom, PropKey};
+use crate::heap::Heap;
 use crate::ledger::{TrackedBox, TrackedVec};
 use crate::object::{ArgumentsData, ErrorKind, MappedArgumentsData, ObjectData, ObjectFlags};
 use crate::ops::{convert, property};
@@ -174,14 +175,30 @@ pub(super) fn var_op(
 }
 
 fn global_scope(ctx: &ExecCtx<'_, '_>) -> Option<ModId> {
-    ctx.runtime.modules.iter().copied().find(|&id| {
-        let record = ctx.heap().modules.get(id).unwrap();
-        record.global_scope && record.realm == Some(ctx.realm_id())
+    global_scope_in(ctx.heap(), &ctx.runtime.modules, ctx.realm_id())
+}
+
+fn global_scope_in(heap: &Heap, modules: &[ModId], realm: RealmId) -> Option<ModId> {
+    modules.iter().copied().find(|&id| {
+        let record = heap.modules.get(id).unwrap();
+        record.global_scope && record.realm == Some(realm)
     })
 }
 
 fn lexical(ctx: &ExecCtx<'_, '_>, key: PropKey) -> Option<(VarRefId, bool)> {
-    let scope = ctx.heap().modules.get(global_scope(ctx)?).unwrap();
+    lexical_in(ctx.heap(), &ctx.runtime.modules, ctx.realm_id(), key)
+}
+
+pub(super) fn lexical_in(
+    heap: &Heap,
+    modules: &[ModId],
+    realm: RealmId,
+    key: PropKey,
+) -> Option<(VarRefId, bool)> {
+    let scope = heap
+        .modules
+        .get(global_scope_in(heap, modules, realm)?)
+        .unwrap();
     scope
         .lexical
         .iter()
@@ -218,6 +235,7 @@ fn define_lexical(ctx: &mut ExecCtx<'_, '_>, key: PropKey, writable: bool) -> Js
             },
         )?;
         scope.lexical.push_reserved((key, (id, writable)));
+        rt.vm.global_lexical_epoch += 1;
         Ok(())
     })
 }
