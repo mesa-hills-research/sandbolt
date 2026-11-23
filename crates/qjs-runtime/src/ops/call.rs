@@ -249,9 +249,11 @@ fn enter_call(
     } else {
         ctx.runtime.vm.stack[base + 1]
     };
-    ctx.root(this)?;
-    ctx.reserve_stack(storage + operands)?;
-    ctx.runtime.vm.stack.pop();
+    if ctx.runtime.vm.stack.capacity() - ctx.runtime.vm.stack.len() < storage + operands {
+        ctx.root(this)?;
+        ctx.reserve_stack(storage + operands)?;
+        ctx.runtime.vm.stack.pop();
+    }
     for _ in 0..storage {
         ctx.runtime.vm.stack.push_reserved(Value::UNDEFINED);
     }
@@ -273,9 +275,13 @@ fn enter_call(
         coroutine: None,
     };
     // The original call operands still contain new.target until the frame is live.
-    ctx.root(this)?;
-    ctx.allocate(|runtime| runtime.vm.frames.push(&runtime.heap.ledger, frame))?;
-    ctx.runtime.vm.stack.pop();
+    if ctx.runtime.vm.frames.len() < ctx.runtime.vm.frames.capacity() {
+        ctx.runtime.vm.frames.push_reserved(frame);
+    } else {
+        ctx.root(this)?;
+        ctx.allocate(|runtime| runtime.vm.frames.push(&runtime.heap.ledger, frame))?;
+        ctx.runtime.vm.stack.pop();
+    }
     ctx.runtime.vm.stack[base + 1] = this;
     let kind = code
         .and_then(|code| ctx.heap().bytecode.get(code).unwrap().compiled.as_ref())

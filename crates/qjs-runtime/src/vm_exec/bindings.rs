@@ -327,15 +327,80 @@ pub(super) fn binding_op(
 ) -> JsResult<()> {
     use Opcode::*;
     let op = inst.opcode;
-    let strict = compiled(ctx, code).strict;
-    let tail = ctx.runtime.vm.stack.len();
-    let atom = match inst.operands {
-        Operands::Atom(atom)
-        | Operands::AtomU8(atom, _)
-        | Operands::AtomU16(atom, _)
-        | Operands::AtomJumpU8(atom, _, _) => Some(key(ctx, code, atom)),
-        _ => None,
+    let strict;
+    let fast_global;
+    let atom = {
+        let cf = compiled(ctx, code);
+        strict = cf.strict;
+        fast_global = cf.eval.is_none() && ctx.runtime.modules.is_empty();
+        match inst.operands {
+            Operands::Atom(atom)
+            | Operands::AtomU8(atom, _)
+            | Operands::AtomU16(atom, _)
+            | Operands::AtomJumpU8(atom, _, _) => Some(key(ctx, code, atom)),
+            _ => None,
+        }
     };
+    let tail = ctx.runtime.vm.stack.len();
+    if fast_global {
+        match op {
+            GetVar | GetVarUndef => {
+                if let Some((_, _, value, _)) = global_data_slot(ctx, atom.unwrap()) {
+                    ctx.runtime.vm.stack.push_reserved(value);
+                    return Ok(());
+                }
+            }
+            PutVar | PutVarInit => {
+                if let Some((id, slot_index, _, flags)) = global_data_slot(ctx, atom.unwrap())
+                    && flags.contains(PropFlags::WRITABLE)
+                {
+                    let value = ctx.runtime.vm.stack[tail - 1];
+                    ctx.runtime.heap.objects.get_mut(id).unwrap().props[slot_index] = value;
+                    property::invalidate_array_prototypes(ctx, id);
+                    ctx.runtime.vm.stack.truncate(tail - 1);
+                    return Ok(());
+                }
+            }
+            MakeVarRef => {
+                let k = atom.unwrap();
+                if let Some((id, _, _, _)) = global_data_slot(ctx, k)
+                    && let crate::atom::KeyKind::String(a) = k.decode()
+                    && let Some(str_id) = ctx.heap().atoms.dynamic_string(a)
+                {
+                    ctx.runtime.vm.stack.push_reserved(Value::object(id));
+                    ctx.runtime.vm.stack.push_reserved(Value::string(str_id));
+                    return Ok(());
+                }
+            }
+            GetRefValue => {
+                let global_id = ctx.realm().global_object;
+                if ctx.runtime.vm.stack[tail - 2] == Value::object(global_id)
+                    && let ValueKind::String(str_id) = ctx.runtime.vm.stack[tail - 1].decode()
+                    && let Some(k) = ctx.heap().atoms.find(&ctx.heap().strings, str_id)
+                    && let Some((_, _, value, _)) = global_data_slot(ctx, k)
+                {
+                    ctx.runtime.vm.stack.push_reserved(value);
+                    return Ok(());
+                }
+            }
+            PutRefValue => {
+                let global_id = ctx.realm().global_object;
+                if ctx.runtime.vm.stack[tail - 3] == Value::object(global_id)
+                    && let ValueKind::String(str_id) = ctx.runtime.vm.stack[tail - 2].decode()
+                    && let Some(k) = ctx.heap().atoms.find(&ctx.heap().strings, str_id)
+                    && let Some((id, slot_index, _, flags)) = global_data_slot(ctx, k)
+                    && flags.contains(PropFlags::WRITABLE)
+                {
+                    let value = ctx.runtime.vm.stack[tail - 1];
+                    ctx.runtime.heap.objects.get_mut(id).unwrap().props[slot_index] = value;
+                    property::invalidate_array_prototypes(ctx, id);
+                    ctx.runtime.vm.stack.truncate(tail - 3);
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+    }
     let arg = frame.base as usize + 2;
     let result = ctx.with_scope(|ctx| {
         let h = |n: usize| Handle::at(tail - n);

@@ -237,10 +237,22 @@ pub(super) fn dispatch<'s>(
 }
 
 fn from_codes<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>, points: bool) -> JsResult<Value> {
+    if !points && args.len() <= 32 {
+        let mut buf = [0u16; 32];
+        for (i, slot) in buf.iter_mut().take(args.len()).enumerate() {
+            let arg = args.get(i).unwrap();
+            *slot = if let ValueKind::Int32(n) = ctx.get(arg).decode() {
+                n as u16
+            } else {
+                to_uint32(ctx, arg)? as u16
+            };
+        }
+        return ctx.new_utf16(&buf[..args.len()]).map(|s| ctx.get(s));
+    }
     let mut out = Builder::new();
     out.reserve(ctx, args.len(), true)?;
     for i in 0..args.len() {
-        if i & 1023 == 0 {
+        if i > 0 && (i & 1023) == 0 {
             ctx.check_interrupt()?;
         }
         let arg = args.get(i).unwrap();
@@ -251,8 +263,12 @@ fn from_codes<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>, points: bool) -> Js
             }
             out.code_point(ctx, c as u32)?;
         } else {
-            let c = to_uint32(ctx, arg)?;
-            out.unit(ctx, c as u16)?;
+            let c = if let ValueKind::Int32(n) = ctx.get(arg).decode() {
+                n as u16
+            } else {
+                to_uint32(ctx, arg)? as u16
+            };
+            out.unit(ctx, c)?;
         }
     }
     out.value(ctx)

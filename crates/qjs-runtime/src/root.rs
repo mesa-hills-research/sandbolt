@@ -393,21 +393,40 @@ impl<'s> ExecCtx<'_, 's> {
             let len = a.len().checked_add(b.len()).ok_or(AllocError::Limit)?;
             let is_wide = a.is_wide() || b.is_wide();
             let depth = a.depth().max(b.depth()) + 1;
-            let string = if depth > MAX_ROPE_DEPTH {
-                JsString::from_units(
+            let string = match (a, b) {
+                (
+                    JsString::Latin1 {
+                        data: da,
+                        is_ascii: ia,
+                    },
+                    JsString::Latin1 {
+                        data: db,
+                        is_ascii: ib,
+                    },
+                ) if len <= 16 => {
+                    let mut data = TrackedVec::new();
+                    data.try_reserve_exact(&heap.ledger, len as usize)?;
+                    for &byte in da.iter().chain(db.iter()) {
+                        data.push_reserved(byte);
+                    }
+                    JsString::Latin1 {
+                        data,
+                        is_ascii: *ia && *ib,
+                    }
+                }
+                _ if depth > MAX_ROPE_DEPTH => JsString::from_units(
                     &heap.ledger,
                     len as usize,
                     is_wide,
                     heap.string_units(left).chain(heap.string_units(right)),
-                )?
-            } else {
-                JsString::Rope {
+                )?,
+                _ => JsString::Rope {
                     left,
                     right,
                     len,
                     is_wide,
                     depth,
-                }
+                },
             };
             heap.strings.insert(&heap.ledger, string)
         })?;

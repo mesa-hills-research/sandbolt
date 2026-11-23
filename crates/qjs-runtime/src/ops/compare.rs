@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use super::convert::{self, PreferredType};
 use crate::heap::{BigIntData, Heap};
 use crate::root::{ExecCtx, Handle};
+use crate::string::JsString;
 use crate::value::*;
 use crate::vm::exec::numeric::compare_big_string;
 
@@ -38,10 +39,11 @@ fn equal(heap: &Heap, x: Value, y: Value, kind: Equality) -> bool {
         return compare_big(x, y) == Ordering::Equal;
     }
     match (x.decode(), y.decode()) {
-        (ValueKind::String(x), ValueKind::String(y)) => {
-            heap.string(x).len() == heap.string(y).len()
-                && heap.string_units(x).eq(heap.string_units(y))
-        }
+        (ValueKind::String(x), ValueKind::String(y)) => match (heap.string(x), heap.string(y)) {
+            (JsString::Latin1 { data: a, .. }, JsString::Latin1 { data: b, .. }) => a[..] == b[..],
+            (JsString::Utf16(a), JsString::Utf16(b)) => a[..] == b[..],
+            (a, b) => a.len() == b.len() && heap.string_units(x).eq(heap.string_units(y)),
+        },
         _ => false,
     }
 }

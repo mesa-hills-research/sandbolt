@@ -167,6 +167,38 @@ impl AtomTable {
     }
 
     pub(crate) fn find(&self, strings: &Arena<JsString>, id: StrId) -> Option<PropKey> {
+        if let JsString::Latin1 { data, .. } = strings.get(id).unwrap() {
+            let bytes = &data[..];
+            if !bytes.is_empty()
+                && bytes[0].is_ascii_digit()
+                && let Some(index) =
+                    parse_index(bytes.iter().map(|&b| u16::from(b))).and_then(PropKey::index)
+            {
+                return Some(index);
+            }
+            let hash = bytes
+                .iter()
+                .fold(FNV_OFFSET, |acc, &b| hash_unit(acc, u16::from(b)));
+            if let Some(key) = lookup_builtin(hash, |name| name.as_bytes() == bytes) {
+                return Some(key);
+            }
+            let hash = self.content_hash(bytes.iter().map(|&b| u16::from(b)));
+            let row = self.by_content.find(hash, |row| {
+                let other = self.dynamic[row].id;
+                other == id
+                    || match strings.get(other).unwrap() {
+                        JsString::Latin1 { data: ob, .. } => &ob[..] == bytes,
+                        s => {
+                            s.len() as usize == bytes.len()
+                                && bytes
+                                    .iter()
+                                    .map(|&b| u16::from(b))
+                                    .eq(StringUnits::new(strings, other))
+                        }
+                    }
+            })?;
+            return Some(PropKey::atom(self.dynamic[row].atom));
+        }
         let units = || StringUnits::new(strings, id);
         if let Some(index) = parse_index(units()).and_then(PropKey::index) {
             return Some(index);

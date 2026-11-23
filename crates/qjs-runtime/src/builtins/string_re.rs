@@ -317,8 +317,10 @@ impl Builder {
 
     fn extend(&mut self, ctx: &mut ExecCtx<'_, '_>, units: &[u16]) -> JsResult<()> {
         self.reserve(ctx, units.len(), false)?;
-        for chunk in units.chunks(4096) {
-            ctx.check_interrupt()?;
+        for (chunk_idx, chunk) in units.chunks(4096).enumerate() {
+            if chunk_idx > 0 {
+                ctx.check_interrupt()?;
+            }
             for &unit in chunk {
                 self.0.push_reserved(unit);
             }

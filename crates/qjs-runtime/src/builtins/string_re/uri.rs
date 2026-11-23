@@ -44,10 +44,19 @@ pub(super) fn dispatch<'s>(op: u16, ctx: &mut ExecCtx<'_, 's>, args: Args<'s>) -
     let mut short = [0; 32];
     let long;
     let input: &[u16] = if let Some(short) = short.get_mut(..len) {
-        for (slot, unit) in short.iter_mut().zip(ctx.heap().string_units(id)) {
-            *slot = unit;
+        match ctx.heap().string(id) {
+            crate::string::JsString::Latin1 { data, .. } => {
+                for (slot, &byte) in short.iter_mut().zip(data.iter()) {
+                    *slot = u16::from(byte);
+                }
+            }
+            crate::string::JsString::Utf16(data) => short.copy_from_slice(data),
+            crate::string::JsString::Rope { .. } => {
+                for (slot, unit) in short.iter_mut().zip(ctx.heap().string_units(id)) {
+                    *slot = unit;
+                }
+            }
         }
-        ctx.check_interrupt()?;
         short
     } else {
         long = units(ctx, value)?;
@@ -77,7 +86,7 @@ fn encode(ctx: &mut ExecCtx<'_, '_>, units: &[u16], full: bool) -> JsResult<Valu
     let mut out = Builder::new();
     let mut i = 0;
     while i < units.len() {
-        if i & 2047 < 2 {
+        if i > 0 && (i & 2047) < 2 {
             ctx.check_interrupt()?;
         }
         let (cp, end) = code_point(units, i);
@@ -119,10 +128,13 @@ fn percent_byte(input: &[u16]) -> Option<u8> {
 }
 
 fn decode(ctx: &mut ExecCtx<'_, '_>, units: &[u16], full: bool) -> JsResult<Value> {
+    if units.len() <= 32 {
+        return decode_short(ctx, units, full);
+    }
     let mut out = Builder::new();
     let mut i = 0;
     while i < units.len() {
-        if i & 2047 < 12 {
+        if i > 0 && (i & 2047) < 12 {
             ctx.check_interrupt()?;
         }
         if units[i] != u16::from(b'%') {
@@ -154,6 +166,47 @@ fn decode(ctx: &mut ExecCtx<'_, '_>, units: &[u16], full: bool) -> JsResult<Valu
         i += 3 * n;
     }
     out.value(ctx)
+}
+
+fn decode_short(ctx: &mut ExecCtx<'_, '_>, units: &[u16], full: bool) -> JsResult<Value> {
+    let mut buf = [0u16; 32];
+    let mut out_len = 0usize;
+    let mut i = 0;
+    while i < units.len() {
+        if units[i] != u16::from(b'%') {
+            buf[out_len] = units[i];
+            out_len += 1;
+            i += 1;
+            continue;
+        }
+        let first = percent_byte(&units[i..]).ok_or_else(|| uri_error(ctx))?;
+        let n = match first {
+            0..=0x7f => 1,
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => return Err(uri_error(ctx)),
+        };
+        if n == 1 && full && URI_RESERVED.contains(&first) {
+            buf[out_len..out_len + 3].copy_from_slice(&units[i..i + 3]);
+            out_len += 3;
+        } else {
+            let mut bytes = [first; 4];
+            for (j, byte) in bytes.iter_mut().enumerate().take(n).skip(1) {
+                let rest = units.get(i + 3 * j..).ok_or_else(|| uri_error(ctx))?;
+                *byte = percent_byte(rest).ok_or_else(|| uri_error(ctx))?;
+            }
+            let decoded = std::str::from_utf8(&bytes[..n]).map_err(|_| uri_error(ctx))?;
+            for c in decoded.chars() {
+                let mut enc = [0u16; 2];
+                let slice = c.encode_utf16(&mut enc);
+                buf[out_len..out_len + slice.len()].copy_from_slice(slice);
+                out_len += slice.len();
+            }
+        }
+        i += 3 * n;
+    }
+    ctx.new_utf16(&buf[..out_len]).map(|s| ctx.get(s))
 }
 
 fn escape(ctx: &mut ExecCtx<'_, '_>, units: &[u16]) -> JsResult<Value> {

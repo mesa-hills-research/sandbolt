@@ -151,10 +151,12 @@ pub(crate) struct Countdown {
 
 pub(crate) fn interrupt(engine: &mut JsEngine, budget: Budget, countdown: Rc<Countdown>) {
     let mut remaining_polls = 150u32;
+    let mut clock_tick = 0u32;
     engine.set_interrupt_handler(Some(Box::new(move || {
-        if budget.expired() {
+        if clock_tick == 0 && budget.expired() {
             return true;
         }
+        clock_tick = (clock_tick + 1) & 255;
         if countdown.enabled.get() {
             remaining_polls = remaining_polls.saturating_sub(1);
             countdown.fired.set(remaining_polls == 0);

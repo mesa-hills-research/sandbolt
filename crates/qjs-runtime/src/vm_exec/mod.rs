@@ -354,9 +354,10 @@ pub(crate) fn step(
 ) -> JsResult<Option<Value>> {
     use Opcode::*;
     let function = compiled(ctx, code);
-    if let Ok(i) = function
-        .hoisted
-        .binary_search_by_key(&frame.pc, |&(pc, _)| pc)
+    if !function.hoisted.is_empty()
+        && let Ok(i) = function
+            .hoisted
+            .binary_search_by_key(&frame.pc, |&(pc, _)| pc)
     {
         let next = function.hoisted[i].1;
         ctx.runtime.vm.frames[index].pc = next;
@@ -400,8 +401,29 @@ pub(crate) fn step(
                 _ => Value::bool(false),
             }],
         ),
+        PushConst | PushConst8 => {
+            let Operands::Constant(c) = inst.operands else {
+                unreachable!()
+            };
+            let bc = ctx.heap().bytecode.get(code).unwrap();
+            let constant = bc.constants[c as usize];
+            let is_regex = !bc.compiled.as_ref().unwrap().regex_constants.is_empty()
+                && bc
+                    .compiled
+                    .as_ref()
+                    .unwrap()
+                    .regex_constants
+                    .binary_search(&c)
+                    .is_ok();
+            let result = if is_regex {
+                ctx.with_scope(|ctx| objects::clone_regexp(ctx, constant))?
+            } else {
+                constant
+            };
+            replace(ctx, 0, &[result]);
+        }
         PushEmptyString | PushAtomValue | PrivateSymbol | Object | PushThis | SpecialObject
-        | Rest | ArrayFrom | PushConst | PushConst8 | Fclosure | Fclosure8 => {
+        | Rest | ArrayFrom | Fclosure | Fclosure8 => {
             let mut consumed = 0;
             let result = ctx.with_scope(|ctx| {
                 let result = match op {
@@ -449,29 +471,16 @@ pub(crate) fn step(
                         };
                         array_from_stack(ctx, start, count)?
                     }
-                    PushConst | PushConst8 | Fclosure | Fclosure8 => {
+                    Fclosure | Fclosure8 => {
                         let Operands::Constant(c) = inst.operands else {
                             unreachable!()
                         };
                         let function = ctx.heap().bytecode.get(code).unwrap();
                         let constant = function.constants[c as usize];
-                        if matches!(op, Fclosure | Fclosure8) {
-                            let ValueKind::Bytecode(child) = constant.decode() else {
-                                unreachable!()
-                            };
-                            return bindings::closure(ctx, frame, child);
-                        } else if function
-                            .compiled
-                            .as_ref()
-                            .unwrap()
-                            .regex_constants
-                            .binary_search(&c)
-                            .is_ok()
-                        {
-                            return objects::clone_regexp(ctx, constant);
-                        } else {
-                            return Ok(constant);
-                        }
+                        let ValueKind::Bytecode(child) = constant.decode() else {
+                            unreachable!()
+                        };
+                        return bindings::closure(ctx, frame, child);
                     }
                     _ => unreachable!(),
                 };
@@ -722,18 +731,33 @@ pub(crate) fn step(
                 _ => None,
             };
             let slot = local.unwrap_or(tail - 1);
-            let (before, after) = ctx.with_scope(|ctx| {
-                if op == AddLoc {
-                    return numeric::binary(ctx, Add, Handle::at(slot), Handle::at(tail - 1))
-                        .map(|v| (Value::UNDEFINED, v));
+            let fast = match (op, ctx.runtime.vm.stack[slot].decode()) {
+                (Inc | PostInc | IncLoc, ValueKind::Int32(n)) if n < i32::MAX => {
+                    Some((Value::int32(n), Value::int32(n + 1)))
                 }
-                let op = match op {
-                    IncLoc => Inc,
-                    DecLoc => Dec,
-                    other => other,
-                };
-                numeric::unary(ctx, op, Handle::at(slot))
-            })?;
+                (Dec | PostDec | DecLoc, ValueKind::Int32(n)) if n > i32::MIN => {
+                    Some((Value::int32(n), Value::int32(n - 1)))
+                }
+                (Not, ValueKind::Int32(n)) => Some((Value::UNDEFINED, Value::int32(!n))),
+                (Plus, ValueKind::Int32(n)) => Some((Value::UNDEFINED, Value::int32(n))),
+                _ => None,
+            };
+            let (before, after) = if let Some(pair) = fast {
+                pair
+            } else {
+                ctx.with_scope(|ctx| {
+                    if op == AddLoc {
+                        return numeric::binary(ctx, Add, Handle::at(slot), Handle::at(tail - 1))
+                            .map(|v| (Value::UNDEFINED, v));
+                    }
+                    let op = match op {
+                        IncLoc => Inc,
+                        DecLoc => Dec,
+                        other => other,
+                    };
+                    numeric::unary(ctx, op, Handle::at(slot))
+                })?
+            };
             if let Some(slot) = local {
                 ctx.runtime.vm.stack[slot] = after;
                 if op == AddLoc {
@@ -746,24 +770,73 @@ pub(crate) fn step(
             }
         }
         Mul | Div | Mod | Add | Sub | Shl | Sar | Shr | And | Xor | Or | Pow => {
-            let result = ctx.with_scope(|ctx| {
-                numeric::binary(ctx, op, Handle::at(tail - 2), Handle::at(tail - 1))
-            })?;
+            let lhs = ctx.runtime.vm.stack[tail - 2];
+            let rhs = ctx.runtime.vm.stack[tail - 1];
+            let fast = match (lhs.decode(), rhs.decode()) {
+                (ValueKind::Int32(a), ValueKind::Int32(b)) => match op {
+                    Add => Some(
+                        a.checked_add(b)
+                            .map(Value::int32)
+                            .unwrap_or_else(|| Value::number(f64::from(a) + f64::from(b))),
+                    ),
+                    Sub => Some(
+                        a.checked_sub(b)
+                            .map(Value::int32)
+                            .unwrap_or_else(|| Value::number(f64::from(a) - f64::from(b))),
+                    ),
+                    Mul if !(a == 0 && b < 0) && !(b == 0 && a < 0) => Some(
+                        a.checked_mul(b)
+                            .map(Value::int32)
+                            .unwrap_or_else(|| Value::number(f64::from(a) * f64::from(b))),
+                    ),
+                    And => Some(Value::int32(a & b)),
+                    Or => Some(Value::int32(a | b)),
+                    Xor => Some(Value::int32(a ^ b)),
+                    Shl => Some(Value::int32(((a as u32) << ((b as u32) & 31)) as i32)),
+                    Sar => Some(Value::int32(a >> ((b as u32) & 31))),
+                    Shr => Some(Value::number(((a as u32) >> ((b as u32) & 31)) as f64)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let result = if let Some(result) = fast {
+                result
+            } else {
+                ctx.with_scope(|ctx| {
+                    numeric::binary(ctx, op, Handle::at(tail - 2), Handle::at(tail - 1))
+                })?
+            };
             replace(ctx, 2, &[result]);
         }
         Eq | Neq | StrictEq | StrictNeq | Lt | Lte | Gt | Gte => {
-            let result = ctx.with_scope(|ctx| {
-                let (a, b) = (Handle::at(tail - 2), Handle::at(tail - 1));
-                Ok(match op {
-                    Eq | Neq => compare::abstract_eq(ctx, a, b)? ^ (op == Neq),
-                    StrictEq | StrictNeq => compare::strict_eq(ctx, a, b) ^ (op == StrictNeq),
-                    Lt => compare::abstract_relational(ctx, a, b, true)? == Some(true),
-                    Gt => compare::abstract_relational(ctx, b, a, false)? == Some(true),
-                    Lte => compare::abstract_relational(ctx, b, a, false)? == Some(false),
-                    Gte => compare::abstract_relational(ctx, a, b, true)? == Some(false),
+            let lhs = ctx.runtime.vm.stack[tail - 2];
+            let rhs = ctx.runtime.vm.stack[tail - 1];
+            let result = match (lhs.decode(), rhs.decode()) {
+                (ValueKind::Int32(a), ValueKind::Int32(b)) => match op {
+                    Eq | StrictEq => a == b,
+                    Neq | StrictNeq => a != b,
+                    Lt => a < b,
+                    Lte => a <= b,
+                    Gt => a > b,
+                    Gte => a >= b,
                     _ => unreachable!(),
-                })
-            })?;
+                },
+                _ if matches!(op, StrictEq | StrictNeq) => {
+                    compare::strict_eq(ctx, Handle::at(tail - 2), Handle::at(tail - 1))
+                        ^ (op == StrictNeq)
+                }
+                _ => ctx.with_scope(|ctx| {
+                    let (a, b) = (Handle::at(tail - 2), Handle::at(tail - 1));
+                    Ok(match op {
+                        Eq | Neq => compare::abstract_eq(ctx, a, b)? ^ (op == Neq),
+                        Lt => compare::abstract_relational(ctx, a, b, true)? == Some(true),
+                        Gt => compare::abstract_relational(ctx, b, a, false)? == Some(true),
+                        Lte => compare::abstract_relational(ctx, b, a, false)? == Some(false),
+                        Gte => compare::abstract_relational(ctx, a, b, true)? == Some(false),
+                        _ => unreachable!(),
+                    })
+                })?,
+            };
             replace(ctx, 2, &[Value::bool(result)]);
         }
         Typeof | Lnot | TypeofIsFunction | TypeofIsUndefined | IsUndefinedOrNull | IsUndefined
