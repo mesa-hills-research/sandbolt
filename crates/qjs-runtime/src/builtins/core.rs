@@ -150,7 +150,11 @@ fn set_or_throw<'s>(
 
 // The snapshot survives getters or traps deleting keys from the original object.
 fn root_keys(ctx: &mut ExecCtx<'_, '_>, keys: &[PropKey]) -> JsResult<()> {
-    ctx.reserve_stack(keys.len())?;
+    let dynamic = keys
+        .iter()
+        .filter(|&&key| ctx.heap().dynamic_key_value(key).is_some())
+        .count();
+    ctx.reserve_stack(dynamic)?;
     for &key in keys {
         if let Some(value) = ctx.heap().dynamic_key_value(key) {
             ctx.runtime.vm.stack.push_reserved(value);
@@ -213,8 +217,7 @@ fn for_each_iterator<'s>(
             }
             let value = get(ctx, result, crate::atom::Atom::get("value"))?;
             if let Err(error) = f(ctx, value, index) {
-                close_iterator_on_throw(ctx, iterator, error);
-                return Err(error);
+                return Err(close_iterator_on_throw(ctx, iterator, error));
             }
             Ok(false)
         })?;
@@ -229,21 +232,24 @@ fn close_iterator_on_throw<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     iterator: Handle<'s>,
     error: crate::value::Abrupt,
-) {
-    if error == crate::value::Abrupt::Interrupted {
-        return;
+) -> crate::value::Abrupt {
+    use crate::value::Abrupt;
+    if error == Abrupt::Interrupted {
+        return error;
     }
     let Some((exception, oom)) = ctx.take_exception() else {
-        return;
+        return error;
     };
-    // Put the exception back if the spare stack slot cannot hold another root.
-    if ctx.root(exception).is_ok() {
-        let result = get(ctx, iterator, crate::atom::Atom::get("return"));
-        if let Ok(method) = result
-            && !matches!(ctx.get(method), Value::NULL | Value::UNDEFINED)
-        {
-            let _ = call::call(ctx, method, iterator, Args::empty());
+    let close = (|| {
+        ctx.root(exception)?;
+        let method = get(ctx, iterator, crate::atom::Atom::get("return"))?;
+        if !matches!(ctx.get(method), Value::NULL | Value::UNDEFINED) {
+            call::call(ctx, method, iterator, Args::empty())?;
         }
+        Ok(())
+    })();
+    if close == Err(Abrupt::Interrupted) {
+        return Abrupt::Interrupted;
     }
-    ctx.throw_value(exception, oom);
+    ctx.throw_value(exception, oom)
 }

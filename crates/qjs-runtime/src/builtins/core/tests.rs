@@ -464,7 +464,7 @@ fn object_descriptors_copy_enumeration_and_integrity() {
     });
 }
 
-const CALLBACKS: [NativeFn; 9] = [
+const CALLBACKS: [NativeFn; 11] = [
     iterator_this,
     iterator_next,
     iterator_return,
@@ -474,6 +474,8 @@ const CALLBACKS: [NativeFn; 9] = [
     throw_first,
     read_key,
     count_call,
+    interrupt_then_throw,
+    delete_symbol_keys,
 ];
 
 fn iterator_this<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>, _: Args<'s>) -> JsResult<Value> {
@@ -535,6 +537,29 @@ fn count_call<'s>(ctx: &mut ExecCtx<'_, 's>, _: Handle<'s>, args: Args<'s>) -> J
     let one = number(ctx, 1)?;
     put_named(ctx, count, "read", one)?;
     Ok(Value::int32(0))
+}
+
+fn interrupt_then_throw<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    _: Handle<'s>,
+    args: Args<'s>,
+) -> JsResult<Value> {
+    ctx.runtime.set_interrupt_handler(Some(Box::new(|| true)));
+    Err(ctx.throw(args.get(0).unwrap()))
+}
+
+fn delete_symbol_keys<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    this: Handle<'s>,
+    _: Args<'s>,
+) -> JsResult<Value> {
+    for &key in property::own_property_keys(ctx, this)?.iter() {
+        if matches!(key.decode(), KeyKind::Symbol(_)) {
+            property::delete_property(ctx, this, key)?;
+        }
+    }
+    ctx.collect();
+    Ok(Value::int32(42))
 }
 
 fn iterable<'s>(ctx: &mut ExecCtx<'_, 's>, items: &[Handle<'s>]) -> JsResult<Handle<'s>> {
@@ -606,6 +631,56 @@ fn object_iterable_operations_keep_keys_values_and_original_exceptions() {
         throws(ctx, result, ErrorKind::Type);
         let closed = named(ctx, bad, "closed")?;
         ok_bool(ctx, ctx.get(closed), true);
+        Ok(())
+    });
+}
+
+#[test]
+fn iterator_close_propagates_host_interrupts() {
+    run(|ctx| {
+        let object = global(ctx, "Object")?;
+        let one = number(ctx, 1)?;
+        let input = iterable(ctx, &[one])?;
+        let callback = ctx.new_native(NativeFnId(9), false)?;
+        let result = method(ctx, object, "groupBy", &[input, callback]);
+        ctx.runtime.set_interrupt_handler(None);
+        assert_eq!(result.unwrap_err(), Abrupt::Interrupted);
+        assert!(ctx.pending_exception().is_none());
+        Ok(())
+    });
+}
+
+#[test]
+fn assign_skips_deleted_keys_after_collection_inside_a_getter() {
+    run(|ctx| {
+        let object = global(ctx, "Object")?;
+        let source = ctx.new_object()?;
+        let getter = ctx.new_native(NativeFnId(10), false)?;
+        let first = ctx.intern_str("first")?;
+        define_or_throw(
+            ctx,
+            source,
+            first,
+            PropertyDescriptor {
+                get: Some(getter),
+                enumerable: Some(true),
+                ..PropertyDescriptor::default()
+            },
+        )?;
+        let raw = ctx.get(source);
+        let key = ctx.with_scope(|ctx| {
+            let source = ctx.root(raw)?;
+            let symbol = ctx.new_symbol(None, false)?;
+            let key = convert::to_property_key(ctx, symbol)?;
+            let one = number(ctx, 1)?;
+            put(ctx, source, key, one)?;
+            Ok(key)
+        })?;
+        let copy = ctx.new_object()?;
+        method(ctx, object, "assign", &[copy, source])?;
+        num_property(ctx, copy, "first", 42.0)?;
+        assert!(property::get_own_property_descriptor(ctx, copy, key)?.is_none());
+        assert!(property::get_own_property_descriptor(ctx, source, key)?.is_none());
         Ok(())
     });
 }
