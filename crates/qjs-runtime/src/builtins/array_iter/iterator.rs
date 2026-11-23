@@ -1,8 +1,11 @@
 use super::*;
+use crate::builtins::promise_json_extras::{fulfill_promise, new_promise_capability};
 use crate::builtins::typed_atomics::{typed_array_get_index, typed_array_length};
 use crate::builtins::{configure_ctor, define_data, install_accessor, install_method};
 use crate::ledger::TrackedBox;
-use crate::object::{HelperData, HelperOp, IteratorData, IteratorKind, IteratorRecordData};
+use crate::object::{
+    HelperData, HelperOp, HelperState, IteratorData, IteratorKind, IteratorRecordData,
+};
 use crate::ops::convert::{to_number, to_object};
 use crate::ops::property::{get_own_property_descriptor, get_prototype_of, set_property};
 use crate::shape::PropFlags;
@@ -42,6 +45,8 @@ const CHUNKS: u16 = 27;
 const WINDOWS: u16 = 28;
 const INCLUDES: u16 = 29;
 const JOIN: u16 = 30;
+const ASYNC_DISPOSE: u16 = 31;
+const DISCARD_RESULT: u16 = 32;
 
 const fn id(n: u16) -> NativeFnId {
     NativeFnId(ARRAY_ITER_BASE + 128 + n)
@@ -102,6 +107,15 @@ pub(super) fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
         symbol(ctx, WellKnown::Dispose),
         id(DISPOSE),
         "[Symbol.dispose]",
+        0,
+    )?;
+    let async_proto = ctx.root(Value::object(ctx.realm().async_iterator_proto))?;
+    install_method(
+        ctx,
+        async_proto,
+        symbol(ctx, WellKnown::AsyncDispose),
+        id(ASYNC_DISPOSE),
+        "[Symbol.asyncDispose]",
         0,
     )?;
     let k = key(ctx, "constructor")?;
@@ -191,6 +205,8 @@ pub(super) fn dispatch<'s>(
             }
             Ok(Value::UNDEFINED)
         }
+        ASYNC_DISPOSE => async_dispose(ctx, this),
+        DISCARD_RESULT => Ok(Value::UNDEFINED),
         GET_CTOR => Ok(Value::object(ctx.realm().iterator_ctor)),
         GET_TAG => {
             let tag = ctx.new_string("Iterator")?;
@@ -229,6 +245,28 @@ pub(super) fn dispatch<'s>(
         REDUCE | TO_ARRAY | FOR_EACH | SOME | EVERY | FIND => consume(ctx, this, args, n),
         _ => Err(ctx.throw_type_error("Unknown iterator builtin")),
     }
+}
+
+fn async_dispose<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>) -> JsResult<Value> {
+    let ctor = ctx.root(Value::object(ctx.realm().promise_ctor))?;
+    let capability = new_promise_capability(ctx, ctor)?;
+    let status = (|| {
+        let object = to_object(ctx, this)?;
+        let k = key(ctx, "return")?;
+        let undefined = ctx.root(Value::UNDEFINED)?;
+        let Some(method) = array::get_method_v(ctx, object, this, k)? else {
+            return fulfill_promise(ctx, capability.promise, undefined);
+        };
+        let value = call(ctx, method, this, Args::empty())?;
+        let value = ctx.root(value)?;
+        let promise = promise_resolve(ctx, ctor, value)?;
+        let discard = ctx.new_native(id(DISCARD_RESULT), false)?;
+        perform_promise_then(ctx, promise, discard, undefined, Some(capability))
+    })();
+    if let Err(error) = status {
+        reject_thrown(ctx, capability.promise, error)?;
+    }
+    Ok(ctx.get(capability.promise))
 }
 
 pub(crate) fn new_array_iterator<'s>(
@@ -557,15 +595,24 @@ fn close_helper(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> JsResult<()> {
 
 fn helper_next<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>, close: bool) -> JsResult<Value> {
     let id = ctx.object_id(this)?;
-    let op = match data(ctx, id) {
+    let (op, state) = match data(ctx, id) {
         Some(IteratorKind::Complete) => return result(ctx, None),
-        Some(IteratorKind::Helper(data)) if !data.running => data.op,
-        Some(IteratorKind::Helper(_)) => {
-            return Err(ctx.throw_type_error("Iterator helper is already running"));
-        }
+        Some(IteratorKind::Helper(data)) => (data.op, data.state),
         _ => return Err(ctx.throw_type_error("Expected an Iterator Helper")),
     };
-    helper_mut(ctx, id).running = true;
+    match state {
+        HelperState::Completed => return result(ctx, None),
+        HelperState::Executing => {
+            return Err(ctx.throw_type_error("Iterator helper is already running"));
+        }
+        _ => (),
+    }
+    helper_mut(ctx, id).state = if close && state == HelperState::SuspendedStart {
+        // Close callbacks can reenter a helper that has yet to run.
+        HelperState::Completed
+    } else {
+        HelperState::Executing
+    };
     let item = if close {
         close_helper(ctx, id).map(|()| None)
     } else {
@@ -581,7 +628,7 @@ fn helper_next<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>, close: bool) -> 
         }
     };
     if matches!(item, Ok(Some(_))) {
-        helper_mut(ctx, id).running = false;
+        helper_mut(ctx, id).state = HelperState::SuspendedYield;
     } else {
         *data_mut(ctx, id) = IteratorKind::Complete;
     }

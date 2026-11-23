@@ -90,6 +90,14 @@ impl Trace for ZipInput {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HelperState {
+    SuspendedStart,
+    SuspendedYield,
+    Executing,
+    Completed,
+}
+
 #[derive(Debug)]
 pub struct HelperData {
     pub op: HelperOp,
@@ -98,7 +106,7 @@ pub struct HelperData {
     pub callback: Value,
     pub position: u64,
     pub limit: f64,
-    pub running: bool,
+    pub state: HelperState,
     pub sequence: TrackedVec<IteratorRecordData>,
     pub zip: TrackedVec<ZipInput>,
     pub buffer: TrackedVec<Value>,
@@ -114,7 +122,7 @@ impl HelperData {
             callback: Value::UNDEFINED,
             position: 0,
             limit: 0.0,
-            running: false,
+            state: HelperState::SuspendedStart,
             sequence: TrackedVec::new(),
             zip: TrackedVec::new(),
             buffer: TrackedVec::new(),
