@@ -77,6 +77,34 @@ fn handles_number_and_bigint_conversions() {
 }
 
 #[test]
+fn primitive_property_reads_keep_the_receiver_and_string_indices() {
+    assert_eq!(
+        run(r#"
+        Object.defineProperty(String.prototype, '0', {value: 'shadowed'});
+        Object.defineProperty(String.prototype, '1', {get() {'use strict'; return this;}});
+        Object.defineProperty(Number.prototype, 'key', {get() {'use strict'; return this;}});
+        let pair = '\uD83D' + '\uDE00';
+        ['x'[0], 'x'[1], pair.length, pair[1].charCodeAt(0).toString(16), (7).key === 7].join('|')
+        "#),
+        "x|x|2|de00|true"
+    );
+}
+
+#[test]
+fn numeric_property_keys_preserve_proxy_key_strings() {
+    assert_eq!(
+        run(r#"
+        let seen = [];
+        let key = { [Symbol.toPrimitive](hint) { seen.push(hint); return -0; } };
+        let proxy = new Proxy({}, {get(_, key) { return key; }});
+        [proxy[key], proxy[3], proxy[1073741823], proxy[1073741824], proxy[-1],
+         proxy[1.25], proxy[NaN], seen.join(',')].join('|')
+        "#),
+        "0|3|1073741823|1073741824|-1|1.25|NaN|string"
+    );
+}
+
+#[test]
 fn numeric_binary_operators_coerce_the_left_operand_first() {
     assert_eq!(
         run(r#"

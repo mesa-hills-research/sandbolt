@@ -159,11 +159,6 @@ fn strict_set<'s>(
     Ok(())
 }
 
-fn get<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>, key: PropKey) -> JsResult<Value> {
-    let boxed = convert::to_object(ctx, value)?;
-    property::get_property_with_receiver(ctx, boxed, key, value)
-}
-
 fn set_home(ctx: &mut ExecCtx<'_, '_>, function: Value, home: ObjId) {
     let Some(function) = function.as_object() else {
         return;
@@ -247,7 +242,7 @@ pub(super) fn object_op(
         Ok(match op {
             GetField | GetField2 | GetLength => one(
                 usize::from(op != GetField2),
-                get(ctx, h(1), atom.unwrap_or(Atom::get("length")))?,
+                property::get_property(ctx, h(1), atom.unwrap_or(Atom::get("length")))?,
             ),
             PutField => {
                 strict_set(ctx, h(2), atom.unwrap(), h(1), strict)?;
@@ -255,9 +250,9 @@ pub(super) fn object_op(
             }
             GetArrayEl | GetArrayEl2 => {
                 let receiver = h(2);
-                let object = convert::to_object(ctx, receiver)?;
+                convert::require_object_coercible(ctx, ctx.get(receiver))?;
                 let key = convert::to_property_key(ctx, h(1))?;
-                let value = property::get_property_with_receiver(ctx, object, key, receiver)?;
+                let value = property::get_property(ctx, receiver, key)?;
                 one(if op == GetArrayEl { 2 } else { 1 }, value)
             }
             PutArrayEl => {
@@ -613,7 +608,7 @@ pub(super) fn get_method<'s>(
     object: Handle<'s>,
     key: PropKey,
 ) -> JsResult<Option<Handle<'s>>> {
-    let value = get(ctx, object, key)?;
+    let value = property::get_property(ctx, object, key)?;
     if value == Value::UNDEFINED || value == Value::NULL {
         return Ok(None);
     }

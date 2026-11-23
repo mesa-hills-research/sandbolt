@@ -550,6 +550,36 @@ fn ropes_flatten_in_place_without_losing_surrogates() {
 }
 
 #[test]
+fn primitive_string_length_read_does_not_allocate_a_wrapper() {
+    let mut runtime = Runtime::new(EngineLimits::default()).unwrap();
+    runtime.with_scope(runtime.default_realm(), |ctx| {
+        let string = ctx.new_string("😀").unwrap();
+        let objects = ctx.heap().objects.len();
+        assert_eq!(
+            get_property(ctx, string, LENGTH).unwrap().as_number(),
+            Some(2.0)
+        );
+        assert_eq!(ctx.heap().objects.len(), objects);
+    });
+}
+
+#[test]
+fn numeric_inline_keys_do_not_allocate_strings() {
+    let mut runtime = Runtime::new(EngineLimits::default()).unwrap();
+    runtime.with_scope(runtime.default_realm(), |ctx| {
+        for (number, index) in [(Value::int32(3), 3), (Value::number(-0.0), 0)] {
+            let value = ctx.root(number).unwrap();
+            let strings = ctx.heap().strings.len();
+            assert_eq!(
+                convert::to_property_key(ctx, value).unwrap(),
+                PropKey::index(index).unwrap()
+            );
+            assert_eq!(ctx.heap().strings.len(), strings);
+        }
+    });
+}
+
+#[test]
 fn ordered_keys_fast_array_downgrade_and_prototype_invalidation() {
     let mut runtime = Runtime::new(EngineLimits::default()).unwrap();
     let realm = runtime.default_realm();

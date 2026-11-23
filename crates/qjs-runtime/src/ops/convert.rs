@@ -280,6 +280,14 @@ fn number_text<'s>(ctx: &mut ExecCtx<'_, 's>, n: f64) -> JsResult<Handle<'s>> {
 
 pub fn to_property_key<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<PropKey> {
     let raw = to_primitive(ctx, value, PreferredType::String)?;
+    if let Some(number) = raw.as_number() {
+        let index = number as u32;
+        if number == f64::from(index)
+            && let Some(key) = PropKey::index(index)
+        {
+            return Ok(key);
+        }
+    }
     let value = ctx.root(raw)?;
     if let ValueKind::Symbol(id) = raw.decode() {
         return Ok(ctx.heap().symbols.get(id).unwrap().key());
@@ -301,11 +309,36 @@ pub(crate) fn key_value<'s>(ctx: &mut ExecCtx<'_, 's>, key: PropKey) -> JsResult
     }
 }
 
+pub(crate) fn primitive_prototype(ctx: &ExecCtx<'_, '_>, kind: ValueKind) -> Option<ObjId> {
+    let realm = ctx.realm();
+    Some(match kind {
+        ValueKind::Bool(_) => realm.boolean_proto,
+        ValueKind::Int32(_) | ValueKind::Float64(_) => realm.number_proto,
+        ValueKind::String(_) => realm.string_proto,
+        ValueKind::Symbol(_) => realm.symbol_proto,
+        ValueKind::BigInt(_) | ValueKind::ShortBigInt(_) => realm.bigint_proto,
+        _ => return None,
+    })
+}
+
+pub(crate) fn require_object_coercible(ctx: &mut ExecCtx<'_, '_>, value: Value) -> JsResult<()> {
+    if matches!(value, Value::NULL | Value::UNDEFINED) {
+        Err(ctx.throw_type_error("cannot convert value to object"))
+    } else {
+        Ok(())
+    }
+}
+
 pub fn to_object<'s>(ctx: &mut ExecCtx<'_, 's>, handle: Handle<'s>) -> JsResult<Handle<'s>> {
     let value = ctx.get(handle);
+    let kind = value.decode();
+    if matches!(kind, ValueKind::Object(_)) {
+        return Ok(handle);
+    }
+    let proto = primitive_prototype(ctx, kind)
+        .ok_or_else(|| ctx.throw_type_error("cannot convert value to object"))?;
     macro_rules! boxed {
-        ($proto:ident, $variant:ident, $data:ident) => {{
-            let proto = ctx.realm().$proto;
+        ($variant:ident, $data:ident) => {{
             ctx.make_object(Some(proto), ObjectFlags::EXTENSIBLE, |ledger| {
                 Ok(ObjectData::$variant(TrackedBox::new(
                     ledger,
@@ -314,18 +347,15 @@ pub fn to_object<'s>(ctx: &mut ExecCtx<'_, 's>, handle: Handle<'s>) -> JsResult<
             })
         }};
     }
-    match value.decode() {
-        ValueKind::Object(_) => Ok(handle),
-        ValueKind::Bool(_) => boxed!(boolean_proto, BooleanObject, BooleanObjectData),
-        ValueKind::Int32(_) | ValueKind::Float64(_) => {
-            boxed!(number_proto, NumberObject, NumberObjectData)
-        }
-        ValueKind::String(_) => boxed!(string_proto, StringObject, StringObjectData),
-        ValueKind::Symbol(_) => boxed!(symbol_proto, SymbolObject, SymbolObjectData),
+    match kind {
+        ValueKind::Bool(_) => boxed!(BooleanObject, BooleanObjectData),
+        ValueKind::Int32(_) | ValueKind::Float64(_) => boxed!(NumberObject, NumberObjectData),
+        ValueKind::String(_) => boxed!(StringObject, StringObjectData),
+        ValueKind::Symbol(_) => boxed!(SymbolObject, SymbolObjectData),
         ValueKind::BigInt(_) | ValueKind::ShortBigInt(_) => {
-            boxed!(bigint_proto, BigIntObject, BigIntObjectData)
+            boxed!(BigIntObject, BigIntObjectData)
         }
-        _ => Err(ctx.throw_type_error("cannot convert value to object")),
+        _ => unreachable!(),
     }
 }
 

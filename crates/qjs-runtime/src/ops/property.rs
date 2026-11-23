@@ -109,11 +109,29 @@ fn string_property(heap: &Heap, id: ObjId, key: PropKey) -> Option<(StrId, Optio
     let ValueKind::String(string) = data.value.decode() else {
         unreachable!()
     };
+    string_own_property(heap, string, key)
+}
+
+fn string_own_property(heap: &Heap, string: StrId, key: PropKey) -> Option<(StrId, Option<u32>)> {
     if key == LENGTH {
         return Some((string, None));
     }
     let index = heap.array_index(key)?;
     (index < heap.string(string).len()).then_some((string, Some(index)))
+}
+
+fn read_string_property(
+    ctx: &mut ExecCtx<'_, '_>,
+    string: StrId,
+    index: Option<u32>,
+) -> JsResult<Value> {
+    if let Some(index) = index {
+        let unit = ctx.heap().string_units(string).nth(index as usize).unwrap();
+        let value = ctx.new_utf16(&[unit])?;
+        Ok(ctx.get(value))
+    } else {
+        Ok(Value::number(f64::from(ctx.heap().string(string).len())))
+    }
 }
 
 fn mapped_parameter(heap: &Heap, id: ObjId, key: PropKey) -> Option<VarRefId> {
@@ -238,15 +256,11 @@ fn own_descriptor(
     let Some((string, index)) = string_property(ctx.heap(), id, key) else {
         return Ok(None);
     };
-    let (value, flags) = if let Some(index) = index {
-        let unit = ctx.heap().string_units(string).nth(index as usize).unwrap();
-        let value = ctx.new_utf16(&[unit])?;
-        (ctx.get(value), PropFlags::ENUMERABLE)
+    let value = read_string_property(ctx, string, index)?;
+    let flags = if index.is_some() {
+        PropFlags::ENUMERABLE
     } else {
-        (
-            Value::number(f64::from(ctx.heap().string(string).len())),
-            PropFlags::default(),
-        )
+        PropFlags::default()
     };
     Ok(Some(describe(ctx.heap(), value, flags)))
 }
@@ -383,12 +397,20 @@ pub fn get_property_with_receiver<'s>(
     key: PropKey,
     receiver: Handle<'s>,
 ) -> JsResult<Value> {
-    let object = ctx.get(object);
+    let kind = ctx.get(object).decode();
+    if let ValueKind::String(string) = kind
+        && let Some((string, index)) = string_own_property(ctx.heap(), string, key)
+    {
+        return ctx.with_scope(|ctx| read_string_property(ctx, string, index));
+    }
+    let id = if let ValueKind::Object(id) = kind {
+        id
+    } else {
+        super::convert::primitive_prototype(ctx, kind)
+            .ok_or_else(|| ctx.throw_type_error("cannot convert value to object"))?
+    };
     let receiver = ctx.get(receiver);
     ctx.with_scope(|ctx| {
-        let object = ctx.root(object)?;
-        let object = super::convert::to_object(ctx, object)?;
-        let id = ctx.object_id(object)?;
         let receiver = ctx.root(receiver)?;
         get_from(ctx, id, key, receiver)
     })
@@ -433,13 +455,7 @@ fn get_from<'s>(
             };
         }
         if let Some((string, index)) = string_property(ctx.heap(), id, key) {
-            return if let Some(index) = index {
-                let unit = ctx.heap().string_units(string).nth(index as usize).unwrap();
-                let value = ctx.new_utf16(&[unit])?;
-                Ok(ctx.get(value))
-            } else {
-                Ok(Value::number(f64::from(ctx.heap().string(string).len())))
-            };
+            return read_string_property(ctx, string, index);
         }
         if let Some((value, _)) = own(ctx.heap(), id, key) {
             if let ValueKind::Accessor(acc) = value.decode() {
