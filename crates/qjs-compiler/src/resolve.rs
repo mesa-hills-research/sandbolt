@@ -507,8 +507,12 @@ impl Emitter<'_> {
                             if asynchronous {
                                 let error = self.label();
                                 let done = self.label();
-                                out.push(IrOp::Catch(error));
                                 out.extend([
+                                    resolved(GetLoc, Operands::Local(slot)),
+                                    plain(UsingDisposeInit),
+                                    plain(StrictEq),
+                                    IrOp::JumpIfTrue(done),
+                                    IrOp::Catch(error),
                                     resolved(UsingDisposeAsync, Operands::Local(slot)),
                                     plain(Await),
                                     plain(Drop),

@@ -536,47 +536,49 @@ impl Emitter<'_> {
     ) -> Result {
         self.completion_reset();
         let scope = self.start_scope(Some(self.f().scope))?;
-        let mut per_iteration = false;
-        if let Some(init) = init {
-            match init {
-                ForInit::Declaration(d) => {
-                    if d.kind != DeclKind::Var {
-                        self.declare(d, scope)?;
-                    }
-                    self.declaration_value(d)?;
-                    per_iteration = d.kind == DeclKind::Let;
-                }
-                ForInit::Expression(e) => {
-                    self.expression(*e)?;
-                    self.plain(Opcode::Drop);
-                }
-            }
+        if let Some(ForInit::Declaration(d)) = init
+            && d.kind != DeclKind::Var
+        {
+            self.declare(d, scope)?;
         }
-        if per_iteration {
-            self.copy_iteration(scope);
-        }
-        let test_label = self.label();
-        let update_label = self.label();
-        let exit = self.label();
         self.fm().cleanup.push(Cleanup::Scope(scope));
-        let count = self.loop_controls(labels, exit, update_label);
-        self.mark(test_label);
-        if let Some(test) = test {
-            self.expression(test)?;
-            self.if_false(exit);
-        }
-        self.statement(body)?;
-        self.mark(update_label);
-        if per_iteration {
-            self.copy_iteration(scope);
-        }
-        if let Some(update) = update {
-            self.expression(update)?;
-            self.plain(Opcode::Drop);
-        }
-        self.jump(test_label);
-        self.mark(exit);
-        self.fm().control.truncate(count);
+        self.disposal_scope(scope, |e| {
+            let per_iteration =
+                matches!(init, Some(ForInit::Declaration(d)) if d.kind == DeclKind::Let);
+            match init {
+                Some(ForInit::Declaration(d)) => e.declaration_value(d)?,
+                Some(ForInit::Expression(expr)) => {
+                    e.expression(*expr)?;
+                    e.plain(Opcode::Drop);
+                }
+                None => (),
+            }
+            if per_iteration {
+                e.copy_iteration(scope);
+            }
+            let test_label = e.label();
+            let update_label = e.label();
+            let exit = e.label();
+            let count = e.loop_controls(labels, exit, update_label);
+            e.mark(test_label);
+            if let Some(test) = test {
+                e.expression(test)?;
+                e.if_false(exit);
+            }
+            e.statement(body)?;
+            e.mark(update_label);
+            if per_iteration {
+                e.copy_iteration(scope);
+            }
+            if let Some(update) = update {
+                e.expression(update)?;
+                e.plain(Opcode::Drop);
+            }
+            e.jump(test_label);
+            e.mark(exit);
+            e.fm().control.truncate(count);
+            Ok(())
+        })?;
         self.fm().cleanup.pop();
         self.end_scope(scope);
         Ok(())
