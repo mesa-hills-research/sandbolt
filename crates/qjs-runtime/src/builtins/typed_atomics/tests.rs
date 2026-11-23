@@ -396,6 +396,34 @@ fn typed_array_methods_use_snapshot_lengths_and_live_elements() {
 }
 
 #[test]
+fn typed_iteration_and_string_conversion_use_array_intrinsics() {
+    let mut rt = runtime();
+    rt.with_scope(rt.default_realm(), |ctx| {
+        let array_proto = root(ctx, Value::object(ctx.realm().array_proto));
+        let three = root(ctx, number(3));
+        let view = construct(ctx, "Int16Array", &[three]);
+        assert_eq!(
+            named(ctx, view, "toString").unwrap(),
+            named(ctx, array_proto, "toString").unwrap()
+        );
+        let iteration = symbol(ctx, WellKnown::Iterator);
+        assert_eq!(
+            property::get_property(ctx, view, iteration).unwrap(),
+            named(ctx, view, "values").unwrap()
+        );
+        put(ctx, array_proto, "keys", Value::UNDEFINED, method_flags()).unwrap();
+        let iter = call_method(ctx, view, "keys", &[]);
+        for i in 0..3 {
+            let step = call_method(ctx, iter, "next", &[]);
+            assert_eq!(named(ctx, step, "done").unwrap(), Value::bool(false));
+            assert_eq!(number_prop(ctx, step, "value"), i as f64);
+        }
+        let step = call_method(ctx, iter, "next", &[]);
+        assert_eq!(named(ctx, step, "done").unwrap(), Value::bool(true));
+    });
+}
+
+#[test]
 fn typed_slice_copies_overlapping_species_in_increasing_order() {
     let mut rt = runtime();
     rt.with_scope(rt.default_realm(), |ctx| {

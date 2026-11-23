@@ -48,20 +48,7 @@ pub(super) fn install<'s>(ctx: &mut ExecCtx<'_, 's>) -> JsResult<()> {
     define_data(ctx, proto, iterator, values, method_flags())?;
     let array_proto = ctx.root(Value::object(ctx.realm().array_proto))?;
     let to_string = property::get_property(ctx, array_proto, PropKey::atom(Atom::TO_STRING))?;
-    let to_string = if to_string == Value::UNDEFINED
-        || property::get_own_property_descriptor(ctx, array_proto, PropKey::atom(Atom::TO_STRING))?
-            .is_none()
-    {
-        make_native_fn(
-            ctx,
-            id(TYPED_START + METHODS + methods::TO_STRING),
-            "toString",
-            0,
-            false,
-        )?
-    } else {
-        ctx.root(to_string)?
-    };
+    let to_string = ctx.root(to_string)?;
     define_data(
         ctx,
         proto,
@@ -508,9 +495,6 @@ pub(super) fn dispatch<'s>(
             Some(view) => ctx.new_string(view.kind.name()).map(|s| ctx.get(s)),
             None => Ok(Value::UNDEFINED),
         };
-    }
-    if op == METHODS + methods::TO_STRING {
-        return methods::to_string(ctx, this);
     }
     let obj = ctx.object_id(this)?;
     let view =

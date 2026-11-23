@@ -1,7 +1,9 @@
 use std::cmp::Ordering;
 
 use super::*;
+use crate::builtins::array_iter::new_array_iterator;
 use crate::ledger::TrackedVec;
+use crate::object::ArrayIteratorKind;
 use crate::ops::compare;
 
 const AT: u16 = 0;
@@ -34,7 +36,6 @@ const TO_REVERSED: u16 = 26;
 pub(super) const TO_SORTED: u16 = 27;
 const VALUES: u16 = 28;
 const WITH: u16 = 29;
-pub(super) const TO_STRING: u16 = 30;
 
 pub(super) const TABLE: &[(&str, u32)] = &[
     ("at", 1),
@@ -113,10 +114,12 @@ pub(super) fn dispatch<'s>(
             Ok(ctx.get(this))
         }
         ENTRIES | KEYS | VALUES => {
-            let array_proto = ctx.root(Value::object(ctx.realm().array_proto))?;
-            let func = named(ctx, array_proto, TABLE[op as usize].0)?;
-            let func = ctx.root(func)?;
-            call::call(ctx, func, this, Args::empty())
+            let kind = match op {
+                ENTRIES => ArrayIteratorKind::Entry,
+                KEYS => ArrayIteratorKind::Key,
+                _ => ArrayIteratorKind::Value,
+            };
+            new_array_iterator(ctx, this, kind).map(|iter| ctx.get(iter))
         }
         EVERY | FILTER | FIND | FIND_INDEX | FIND_LAST | FIND_LAST_INDEX | FOR_EACH | MAP
         | SOME => callbacks(op, ctx, this, args, view, len),
@@ -450,22 +453,6 @@ fn append_units(
         to.push_reserved(c);
     }
     Ok(())
-}
-
-pub(super) fn to_string<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>) -> JsResult<Value> {
-    let this = convert::to_object(ctx, this)?;
-    let join = named(ctx, this, "join")?;
-    let func = if join
-        .as_object()
-        .is_some_and(|obj| call::is_callable(ctx.heap(), obj))
-    {
-        join
-    } else {
-        let object_proto = ctx.root(Value::object(ctx.realm().object_proto))?;
-        property::get_property(ctx, object_proto, PropKey::atom(Atom::TO_STRING))?
-    };
-    let func = ctx.root(func)?;
-    call::call(ctx, func, this, Args::empty())
 }
 
 fn set<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>, dest: TypedArrayData) -> JsResult<Value> {
