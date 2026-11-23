@@ -28,6 +28,9 @@ const REPLACER: NativeFnId = NativeFnId(11);
 const TO_JSON: NativeFnId = NativeFnId(12);
 const RESOLVE_IDENTITY: NativeFnId = NativeFnId(13);
 const BOTH: NativeFnId = NativeFnId(14);
+const REALM_THEN: NativeFnId = NativeFnId(15);
+const REENTER_JSON: NativeFnId = NativeFnId(16);
+const THEN_GETTER_OOM: NativeFnId = NativeFnId(17);
 
 const CALLBACKS: &[NativeFn] = &[
     thenable,
@@ -45,6 +48,9 @@ const CALLBACKS: &[NativeFn] = &[
     to_json,
     resolve_identity,
     both,
+    realm_then,
+    reenter_json,
+    then_getter_oom,
 ];
 
 thread_local! {
@@ -385,7 +391,7 @@ fn promise_combinators_wait_and_preserve_iteration_order() {
     let mut runtime = runtime();
     let roots = runtime.with_scope(runtime.default_realm(), |ctx| {
         let ctor = builtin(ctx, "Promise");
-        let one = ctx.root(Value::int32(1)).unwrap();
+        let first = ctx.root(Value::int32(1)).unwrap();
         let two = ctx.root(Value::int32(2)).unwrap();
         let reason = ctx.root(Value::int32(9)).unwrap();
         let record = invoke(ctx, ctor, "withResolvers", &[]).unwrap();
@@ -409,7 +415,7 @@ fn promise_combinators_wait_and_preserve_iteration_order() {
             ctx.persist(result).unwrap()
         })
         .collect::<Vec<_>>();
-        one_call(ctx, resolve, one);
+        one(ctx, resolve, first).unwrap();
         roots
     });
     runtime.collect();
@@ -458,10 +464,6 @@ fn promise_combinators_wait_and_preserve_iteration_order() {
             assert_text(ctx, ctx.get(text), expected);
         });
     }
-}
-
-fn one_call<'s>(ctx: &mut ExecCtx<'_, 's>, callback: Handle<'s>, input: Handle<'s>) {
-    one(ctx, callback, input).unwrap();
 }
 
 #[test]
@@ -750,6 +752,110 @@ fn domexception_slots_legacy_constants_and_base64() {
         }
         assert!(invoke(ctx, global, "queueMicrotask", &[]).is_err());
         assert_kind(ctx, ErrorKind::Type);
+    });
+}
+
+fn realm_then<'s>(ctx: &mut ExecCtx<'_, 's>, _: Handle<'s>, args: Args<'s>) -> JsResult<Value> {
+    let resolve = args.get(0).unwrap();
+    assert_eq!(
+        get_prototype_of(ctx, resolve)?,
+        Some(ctx.realm().function_proto)
+    );
+    let result = ctx.root(Value::int32(17))?;
+    one(ctx, resolve, result)
+}
+
+#[test]
+fn thenable_job_creates_resolvers_in_the_then_methods_realm() {
+    let mut runtime = runtime();
+    let other = runtime.create_realm().unwrap();
+    runtime.install_builtins(other).unwrap();
+    let thenable = runtime.with_scope(other, |ctx| {
+        let thenable = ctx.new_object().unwrap();
+        let then = ctx.new_native(REALM_THEN, false).unwrap();
+        data(ctx, thenable, "then", then, DATA).unwrap();
+        ctx.persist(thenable).unwrap()
+    });
+    let promise = runtime.with_scope(runtime.default_realm(), |ctx| {
+        let thenable = ctx.get_persistent(&thenable).unwrap().unwrap();
+        let ctor = builtin(ctx, "Promise");
+        let promise = invoke(ctx, ctor, "resolve", &[thenable]).unwrap();
+        ctx.persist(promise).unwrap()
+    });
+    runtime.release_persistent(thenable);
+    runtime.run_jobs().unwrap();
+    assert_eq!(snapshot(&mut runtime, &promise).0, Some(Value::int32(17)));
+}
+
+fn reenter_json<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>, _: Args<'s>) -> JsResult<Value> {
+    let json = builtin(ctx, "JSON");
+    let redirect = get_named(ctx, this, "redirect")?;
+    let string = invoke(ctx, json, "stringify", &[redirect])?;
+    Ok(ctx.get(string))
+}
+
+fn then_getter_oom<'s>(ctx: &mut ExecCtx<'_, 's>, _: Handle<'s>, _: Args<'s>) -> JsResult<Value> {
+    EVENTS.with(|events| events.borrow_mut().push(5));
+    Err(ctx.throw_oom())
+}
+
+#[test]
+fn then_getter_runs_synchronously_and_its_oom_rejects_the_promise() {
+    let mut runtime = runtime();
+    runtime.with_scope(runtime.default_realm(), |ctx| {
+        let thenable = ctx.new_object().unwrap();
+        let get = ctx.new_native(THEN_GETTER_OOM, false).unwrap();
+        let key = ctx.intern_str("then").unwrap();
+        define_own_property(
+            ctx,
+            thenable,
+            key,
+            PropertyDescriptor {
+                get: Some(get),
+                ..PropertyDescriptor::default()
+            },
+        )
+        .unwrap();
+        let ctor = builtin(ctx, "Promise");
+        let result = invoke(ctx, ctor, "resolve", &[thenable]);
+        assert_eq!(EVENTS.with(|events| events.borrow().clone()), vec![5]);
+        let result = result.unwrap();
+        assert!(!ctx.is_oom());
+        let data = promise_data(ctx, ctx.get(result));
+        assert!(data.rejected);
+        assert_eq!(
+            data.result,
+            Some(Value::object(ctx.realm().oom_error.object))
+        );
+    });
+    assert_eq!(runtime.queued_jobs(), 0);
+}
+
+#[test]
+fn nested_to_json_calls_share_the_stack_budget() {
+    let mut runtime = runtime();
+    runtime.with_scope(runtime.default_realm(), |ctx| {
+        let json = builtin(ctx, "JSON");
+        let mut value = ctx.root(Value::NULL).unwrap();
+        for _ in 0..3 {
+            let redirect = ctx.new_object().unwrap();
+            data(ctx, redirect, "redirect", value, DATA).unwrap();
+            let method = ctx.new_native(REENTER_JSON, false).unwrap();
+            data(ctx, redirect, "toJSON", method, DATA).unwrap();
+            value = redirect;
+            for _ in 0..7 {
+                let array = ctx.new_array().unwrap();
+                let key = index_key(ctx, 0).unwrap();
+                super::super::define_data(ctx, array, key, value, DATA).unwrap();
+                value = array;
+            }
+        }
+        let original = ctx.runtime.vm.limits.stack_bytes;
+        ctx.runtime.vm.limits.stack_bytes = 40 * 1024;
+        assert!(invoke(ctx, json, "stringify", &[value]).is_err());
+        assert_kind(ctx, ErrorKind::Range);
+        ctx.runtime.vm.limits.stack_bytes = original;
+        invoke(ctx, json, "stringify", &[value]).unwrap();
     });
 }
 

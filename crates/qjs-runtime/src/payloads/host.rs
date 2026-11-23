@@ -74,17 +74,18 @@ impl Trace for HostObjectData {
     fn trace(&self, tracer: &Tracer<'_>) {
         match *self {
             Self::ResolvingPair { promise, .. } => promise.trace(tracer),
-            Self::CapabilityExecutor { resolve, reject }
-            | Self::ReactionJob {
-                handler: _,
+            Self::CapabilityExecutor { resolve, reject } => {
+                resolve.trace(tracer);
+                reject.trace(tracer);
+            }
+            Self::ReactionJob {
+                handler,
                 resolve,
                 reject,
             } => {
+                handler.trace(tracer);
                 resolve.trace(tracer);
                 reject.trace(tracer);
-                if let Self::ReactionJob { handler, .. } = *self {
-                    handler.trace(tracer);
-                }
             }
             Self::ThenableJob {
                 value,

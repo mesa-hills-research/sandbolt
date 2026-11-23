@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use super::*;
 use crate::atom::KeyKind;
 use crate::ledger::TrackedBox;
@@ -70,7 +72,7 @@ fn parse<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>, raw: bool) -> JsResult<V
     if raw && matches!(parser.peek(), None | Some(9 | 10 | 13 | 32 | 91 | 123)) {
         return Err(invalid(ctx));
     }
-    let (value, meta) = parser.value(ctx, 0)?;
+    let (value, meta) = parser.value(ctx)?;
     if !raw {
         parser.whitespace(ctx)?;
     }
@@ -99,23 +101,41 @@ fn parse<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>, raw: bool) -> JsResult<V
         input: &input,
         callback: ctx.get(reviver),
     }
-    .visit(ctx, root, empty, meta, 0)
+    .visit(ctx, root, empty, meta)
 }
 
 fn invalid(ctx: &mut ExecCtx<'_, '_>) -> Abrupt {
     ctx.throw_error(ErrorKind::Syntax, "invalid JSON")
 }
 
-fn check_depth(ctx: &mut ExecCtx<'_, '_>, depth: usize) -> JsResult<()> {
-    if depth >= MAX_DEPTH
-        || !ctx
-            .runtime
-            .vm
-            .check_budget(depth * (FRAME_COST / size_of::<Value>()), 0, 0)
-    {
-        return Err(ctx.stack_overflow());
+thread_local! {
+    static TRAVERSAL_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+struct TraversalFrame;
+
+impl TraversalFrame {
+    fn enter(ctx: &mut ExecCtx<'_, '_>) -> JsResult<Self> {
+        // A reviver, replacer or getter can start another JSON traversal on this stack.
+        let depth = TRAVERSAL_DEPTH.get();
+        if depth >= MAX_DEPTH
+            || !ctx
+                .runtime
+                .vm
+                .check_budget(depth * (FRAME_COST / size_of::<Value>()), 0, 0)
+        {
+            return Err(ctx.stack_overflow());
+        }
+        ctx.check_interrupt()?;
+        TRAVERSAL_DEPTH.set(depth + 1);
+        Ok(Self)
     }
-    ctx.check_interrupt()
+}
+
+impl Drop for TraversalFrame {
+    fn drop(&mut self) {
+        TRAVERSAL_DEPTH.set(TRAVERSAL_DEPTH.get() - 1);
+    }
 }
 
 struct Parser<'a> {
@@ -174,8 +194,8 @@ impl Parser<'_> {
         ctx.root(value)
     }
 
-    fn value<'s>(&mut self, ctx: &mut ExecCtx<'_, 's>, depth: usize) -> JsResult<Parsed<'s>> {
-        check_depth(ctx, depth)?;
+    fn value<'s>(&mut self, ctx: &mut ExecCtx<'_, 's>) -> JsResult<Parsed<'s>> {
+        let _frame = TraversalFrame::enter(ctx)?;
         self.whitespace(ctx)?;
         let start = self.pos;
         let value = match self.peek() {
@@ -184,7 +204,7 @@ impl Parser<'_> {
             Some(116) => self.literal(ctx, b"true", Value::bool(true)),
             Some(102) => self.literal(ctx, b"false", Value::bool(false)),
             Some(45 | 48..=57) => self.number(ctx),
-            Some(91 | 123) => return self.compound(ctx, depth),
+            Some(91 | 123) => return self.compound(ctx),
             _ => return Err(invalid(ctx)),
         }?;
         let meta = self
@@ -203,7 +223,7 @@ impl Parser<'_> {
         Ok((value, meta))
     }
 
-    fn compound<'s>(&mut self, ctx: &mut ExecCtx<'_, 's>, depth: usize) -> JsResult<Parsed<'s>> {
+    fn compound<'s>(&mut self, ctx: &mut ExecCtx<'_, 's>) -> JsResult<Parsed<'s>> {
         let array = self.eat(b'[');
         let close = if array {
             b']'
@@ -247,7 +267,7 @@ impl Parser<'_> {
                     self.expect(ctx, b':')?;
                     key
                 };
-                let (value, child) = self.value(ctx, depth + 1)?;
+                let (value, child) = self.value(ctx)?;
                 super::super::define_data(ctx, object, key, value, DATA)?;
                 if let Some((meta, child)) = meta.zip(child) {
                     let meta = ctx.root(meta)?;
@@ -370,9 +390,8 @@ impl Reviver<'_> {
         holder: Handle<'s>,
         key: PropKey,
         meta: Option<Handle<'s>>,
-        depth: usize,
     ) -> JsResult<Value> {
-        check_depth(ctx, depth)?;
+        let _frame = TraversalFrame::enter(ctx)?;
         let value = get(ctx, holder, key)?;
         let record = meta.and_then(|meta| {
             let ObjectData::HostObject(meta) =
@@ -401,7 +420,7 @@ impl Reviver<'_> {
                     let meta = meta.map(|meta| ctx.get(meta));
                     ctx.with_scope(|ctx| {
                         let key = index_key(ctx, index)?;
-                        self.update(ctx, value, key, meta, depth + 1)
+                        self.update(ctx, value, key, meta)
                     })?;
                 }
             } else {
@@ -409,7 +428,7 @@ impl Reviver<'_> {
                 for &key in keys.iter() {
                     let value = ctx.get(value);
                     let meta = meta.map(|meta| ctx.get(meta));
-                    ctx.with_scope(|ctx| self.update(ctx, value, key, meta, depth + 1))?;
+                    ctx.with_scope(|ctx| self.update(ctx, value, key, meta))?;
                 }
             }
         } else if let Some((start, end)) = record {
@@ -430,7 +449,6 @@ impl Reviver<'_> {
         holder: Value,
         key: PropKey,
         meta: Option<Value>,
-        depth: usize,
     ) -> JsResult<()> {
         let holder = ctx.root(holder)?;
         let meta = if let Some(meta) = meta {
@@ -440,7 +458,7 @@ impl Reviver<'_> {
         } else {
             None
         };
-        let value = self.visit(ctx, holder, key, meta, depth)?;
+        let value = self.visit(ctx, holder, key, meta)?;
         if value == Value::UNDEFINED {
             delete_property(ctx, holder, key)?;
         } else {
@@ -645,7 +663,7 @@ impl Writer<'_> {
         value: Handle<'s>,
         depth: usize,
     ) -> JsResult<()> {
-        check_depth(ctx, depth)?;
+        let _frame = TraversalFrame::enter(ctx)?;
         match ctx.get(value).decode() {
             ValueKind::Null => self.ascii(ctx, b"null"),
             ValueKind::Bool(true) => self.ascii(ctx, b"true"),

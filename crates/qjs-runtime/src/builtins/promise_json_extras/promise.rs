@@ -1,9 +1,9 @@
 use super::*;
 use crate::ledger::TrackedBox;
 use crate::object::{ErrorData, ErrorKind, PromiseData, Reaction};
-use crate::ops::call::construct;
+use crate::ops::call::{construct, function_realm};
 use crate::ops::convert::to_boolean;
-use crate::value::{Abrupt, ObjId};
+use crate::value::{Abrupt, ObjId, RealmId};
 use crate::vm::Job;
 
 const CONSTRUCTOR: NativeFnId = NativeFnId(BASE);
@@ -234,7 +234,7 @@ fn constructor<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>) -> JsResult<Value>
 }
 
 fn reason<'s>(ctx: &mut ExecCtx<'_, 's>, error: Abrupt) -> JsResult<Handle<'s>> {
-    if error == Abrupt::Interrupted || ctx.is_oom() {
+    if error == Abrupt::Interrupted {
         return Err(error);
     }
     let (value, _) = ctx.take_exception().expect("throw without an exception");
@@ -301,9 +301,8 @@ fn resolve_fn<'s>(
                     promise: ctx.get(promise),
                 },
             )?;
-            let job = closure(ctx, THENABLE_JOB, job_state, 0)?;
-            let undefined = ctx.root(Value::UNDEFINED)?;
-            ctx.enqueue_job(job, undefined)?;
+            let job = reaction(ctx, THENABLE_JOB, job_state, ctx.get(then))?;
+            enqueue(ctx, job, Value::UNDEFINED)?;
         } else {
             fulfill_promise(ctx, promise, value)?;
         }
@@ -421,20 +420,20 @@ pub(crate) fn perform_promise_then<'s>(
         reject,
     };
     let fulfilled = host(ctx, state(ctx.get(on_fulfilled)))?;
-    let fulfilled = closure(ctx, FULFILL_JOB, fulfilled, 1)?;
+    let fulfilled = reaction(ctx, FULFILL_JOB, fulfilled, ctx.get(on_fulfilled))?;
     let rejected = host(ctx, state(ctx.get(on_rejected)))?;
-    let rejected = closure(ctx, REJECT_JOB, rejected, 1)?;
-    let realm = ctx.realm_id();
-    let (fulfilled_id, rejected_id) = (ctx.object_id(fulfilled)?, ctx.object_id(rejected)?);
+    let rejected = reaction(ctx, REJECT_JOB, rejected, ctx.get(on_rejected))?;
     let promise_data = read_promise(ctx, id);
     if let Some(argument) = promise_data.result {
-        let reaction = if promise_data.rejected {
-            rejected
-        } else {
-            fulfilled
-        };
-        let argument = ctx.root(argument)?;
-        ctx.enqueue_job(reaction, argument)?;
+        enqueue(
+            ctx,
+            if promise_data.rejected {
+                rejected
+            } else {
+                fulfilled
+            },
+            argument,
+        )?;
     } else {
         ctx.allocate(|runtime| {
             let heap = &mut runtime.heap;
@@ -443,14 +442,8 @@ pub(crate) fn perform_promise_then<'s>(
             };
             data.reactions.try_reserve(&heap.ledger, 1)?;
             data.reject_reactions.try_reserve(&heap.ledger, 1)?;
-            data.reactions.push_reserved(Reaction {
-                callback: fulfilled_id,
-                realm,
-            });
-            data.reject_reactions.push_reserved(Reaction {
-                callback: rejected_id,
-                realm,
-            });
+            data.reactions.push_reserved(fulfilled);
+            data.reject_reactions.push_reserved(rejected);
             Ok(())
         })?;
     }
@@ -459,6 +452,45 @@ pub(crate) fn perform_promise_then<'s>(
     };
     data.is_handled = true;
     Ok(())
+}
+
+fn reaction<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    id: NativeFnId,
+    state: Handle<'s>,
+    handler: Value,
+) -> JsResult<Reaction> {
+    let realm = handler_realm(ctx, handler);
+    let state = ctx.get(state);
+    let callback = ctx.runtime.with_scope(realm, |ctx| {
+        let state = ctx.root(state)?;
+        let native = ctx.new_native(id, false)?;
+        let job = ctx.bind_function(native, state, Args::empty())?;
+        ctx.object_id(job)
+    })?;
+    ctx.root(Value::object(callback))?;
+    Ok(Reaction { callback, realm })
+}
+
+fn handler_realm(ctx: &ExecCtx<'_, '_>, handler: Value) -> RealmId {
+    handler
+        .as_object()
+        .filter(|&id| is_callable(ctx.heap(), id))
+        .and_then(|id| function_realm(ctx.heap(), id))
+        .unwrap_or_else(|| ctx.realm_id())
+}
+
+fn enqueue(ctx: &mut ExecCtx<'_, '_>, reaction: Reaction, argument: Value) -> JsResult<()> {
+    ctx.root(argument)?;
+    ctx.allocate(|runtime| {
+        runtime.reserve_jobs(1)?;
+        runtime.job_queue.push_reserved(Job {
+            callback: reaction.callback,
+            realm: reaction.realm,
+            argument,
+        });
+        Ok(())
+    })
 }
 
 fn reaction_job<'s>(
@@ -771,7 +803,7 @@ fn close_iterator_on_throw<'s, T>(
         }
         Ok(())
     })();
-    if close == Err(Abrupt::Interrupted) || ctx.is_oom() {
+    if close == Err(Abrupt::Interrupted) {
         close?;
     }
     Err(ctx.throw(thrown))
