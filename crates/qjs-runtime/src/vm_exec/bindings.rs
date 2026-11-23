@@ -222,13 +222,21 @@ fn define_lexical(ctx: &mut ExecCtx<'_, '_>, key: PropKey, writable: bool) -> Js
     })
 }
 
-fn global_ref<'s>(ctx: &mut ExecCtx<'_, 's>, code: BcId, key: PropKey) -> JsResult<Value> {
+fn scoped_ref(ctx: &mut ExecCtx<'_, '_>, code: BcId, key: PropKey) -> JsResult<Option<Value>> {
     if let Some(binding) = super::eval::lookup(ctx, code, key)? {
-        return Ok(binding);
+        return Ok(Some(binding));
     }
-    if let Some((id, _)) = lexical(ctx, key) {
-        return Ok(Value::var_ref(id));
+    Ok(lexical(ctx, key).map(|(id, _)| Value::var_ref(id)))
+}
+
+fn global_ref(ctx: &mut ExecCtx<'_, '_>, code: BcId, key: PropKey) -> JsResult<Value> {
+    match scoped_ref(ctx, code, key)? {
+        Some(binding) => Ok(binding),
+        None => global_object_ref(ctx, key),
     }
+}
+
+fn global_object_ref(ctx: &mut ExecCtx<'_, '_>, key: PropKey) -> JsResult<Value> {
     let global = Value::object(ctx.realm().global_object);
     let h = ctx.root(global)?;
     Ok(if property::has_property(ctx, h, key)? {
@@ -236,6 +244,18 @@ fn global_ref<'s>(ctx: &mut ExecCtx<'_, 's>, code: BcId, key: PropKey) -> JsResu
     } else {
         Value::UNDEFINED
     })
+}
+
+fn global_data_slot(
+    ctx: &ExecCtx<'_, '_>,
+    key: PropKey,
+) -> Option<(ObjId, usize, Value, PropFlags)> {
+    // The realm global is ordinary, so its own data properties can use their slots directly.
+    let id = ctx.realm().global_object;
+    let object = ctx.heap().object(id);
+    let (index, flags) = ctx.heap().shape(object.shape).find(key)?;
+    let value = object.props[index];
+    (!matches!(value.decode(), ValueKind::Accessor(_))).then_some((id, index, value, flags))
 }
 
 fn read_binding<'s>(
@@ -322,7 +342,16 @@ pub(super) fn binding_op(
         let result = match op {
             GetVar | GetVarUndef => {
                 let key = atom.unwrap();
-                let binding = global_ref(ctx, code, key)?;
+                let binding = scoped_ref(ctx, code, key)?;
+                if binding.is_none()
+                    && let Some((_, _, value, _)) = global_data_slot(ctx, key)
+                {
+                    return Ok((0, [value, Value::EMPTY], None));
+                }
+                let binding = match binding {
+                    Some(binding) => binding,
+                    None => global_object_ref(ctx, key)?,
+                };
                 let binding = ctx.root(binding)?;
                 (
                     0,
@@ -335,7 +364,20 @@ pub(super) fn binding_op(
             }
             PutVar | PutVarInit => {
                 let key = atom.unwrap();
-                let binding = global_ref(ctx, code, key)?;
+                let binding = scoped_ref(ctx, code, key)?;
+                if binding.is_none()
+                    && let Some((id, index, _, flags)) = global_data_slot(ctx, key)
+                    && flags.contains(PropFlags::WRITABLE)
+                {
+                    let value = ctx.get(h(1));
+                    ctx.runtime.heap.objects.get_mut(id).unwrap().props[index] = value;
+                    property::invalidate_array_prototypes(ctx, id);
+                    return Ok((1, [Value::EMPTY; 2], None));
+                }
+                let binding = match binding {
+                    Some(binding) => binding,
+                    None => global_object_ref(ctx, key)?,
+                };
                 let binding = ctx.root(binding)?;
                 write_binding(ctx, binding, key, h(1), strict, op == PutVarInit)?;
                 (1, [Value::EMPTY; 2], None)

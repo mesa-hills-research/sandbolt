@@ -105,6 +105,19 @@ fn numeric_property_keys_preserve_proxy_key_strings() {
 }
 
 #[test]
+fn number_operations_preserve_signed_zero_and_unordered_comparisons() {
+    assert_eq!(
+        run(r#"
+        let z = -0, n = NaN, inf = Infinity;
+        [Object.is(z / 3, -0), Object.is(z * -1, 0), z == 0, n == n,
+         n <= 1, 1 >= n, 1 ** inf, 0xffffffff >>> 0, ~4294967295,
+         -1.9 >>> 0, 0xfffffffe + 2].join('|')
+        "#),
+        "true|true|true|false|false|false|NaN|4294967295|0|4294967295|4294967296"
+    );
+}
+
+#[test]
 fn numeric_binary_operators_coerce_the_left_operand_first() {
     assert_eq!(
         run(r#"
@@ -141,6 +154,41 @@ fn computed_references_check_the_base_and_reuse_the_key() {
         log.join(',')
     "#),
         "property,TypeError,property,TypeError,property,key,rhs,property,key,8,9"
+    );
+}
+
+#[test]
+fn global_data_reads_and_writes_respect_binding_changes() {
+    assert_eq!(
+        run(r#"
+        'use strict';
+        let log = [];
+        Object.defineProperty(globalThis, 'count', {value: 1, writable: true, configurable: true});
+        count = 2;
+        log.push(count);
+        function shadow() { let count = 3; return eval('count = 4; count'); }
+        log.push(shadow(), count);
+        Object.defineProperty(globalThis, 'count', {
+          get() { log.push('get'); return 5; },
+          set(value) { log.push('set', value); }
+        });
+        count = 6;
+        log.push(count);
+        Object.defineProperty(globalThis, 'count', {value: 7, writable: false});
+        try { count = 8; } catch (error) { log.push(error.name); }
+        log.push(count);
+        delete globalThis.count;
+        try { count; } catch (error) { log.push(error.name); }
+        Object.setPrototypeOf(globalThis, new Proxy(Object.getPrototypeOf(globalThis), {
+            has(target, key) { return key === 'count' || Reflect.has(target, key); },
+            get(target, key, receiver) {
+                return key === 'count' ? receiver === globalThis : Reflect.get(target, key, receiver);
+            }
+        }));
+        log.push(count);
+        log.join('|')
+        "#),
+        "2|4|2|set|6|get|5|TypeError|7|ReferenceError|true"
     );
 }
 

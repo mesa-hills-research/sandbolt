@@ -123,6 +123,9 @@ pub fn to_primitive<'s>(
 
 pub fn to_number<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<f64> {
     let raw = ctx.get(value);
+    if let Some(number) = raw.as_number() {
+        return Ok(number);
+    }
     ctx.with_scope(|ctx| {
         let value = ctx.root(raw)?;
         let raw = to_primitive(ctx, value, PreferredType::Number)?;
@@ -219,6 +222,9 @@ pub fn to_uint32<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<u
 }
 
 pub(crate) fn number_to_uint32(n: f64) -> u32 {
+    if (0.0..4_294_967_296.0).contains(&n) {
+        return n as u32;
+    }
     if !n.is_finite() {
         return 0;
     }

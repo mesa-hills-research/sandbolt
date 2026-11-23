@@ -126,6 +126,24 @@ impl JsString {
             _ => 0,
         }
     }
+
+    pub(crate) fn unit_at(arena: &Arena<Self>, mut id: StrId, mut index: u32) -> Option<u16> {
+        loop {
+            match arena.get(id).expect("missing string") {
+                Self::Latin1 { data, .. } => return data.get(index as usize).copied().map(u16::from),
+                Self::Utf16(data) => return data.get(index as usize).copied(),
+                Self::Rope { left, right, .. } => {
+                    let left_len = arena.get(*left).expect("missing string").len();
+                    if index < left_len {
+                        id = *left;
+                    } else {
+                        id = *right;
+                        index -= left_len;
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub struct StringUnits<'a> {

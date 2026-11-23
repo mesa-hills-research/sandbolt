@@ -48,6 +48,9 @@ fn equal(heap: &Heap, x: Value, y: Value, kind: Equality) -> bool {
 
 pub fn abstract_eq<'s>(ctx: &mut ExecCtx<'_, 's>, x: Handle<'s>, y: Handle<'s>) -> JsResult<bool> {
     let (x, y) = (ctx.get(x), ctx.get(y));
+    if let (Some(x), Some(y)) = (x.as_number(), y.as_number()) {
+        return Ok(x == y);
+    }
     ctx.with_scope(|ctx| {
         let x = ctx.mut_root(x)?;
         let y = ctx.mut_root(y)?;
@@ -123,6 +126,9 @@ pub fn abstract_relational<'s>(
     left_first: bool,
 ) -> JsResult<Option<bool>> {
     let (left, right) = (ctx.get(left), ctx.get(right));
+    if let (Some(a), Some(b)) = (left.as_number(), right.as_number()) {
+        return Ok(a.partial_cmp(&b).map(|order| order == Ordering::Less));
+    }
     ctx.with_scope(|ctx| {
         let (first, second) = if left_first {
             (left, right)

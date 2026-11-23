@@ -226,6 +226,9 @@ pub(super) fn binary<'s>(
     right: Handle<'s>,
 ) -> JsResult<Value> {
     use Opcode::*;
+    if let (Some(a), Some(b)) = (ctx.get(left).as_number(), ctx.get(right).as_number()) {
+        return Ok(number_binary(op, a, b));
+    }
     let (left, right) = if op == Add {
         let a = convert::to_primitive(ctx, left, PreferredType::Default)?;
         let left = ctx.root(a)?;
@@ -274,10 +277,15 @@ pub(super) fn binary<'s>(
         }
         _ => return Err(ctx.throw_type_error("cannot mix BigInt and Number")),
     };
+    Ok(number_binary(op, a, b))
+}
+
+fn number_binary(op: Opcode, a: f64, b: f64) -> Value {
+    use Opcode::*;
     if matches!(op, Shl | Sar | Shr | And | Or | Xor) {
         let a = convert::number_to_uint32(a);
         let b = convert::number_to_uint32(b);
-        return Ok(match op {
+        return match op {
             Shl => Value::int32((a << (b & 31)) as i32),
             Sar => Value::int32((a as i32) >> (b & 31)),
             Shr => Value::number(f64::from(a >> (b & 31))),
@@ -285,9 +293,9 @@ pub(super) fn binary<'s>(
             Or => Value::int32((a | b) as i32),
             Xor => Value::int32((a ^ b) as i32),
             _ => unreachable!(),
-        });
+        };
     }
-    Ok(Value::number(match op {
+    Value::number(match op {
         Add => a + b,
         Sub => a - b,
         Mul => a * b,
@@ -296,7 +304,7 @@ pub(super) fn binary<'s>(
         Pow if b.is_nan() || (a.abs() == 1.0 && b.is_infinite()) => f64::NAN,
         Pow => a.powf(b),
         _ => unreachable!(),
-    }))
+    })
 }
 
 pub(super) fn unary<'s>(
@@ -306,8 +314,11 @@ pub(super) fn unary<'s>(
 ) -> JsResult<(Value, Value)> {
     use Opcode::*;
     let raw = convert::to_primitive(ctx, value, PreferredType::Number)?;
+    if let Some(number) = raw.as_number() {
+        return Ok(number_unary(op, number));
+    }
     let value = ctx.root(raw)?;
-    let (before, after) = if bigint(raw) {
+    if bigint(raw) {
         if op == Plus {
             return Err(ctx.throw_type_error("cannot convert BigInt to number"));
         }
@@ -327,18 +338,21 @@ pub(super) fn unary<'s>(
             };
             store(heap, &result)
         })?;
-        (raw, result)
+        Ok((raw, result))
     } else {
-        let number = convert::to_number(ctx, value)?;
-        let result = match op {
-            Neg => -number,
-            Plus => number,
-            Inc | PostInc => number + 1.0,
-            Dec | PostDec => number - 1.0,
-            Not => f64::from(!convert::to_int32(ctx, value)?),
-            _ => unreachable!(),
-        };
-        (Value::number(number), Value::number(result))
+        Ok(number_unary(op, convert::to_number(ctx, value)?))
+    }
+}
+
+fn number_unary(op: Opcode, number: f64) -> (Value, Value) {
+    use Opcode::*;
+    let result = match op {
+        Neg => -number,
+        Plus => number,
+        Inc | PostInc => number + 1.0,
+        Dec | PostDec => number - 1.0,
+        Not => f64::from(!(convert::number_to_uint32(number) as i32)),
+        _ => unreachable!(),
     };
-    Ok((before, after))
+    (Value::number(number), Value::number(result))
 }

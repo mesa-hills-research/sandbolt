@@ -670,6 +670,14 @@ fn uri_encoders_and_decoders_preserve_their_distinct_sets() {
         let result = call_with(ctx, encode, undef, &[lone]);
         exception_kind(ctx, result, ErrorKind::Uri);
         let decode = global_value(ctx, "decodeURIComponent");
+        for len in [20, 21] {
+            let head_text = "x".repeat(len);
+            let head = ctx.new_string(&head_text).unwrap();
+            let tail = ctx.new_string("%F0%9F%90%88").unwrap();
+            let rope = ctx.concat_strings(head, tail).unwrap();
+            let actual = call_with(ctx, decode, undef, &[rope]).unwrap();
+            assert_text(ctx, actual, &(head_text + "🐈"));
+        }
         let actual = call_with(ctx, decode, undef, &[lone]).unwrap();
         assert_units(ctx, actual, &[0xd800]);
         for invalid in [

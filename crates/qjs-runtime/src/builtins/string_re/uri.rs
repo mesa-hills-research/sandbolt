@@ -2,7 +2,8 @@ use crate::object::ErrorKind;
 use crate::root::{Args, ExecCtx};
 use crate::value::{JsResult, Value};
 
-use super::{Builder, STRING_RE_BASE, arg, code_point, global, make_native_fn, text};
+use super::{Builder, STRING_RE_BASE, arg, code_point, global, make_native_fn, string_id, units};
+use crate::ops::convert::to_string;
 use crate::realm::NativeFnId;
 
 const NAMES: [&str; 6] = [
@@ -36,12 +37,27 @@ pub(super) fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
 
 pub(super) fn dispatch<'s>(op: u16, ctx: &mut ExecCtx<'_, 's>, args: Args<'s>) -> JsResult<Value> {
     let input = arg(ctx, args, 0)?;
-    let units = text(ctx, input)?;
+    let input = to_string(ctx, input)?;
+    let value = ctx.get(input);
+    let id = string_id(value);
+    let len = ctx.heap().string(id).len() as usize;
+    let mut short = [0; 32];
+    let long;
+    let input: &[u16] = if let Some(short) = short.get_mut(..len) {
+        for (slot, unit) in short.iter_mut().zip(ctx.heap().string_units(id)) {
+            *slot = unit;
+        }
+        ctx.check_interrupt()?;
+        short
+    } else {
+        long = units(ctx, value)?;
+        &long
+    };
     match op {
-        0 | 1 => encode(ctx, &units, op == 0),
-        2 | 3 => decode(ctx, &units, op == 2),
-        4 => escape(ctx, &units),
-        _ => unescape(ctx, &units),
+        0 | 1 => encode(ctx, input, op == 0),
+        2 | 3 => decode(ctx, input, op == 2),
+        4 => escape(ctx, input),
+        _ => unescape(ctx, input),
     }
 }
 

@@ -4,6 +4,7 @@ use crate::ledger::{TrackedBox, TrackedVec};
 use crate::object::{Accessor, ObjectData, ObjectFlags, ProxyData};
 use crate::root::{Args, ExecCtx, Handle};
 use crate::shape::{PropFlags, Shape, ShapeProp};
+use crate::string::JsString;
 use crate::value::*;
 
 #[derive(Clone, Copy, Debug)]
@@ -126,7 +127,7 @@ fn read_string_property(
     index: Option<u32>,
 ) -> JsResult<Value> {
     if let Some(index) = index {
-        let unit = ctx.heap().string_units(string).nth(index as usize).unwrap();
+        let unit = JsString::unit_at(&ctx.heap().strings, string, index).unwrap();
         let value = ctx.new_utf16(&[unit])?;
         Ok(ctx.get(value))
     } else {
@@ -1702,7 +1703,7 @@ pub fn prevent_extensions<'s>(ctx: &mut ExecCtx<'_, 's>, object: Handle<'s>) -> 
     Ok(true)
 }
 
-fn invalidate_array_prototypes(ctx: &mut ExecCtx<'_, '_>, object: ObjId) {
+pub(crate) fn invalidate_array_prototypes(ctx: &mut ExecCtx<'_, '_>, object: ObjId) {
     if !ctx
         .heap()
         .object(object)

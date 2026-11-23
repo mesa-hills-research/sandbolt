@@ -534,6 +534,12 @@ fn ropes_flatten_in_place_without_losing_surrogates() {
         let string = ctx.concat_strings(head, tail).unwrap();
         let id = string_id(ctx.get(string));
         assert_eq!(ctx.heap().string(id).depth(), 1);
+        for (index, unit) in [101, 233, 0xd800, 0xdc00, 0xdfff].into_iter().enumerate() {
+            assert_eq!(
+                crate::string::JsString::unit_at(&ctx.heap().strings, id, index as u32),
+                Some(unit)
+            );
+        }
         ctx.flatten_string(string).unwrap();
         assert_eq!(ctx.heap().string(id).depth(), 0);
         assert!(
