@@ -218,6 +218,18 @@ fn native(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame) -> JsResult<Value> {
         unreachable!()
     };
     let id = data.function;
+    if (0x1000..=0x1FFF).contains(&id.0) {
+        let base = frame.base as usize;
+        return RootScope::new(ctx.runtime, frame.realm).run(|ctx| {
+            crate::builtins::dispatch(
+                id,
+                ctx,
+                Handle::at(base + 1),
+                Args::new(base + 2, frame.arg_count as usize),
+            )
+            .unwrap()
+        });
+    }
     let function = super::convert::builtin_native(id).or_else(|| {
         (id.0 < 0xfff0)
             .then(|| ctx.runtime.native_dispatch.get(id.0 as usize).copied())

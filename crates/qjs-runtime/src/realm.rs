@@ -423,6 +423,10 @@ impl Runtime {
         })
     }
 
+    pub fn install_builtins(&mut self, realm: RealmId) -> JsResult<()> {
+        self.with_scope(realm, crate::builtins::install_all)
+    }
+
     #[cfg(feature = "gc_stress")]
     pub fn set_gc_stress_interval(&mut self, interval: usize) {
         self.stress_interval = interval.max(1);

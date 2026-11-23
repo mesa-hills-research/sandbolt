@@ -10,8 +10,10 @@
 
 #![deny(unsafe_code)]
 
+pub mod api;
 pub mod arena;
 pub mod atom;
+pub mod builtins;
 pub mod gc;
 pub mod heap;
 pub mod ledger;
