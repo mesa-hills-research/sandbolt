@@ -69,6 +69,29 @@ fn exact_function_source() {
         panic!()
     };
     assert_eq!(source.slice(f.span), raw.as_bytes());
+    let method = "async *f() {}";
+    let source = SourceText::from_utf8(
+        "sample.js",
+        &format!("class C {{ static /* comment */ {method} }}"),
+    );
+    let tree = parse(&source, ParseOptions::default()).unwrap();
+    let Stmt::Class(class) = &tree.arena.stmt(tree.body[0]).kind else {
+        panic!()
+    };
+    let ClassElement::Method { function, .. } = &class.elements[0] else {
+        panic!()
+    };
+    assert_eq!(source.slice(function.span), method.as_bytes());
+}
+
+#[test]
+fn spans_separate_parentheses_from_the_expression() {
+    let source = SourceText::from_utf8("sample.js", "( a, b /* comment */ );");
+    let tree = parse(&source, ParseOptions::default()).unwrap();
+    let Expr::Parenthesized(inner) = expression(&tree, 0) else {
+        panic!()
+    };
+    assert_eq!(source.slice(tree.arena.expr(*inner).span), b"a, b");
 }
 
 #[test]
@@ -100,7 +123,18 @@ fn lexical_goals() {
         "let x = /x/d;",
         "function f(){return /=/.test('=');}",
     ]);
-    invalid(&["/x/uu", "/x/uv", "/x/foo", "/x/\\u0067", "/x\n/"]);
+    invalid(&[
+        "/x/uu",
+        "/x/uv",
+        "/x/foo",
+        "/x/\\u0067",
+        "/x\n/",
+        "/(/",
+        "/[z-a]/",
+        r"/\a/u",
+        "/(?i-i:a)/",
+    ]);
+    valid(&["/😀+/u", "/😀+/", "/(?i:a)/", "/[a&&b]/v"]);
 }
 
 #[test]

@@ -1,6 +1,7 @@
 mod cover;
 mod expression;
 mod module;
+mod regexp;
 mod statement;
 
 pub(crate) use statement::name_is;
@@ -136,16 +137,16 @@ impl<'a> Parser<'a> {
         result
     }
     fn expr(&mut self, start: u32, kind: Expr) -> Result<ExprId> {
+        self.expr_at(self.span(start), kind)
+    }
+    fn expr_at(&mut self, span: Span, kind: Expr) -> Result<ExprId> {
         self.charge(mem::size_of::<Node<Expr>>())?;
         self.arena
             .expressions
             .try_reserve(1)
             .map_err(|_| self.oom())?;
         let id = ExprId(self.arena.expressions.len() as u32);
-        self.arena.expressions.push(Node {
-            span: self.span(start),
-            kind,
-        });
+        self.arena.expressions.push(Node { span, kind });
         Ok(id)
     }
     fn stmt(&mut self, start: u32, kind: Stmt) -> Result<StmtId> {

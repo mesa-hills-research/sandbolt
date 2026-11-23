@@ -288,7 +288,9 @@ impl Parser<'_> {
                 let inner = if list.len() == 1 {
                     list[0]
                 } else {
-                    self.expr(self.arena.expr(list[0]).span.start, Expr::Sequence(list))?
+                    let start = self.arena.expr(list[0]).span.start;
+                    let end = self.arena.expr(*list.last().unwrap()).span.end;
+                    self.expr_at(Span::new(start, end), Expr::Sequence(list))?
                 };
                 Expr::Parenthesized(inner)
             }
@@ -306,10 +308,12 @@ impl Parser<'_> {
                 self.current = self
                     .lexer
                     .at_token(self.current.span, LexicalGoal::RegExp)?;
-                match self.next()?.kind {
-                    TokenKind::RegExp(literal) => Expr::RegExp(literal),
-                    _ => unreachable!(),
-                }
+                let token = self.next()?;
+                let TokenKind::RegExp(literal) = token.kind else {
+                    unreachable!()
+                };
+                self.check_regexp(&literal, token.span)?;
+                Expr::RegExp(literal)
             }
             TokenKind::Word(_) if self.word("function") || self.is_async_function()? => {
                 Expr::Function(self.function(false)?)

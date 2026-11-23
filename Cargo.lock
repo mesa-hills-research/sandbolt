@@ -49,6 +49,7 @@ name = "qjs-syntax"
 version = "0.1.0"
 dependencies = [
  "qjs-dtoa",
+ "qjs-regexp",
  "qjs-unicode",
 ]
 

@@ -42,10 +42,10 @@ impl Parser<'_> {
                     if i + 1 != len || trailing {
                         return Err(self.error_at(span, "Rest parameter must be last"));
                     }
-                    let pat = self.to_pattern(id, true, false, false)?;
+                    let pat = self.reinterpret_pattern(id, true, false, false)?;
                     self.pattern(span, Pattern::Rest(pat))?
                 }
-                Item::Value(id) => self.to_pattern(id, true, true, false)?,
+                Item::Value(id) => self.reinterpret_pattern(id, true, true, false)?,
             };
             self.push(&mut params, pattern)?;
         }
@@ -100,7 +100,7 @@ impl Parser<'_> {
             self.object()?
         };
         let id = self.expr(start, kind)?;
-        self.to_pattern(id, true, false, false)
+        self.reinterpret_pattern(id, true, false, false)
     }
 
     pub(super) fn assignment_target(
@@ -120,20 +120,20 @@ impl Parser<'_> {
                 "Compound assignment requires a simple target",
             ));
         }
-        self.to_pattern(id, false, false, annex_call)
+        self.reinterpret_pattern(id, false, false, annex_call)
     }
 
-    fn to_pattern(
+    fn reinterpret_pattern(
         &mut self,
         id: ExprId,
         binding: bool,
         default: bool,
         annex_call: bool,
     ) -> Result<PatternId> {
-        self.nest(|p| p.to_pattern_inner(id, binding, default, annex_call))
+        self.nest(|p| p.reinterpret_pattern_inner(id, binding, default, annex_call))
     }
 
-    fn to_pattern_inner(
+    fn reinterpret_pattern_inner(
         &mut self,
         id: ExprId,
         binding: bool,
@@ -168,14 +168,14 @@ impl Parser<'_> {
                     match item {
                         None => self.push(&mut elements, None)?,
                         Some(Item::Value(id)) => {
-                            let id = self.to_pattern(id, binding, true, false)?;
+                            let id = self.reinterpret_pattern(id, binding, true, false)?;
                             self.push(&mut elements, Some(id))?;
                         }
                         Some(Item::Spread(id)) => {
                             if i + 1 != len || trailing_comma {
                                 return Err(self.error_at(span, "Rest element must be last"));
                             }
-                            rest = Some(self.to_pattern(id, binding, false, false)?);
+                            rest = Some(self.reinterpret_pattern(id, binding, false, false)?);
                         }
                     }
                 }
@@ -200,12 +200,12 @@ impl Parser<'_> {
                                     "Invalid object rest target",
                                 ));
                             }
-                            rest = Some(self.to_pattern(id, binding, false, false)?);
+                            rest = Some(self.reinterpret_pattern(id, binding, false, false)?);
                             continue;
                         }
                         Property::Value { key, value } => PatternProperty {
                             key,
-                            target: self.to_pattern(value, binding, true, false)?,
+                            target: self.reinterpret_pattern(value, binding, true, false)?,
                         },
                         Property::Shorthand(key) => PatternProperty {
                             target: self.pattern(key.span, Pattern::Identifier(key.clone()))?,

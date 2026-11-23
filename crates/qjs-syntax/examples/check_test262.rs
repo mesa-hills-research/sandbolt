@@ -4,19 +4,24 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use qjs_syntax::{ParseGoal, ParseOptions, SourceText, parse};
+use qjs_syntax::{ParseErrorKind, ParseGoal, ParseOptions, SourceText, parse};
 
 #[derive(Default)]
 struct Counts {
     total: usize,
     invalid_accepted: usize,
     valid_rejected: usize,
+    wrong_error: usize,
     skipped: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args_os().skip(1).map(PathBuf::from);
     let config = fs::read_to_string(args.next().ok_or("Expected path to test262.conf")?)?;
+    let args = args.collect::<Vec<_>>();
+    if args.is_empty() {
+        return Err("Expected at least one test directory".into());
+    }
     let skipped = config
         .lines()
         .filter_map(|line| line.split_once('='))
@@ -28,10 +33,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         visit(&root, &skipped, &mut counts)?;
     }
     eprintln!(
-        "{} parses, {} invalid accepted, {} valid rejected, {} files skipped",
-        counts.total, counts.invalid_accepted, counts.valid_rejected, counts.skipped
+        "{} parses, {} invalid accepted, {} valid rejected, {} wrong errors, {} files skipped",
+        counts.total,
+        counts.invalid_accepted,
+        counts.valid_rejected,
+        counts.wrong_error,
+        counts.skipped
     );
-    if counts.invalid_accepted != 0 || counts.valid_rejected != 0 {
+    if counts.invalid_accepted != 0 || counts.valid_rejected != 0 || counts.wrong_error != 0 {
         std::process::exit(1);
     }
     Ok(())
@@ -54,9 +63,9 @@ fn visit(path: &Path, skip: &HashSet<&str>, counts: &mut Counts) -> std::io::Res
             counts.skipped += 1;
             return Ok(());
         };
-        let Some((_, meta)) = text
+        let Some((meta, _)) = text
             .split_once("/*---")
-            .and_then(|(_, rest)| rest.split_once("---*/").map(|(meta, rest)| (rest, meta)))
+            .and_then(|(_, rest)| rest.split_once("---*/"))
         else {
             counts.skipped += 1;
             return Ok(());
@@ -108,6 +117,10 @@ fn visit(path: &Path, skip: &HashSet<&str>, counts: &mut Counts) -> std::io::Res
                 (Err(e), false) => {
                     counts.valid_rejected += 1;
                     println!("rejected {} ({suffix}) {e}", path.display());
+                }
+                (Err(e), true) if e.kind != ParseErrorKind::Syntax => {
+                    counts.wrong_error += 1;
+                    println!("wrong error {} ({suffix}) {e}", path.display());
                 }
                 _ => (),
             }

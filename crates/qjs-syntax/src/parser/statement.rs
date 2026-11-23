@@ -509,7 +509,6 @@ impl Parser<'_> {
             if self.eat(";")? {
                 continue;
             }
-            let start = self.start();
             let mut is_static = false;
             if self.word("static") {
                 let next = self.peek()?;
@@ -530,6 +529,7 @@ impl Parser<'_> {
                     is_static = true;
                 }
             }
+            let start = self.start();
             let (key, mut kind, is_async, is_generator) = self.method_name(true)?;
             let element =
                 if self.punct("(") || kind != MethodKind::Method || is_async || is_generator {

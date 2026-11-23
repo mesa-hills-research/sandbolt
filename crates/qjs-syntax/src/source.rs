@@ -32,17 +32,7 @@ impl SourceText {
     pub fn from_utf16(filename: impl Into<String>, units: Vec<u16>) -> Self {
         let mut bytes = Vec::with_capacity(units.len());
         for &unit in &units {
-            match unit {
-                0..=0x7f => bytes.push(unit as u8),
-                0x80..=0x7ff => {
-                    bytes.extend([(0xc0 | (unit >> 6)) as u8, (0x80 | (unit & 63)) as u8])
-                }
-                _ => bytes.extend([
-                    (0xe0 | (unit >> 12)) as u8,
-                    (0x80 | ((unit >> 6) & 63)) as u8,
-                    (0x80 | (unit & 63)) as u8,
-                ]),
-            }
+            push_encoded(&mut bytes, u32::from(unit));
         }
         Self::new(filename.into(), units, bytes)
     }
@@ -119,6 +109,24 @@ pub(crate) fn decode(bytes: &[u8], at: usize) -> (u32, usize) {
         value = (value << 6) | u32::from(b & 63);
     }
     (value, n)
+}
+
+pub(crate) fn push_encoded(out: &mut Vec<u8>, c: u32) {
+    match c {
+        0..=0x7f => out.push(c as u8),
+        0x80..=0x7ff => out.extend([(0xc0 | (c >> 6)) as u8, (0x80 | (c & 63)) as u8]),
+        0x800..=0xffff => out.extend([
+            (0xe0 | (c >> 12)) as u8,
+            (0x80 | ((c >> 6) & 63)) as u8,
+            (0x80 | (c & 63)) as u8,
+        ]),
+        _ => out.extend([
+            (0xf0 | (c >> 18)) as u8,
+            (0x80 | ((c >> 12) & 63)) as u8,
+            (0x80 | ((c >> 6) & 63)) as u8,
+            (0x80 | (c & 63)) as u8,
+        ]),
+    }
 }
 
 pub(crate) fn push_utf16(out: &mut Vec<u16>, c: u32) {
