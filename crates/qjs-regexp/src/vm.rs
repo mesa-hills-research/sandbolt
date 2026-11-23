@@ -13,6 +13,7 @@ const MISSING: usize = usize::MAX;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Choice {
     Split,
+    SplitRun { first: usize },
     Positive,
     Negative,
 }
@@ -110,6 +111,30 @@ impl Vm<'_, '_, '_> {
     }
 
     fn push(&mut self, pc: usize, kind: Choice) -> Result<()> {
+        // Adjacent splits with no slot changes can share one frame. Greedy
+        // character repeats otherwise need a separate frame for every match.
+        if kind == Choice::Split
+            && let Some(frame) = self.frames.last_mut()
+            && frame.pc == pc
+            && frame.undo == self.undo.len()
+        {
+            let first = match frame.kind {
+                Choice::Split => Some(frame.pos),
+                Choice::SplitRun { first } => Some(first),
+                _ => None,
+            };
+            if let Some(first) = first
+                && self
+                    .input
+                    .prev(self.pos, first, self.unicode)
+                    .map(|(_, pos)| pos)
+                    == Some(frame.pos)
+            {
+                frame.pos = self.pos;
+                frame.kind = Choice::SplitRun { first };
+                return Ok(());
+            }
+        }
         self.check_depth(self.slots.len(), self.frames.len() + 1, self.undo.len())?;
         self.budget.push(
             &mut self.frames,
@@ -155,9 +180,19 @@ impl Vm<'_, '_, '_> {
     }
 
     fn backtrack(&mut self) -> Result<bool> {
-        while let Some(frame) = self.frames.pop() {
+        while let Some(mut frame) = self.frames.pop() {
             self.tick()?;
             self.restore(frame)?;
+            if let Choice::SplitRun { first } = frame.kind
+                && frame.pos > first
+            {
+                let (_, prev) = self
+                    .input
+                    .prev(frame.pos, first, self.unicode)
+                    .expect("previous split in run");
+                frame.pos = prev;
+                self.frames.push(frame);
+            }
             if frame.kind != Choice::Positive {
                 return Ok(true);
             }
@@ -180,7 +215,7 @@ impl Vm<'_, '_, '_> {
                 }
                 return Ok(());
             }
-            if frame.kind != Choice::Split {
+            if !matches!(frame.kind, Choice::Split | Choice::SplitRun { .. }) {
                 return Err(RegExpError::InvalidBytecode);
             }
         }

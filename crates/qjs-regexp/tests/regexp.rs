@@ -414,6 +414,37 @@ fn interrupts_and_stack_limit() {
 }
 
 #[test]
+fn long_character_repeats_use_bounded_backtracking_space() {
+    let units: Vec<_> = "α😀".repeat(550_000).encode_utf16().collect();
+    let input = RegExpInput::Utf16(&units);
+    let mut host = Host {
+        stack_limit: Some(256),
+        limit: Some(1024),
+        ..Default::default()
+    };
+    for (pattern, expected) in [
+        (br"^\P{ASCII}+$".as_slice(), Some(vec![Some((0, units.len()))])),
+        (
+            br"^([^\d]*)\u{1F600}$",
+            Some(vec![Some((0, units.len())), Some((0, units.len() - 2))]),
+        ),
+        (br"^\S+a$", None),
+    ] {
+        let re = compiled(pattern, F::UNICODE);
+        assert_eq!(
+            exec(&re, input, 0, &mut host).map(|m| m.map(|m| m.captures)),
+            Ok(expected),
+            "{pattern:?}"
+        );
+        assert_eq!(host.bytes, 0);
+    }
+    host.interrupt = true;
+    let re = compiled(br"^\P{ASCII}+$", F::UNICODE);
+    assert_eq!(exec(&re, input, 0, &mut host), Err(RegExpError::Interrupted));
+    assert_eq!(host.bytes, 0);
+}
+
+#[test]
 fn allocation_failures_release_charges() {
     let pattern = br"(?<start>(?:(a|b){2,14}?)+)(?<end>a*)c";
     let mut host = Host::default();
