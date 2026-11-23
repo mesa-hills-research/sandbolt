@@ -133,7 +133,7 @@ impl Parser<'_> {
 
     fn advance(&mut self, ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
         self.pos += 1;
-        if self.pos % 4096 == 0 {
+        if self.pos.is_multiple_of(4096) {
             ctx.check_interrupt()?;
         }
         Ok(())

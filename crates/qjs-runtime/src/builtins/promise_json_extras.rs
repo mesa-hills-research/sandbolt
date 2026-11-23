@@ -14,6 +14,9 @@ mod extras;
 mod json;
 mod promise;
 
+#[cfg(test)]
+mod tests;
+
 #[allow(unused_imports)]
 pub(crate) use promise::{
     PromiseCapability, fulfill_promise, new_promise_capability, perform_promise_then,
