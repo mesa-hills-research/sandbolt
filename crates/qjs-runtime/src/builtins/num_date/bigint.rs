@@ -41,7 +41,7 @@ pub(super) fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
         ctx,
         proto,
         &[
-            ("toString", 1, ToString.id()),
+            ("toString", 0, ToString.id()),
             ("toLocaleString", 0, ToLocaleString.id()),
             ("valueOf", 0, ValueOf.id()),
         ],
