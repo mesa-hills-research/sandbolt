@@ -1,5 +1,3 @@
-use crate::ops::property::PropertyDescriptor;
-
 use super::*;
 
 const APPLY: u16 = 0x80;
@@ -89,7 +87,9 @@ pub(super) fn dispatch<'s>(op: u16, ctx: &mut ExecCtx<'_, 's>, args: Args<'s>) -
                 SET => {
                     let value = arg(ctx, args, 2)?;
                     let receiver = args.get(3).unwrap_or(target);
-                    Ok(Value::bool(set(ctx, target, key, value, receiver)?))
+                    Ok(Value::bool(property::set_property_with_receiver(
+                        ctx, target, key, value, receiver,
+                    )?))
                 }
                 _ => unreachable!(),
             }
@@ -121,52 +121,4 @@ pub(super) fn dispatch<'s>(op: u16, ctx: &mut ExecCtx<'_, 's>, args: Args<'s>) -
         }
         _ => Err(ctx.throw_type_error("unknown Reflect builtin")),
     }
-}
-
-fn set<'s>(
-    ctx: &mut ExecCtx<'_, 's>,
-    target: Handle<'s>,
-    key: PropKey,
-    value: Handle<'s>,
-    receiver: Handle<'s>,
-) -> JsResult<bool> {
-    if ctx.get(target) == ctx.get(receiver) {
-        return property::set_property(ctx, target, key, value);
-    }
-    let cursor = ctx.mut_root(ctx.get(target))?;
-    loop {
-        ctx.check_interrupt()?;
-        if let Some(desc) = property::get_own_property_descriptor(ctx, cursor.handle(), key)? {
-            if desc.is_accessor() {
-                let setter = desc.set.unwrap_or(Value::UNDEFINED);
-                if setter == Value::UNDEFINED {
-                    return Ok(false);
-                }
-                let setter = ctx.root(setter)?;
-                let args = ctx.args(&[value])?;
-                call::call(ctx, setter, receiver, args)?;
-                return Ok(true);
-            }
-            if desc.writable != Some(true) {
-                return Ok(false);
-            }
-            break;
-        }
-        let Some(proto) = property::get_prototype_of(ctx, cursor.handle())? else {
-            break;
-        };
-        ctx.set(&cursor, Value::object(proto));
-    }
-    if ctx.get(receiver).as_object().is_none() {
-        return Ok(false);
-    }
-    let desc = match property::get_own_property_descriptor(ctx, receiver, key)? {
-        Some(desc) if desc.is_accessor() || desc.writable != Some(true) => return Ok(false),
-        Some(_) => PropertyDescriptor {
-            value: Some(value),
-            ..PropertyDescriptor::default()
-        },
-        None => PropertyDescriptor::data(value),
-    };
-    property::define_own_property(ctx, receiver, key, desc)
 }

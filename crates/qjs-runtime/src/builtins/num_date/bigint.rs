@@ -1,7 +1,7 @@
 use qjs_bigint::{BigInt, BigIntError, BigIntHost};
 
 use crate::heap::BigIntData;
-use crate::object::{ErrorKind, ObjectFlags};
+use crate::object::ErrorKind;
 use crate::value::{Abrupt, BigIntId};
 
 use super::*;
@@ -30,13 +30,6 @@ pub(super) fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
     let global = ctx.root(Value::object(ctx.realm().global_object))?;
     let id = ctx.realm().bigint_ctor;
     let ctor = constructor(ctx, global, id, Constructor.id(), "BigInt", 1)?;
-    ctx.runtime
-        .heap
-        .objects
-        .get_mut(id)
-        .unwrap()
-        .flags
-        .set(ObjectFlags::IS_CONSTRUCTOR, false);
     install_methods(
         ctx,
         ctor,
@@ -64,6 +57,9 @@ pub(super) fn dispatch<'s>(
     use MethodId::*;
     let id = NativeFnId(NUM_DATE_BASE + offset);
     if id == Constructor.id() {
+        if ctx.new_target().is_some() {
+            return Err(ctx.throw_type_error("BigInt is not a constructor"));
+        }
         let arg = argument(ctx, args, 0)?;
         return convert(ctx, arg, true);
     }

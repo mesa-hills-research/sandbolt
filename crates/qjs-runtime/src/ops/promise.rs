@@ -61,30 +61,5 @@ pub fn fulfill<'s>(
     promise: Handle<'s>,
     value: Handle<'s>,
 ) -> JsResult<()> {
-    let id = ctx.object_id(promise)?;
-    let argument = ctx.get(value);
-    let ObjectData::Promise(data) = &ctx.heap().object(id).data else {
-        return Err(ctx.throw_type_error("expected a Promise"));
-    };
-    if data.result.is_some() {
-        return Ok(());
-    }
-    let count = data.reactions.len();
-    ctx.allocate(|runtime| {
-        runtime.reserve_jobs(count)?;
-        let ObjectData::Promise(promise) = &mut runtime.heap.objects.get_mut(id).unwrap().data
-        else {
-            unreachable!()
-        };
-        for reaction in promise.reactions.iter() {
-            runtime.job_queue.push_reserved(Job {
-                callback: reaction.callback,
-                argument,
-                realm: reaction.realm,
-            });
-        }
-        promise.reactions = Default::default();
-        promise.result = Some(argument);
-        Ok(())
-    })
+    crate::builtins::promise_json_extras::fulfill_promise(ctx, promise, value)
 }

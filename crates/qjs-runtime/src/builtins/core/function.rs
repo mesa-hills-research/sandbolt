@@ -186,6 +186,9 @@ fn bind<'s>(ctx: &mut ExecCtx<'_, 's>, target: Handle<'s>, args: Args<'s>) -> Js
 
 fn function_to_string<'s>(ctx: &mut ExecCtx<'_, 's>, function: Handle<'s>) -> JsResult<Value> {
     require_callable(ctx, ctx.get(function))?;
+    if let Some(source) = ctx.function_source(function)? {
+        return Ok(ctx.get(source));
+    }
     let name = get(ctx, function, PropKey::atom(Atom::NAME))?;
     let name = if matches!(ctx.get(name).decode(), ValueKind::String(_)) {
         name

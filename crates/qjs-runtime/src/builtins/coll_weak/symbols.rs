@@ -1,6 +1,6 @@
 use super::*;
 use crate::builtins::{install_accessor, make_native_fn};
-use crate::object::{ObjectData, ObjectFlags};
+use crate::object::ObjectData;
 use crate::ops::convert;
 use crate::symbol::SymbolDescription;
 use crate::value::{SymId, ValueKind};
@@ -8,13 +8,6 @@ use crate::value::{SymId, ValueKind};
 pub(super) fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
     let ctor_id = ctx.realm().symbol_ctor;
     let (ctor, proto) = class(ctx, ctor_id, ctx.realm().symbol_proto, SYMBOL, "Symbol", 0)?;
-    ctx.runtime
-        .heap
-        .objects
-        .get_mut(ctor_id)
-        .unwrap()
-        .flags
-        .set(ObjectFlags::IS_CONSTRUCTOR, false);
     install_methods(
         ctx,
         ctor,
@@ -73,6 +66,9 @@ pub(super) fn dispatch<'s>(
 ) -> JsResult<Value> {
     match id {
         SYMBOL | SYMBOL_FOR => {
+            if id == SYMBOL && ctx.new_target().is_some() {
+                return Err(ctx.throw_type_error("Symbol is not a constructor"));
+            }
             let input = arg(ctx, args, 0)?;
             let symbol = if id == SYMBOL_FOR {
                 let key = convert::to_string(ctx, input)?;
