@@ -68,7 +68,8 @@ impl Parser<'_> {
         }
         if let Some(op) = assignment_op(&self.current) {
             self.next()?;
-            let target = self.assignment_target(result, op == AssignOp::Assign, true)?;
+            let annex_call = !matches!(op, AssignOp::And | AssignOp::Or | AssignOp::Nullish);
+            let target = self.assignment_target(result, op == AssignOp::Assign, annex_call)?;
             let value = self.assignment(allow_in)?;
             return self.expr(start, Expr::Assignment { op, target, value });
         }
@@ -557,7 +558,7 @@ impl Parser<'_> {
         })
     }
 
-    fn is_arrow(&self, id: ExprId) -> bool {
+    pub(super) fn is_arrow(&self, id: ExprId) -> bool {
         matches!(&self.arena.expr(id).kind, Expr::Function(f) if f.is_arrow)
     }
 }

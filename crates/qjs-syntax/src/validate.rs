@@ -191,7 +191,7 @@ impl<'a> Validator<'a> {
                         self.lex(name, kind)?;
                     }
                 }
-                self.function(function, None, false)?;
+                self.function(function, None, false, true)?;
             }
             Stmt::Class(class) => {
                 if let Some(name) = &class.name {
@@ -280,7 +280,7 @@ impl<'a> Validator<'a> {
                 if let Some(catch) = catch {
                     self.scope(ScopeKind::Block, |v| {
                         if let Some(binding) = catch.binding {
-                            let simple = v.annex_b()
+                            let simple = v.opts.annex_b
                                 && matches!(v.arena.pattern(binding).kind, Pattern::Identifier(_));
                             v.pattern(binding, Some(Binding::Catch), false, simple)?;
                         }
@@ -371,9 +371,10 @@ impl<'a> Validator<'a> {
         }
     }
     fn iteration(&mut self, id: StmtId) -> Result {
+        let outer_depth = self.ctx.loop_depth;
         self.ctx.loop_depth += 1;
         let result = self.statement(id);
-        self.ctx.loop_depth -= 1;
+        self.ctx.loop_depth = outer_depth;
         result
     }
     fn annex_b(&self) -> bool {
@@ -654,13 +655,13 @@ impl<'a> Validator<'a> {
                             function,
                         } => {
                             self.name(key, span)?;
-                            self.function(function, Some(*kind), false)?;
+                            self.function(function, Some(*kind), false, false)?;
                         }
                         Property::Spread(id) => self.expression(*id)?,
                     }
                 }
             }
-            Expr::Function(function) => self.function(function, None, false)?,
+            Expr::Function(function) => self.function(function, None, false, false)?,
             Expr::Class(class) => self.class(class, span)?,
             Expr::Template(template) => self.template(template, false)?,
             Expr::TaggedTemplate { tag, template } => {
@@ -853,6 +854,7 @@ impl<'a> Validator<'a> {
         function: &'a Function,
         method: Option<MethodKind>,
         derived: bool,
+        declaration: bool,
     ) -> Result {
         let span = function.span;
         let simple = function
@@ -893,11 +895,18 @@ impl<'a> Validator<'a> {
             loop_depth: 0,
             switch_depth: 0,
         };
-        if let Some(name) = &function.name {
-            self.identifier(name, true)?;
-        }
         let allow_duplicates = simple && !self.ctx.strict && !arrow && method.is_none();
-        self.scope(ScopeKind::Var, |v| {
+        let result = self.scope(ScopeKind::Var, |v| {
+            if let Some(name) = &function.name {
+                let params = v.ctx;
+                if declaration {
+                    v.ctx.await_reserved = outer.await_reserved;
+                    v.ctx.yield_reserved = outer.yield_reserved;
+                }
+                let result = v.identifier(name, true);
+                v.ctx = params;
+                result?;
+            }
             for &param in &function.params {
                 v.pattern(param, Some(Binding::Parameter), false, allow_duplicates)?;
             }
@@ -909,9 +918,9 @@ impl<'a> Validator<'a> {
                 FunctionBody::Block(body) => v.list(body),
                 FunctionBody::Expression(id) => v.expression(*id),
             }
-        })?;
+        });
         self.ctx = outer;
-        Ok(())
+        result
     }
 
     fn class(&mut self, class: &'a Class, span: Span) -> Result {
@@ -981,7 +990,7 @@ impl<'a> Validator<'a> {
                     ..
                 } => {
                     self.name(key, span)?;
-                    self.function(function, Some(*kind), class.extends.is_some())?;
+                    self.function(function, Some(*kind), class.extends.is_some(), false)?;
                 }
                 ClassElement::StaticBlock(body) => {
                     self.class_initializer(true, |v| v.scope(ScopeKind::Var, |v| v.list(body)))?

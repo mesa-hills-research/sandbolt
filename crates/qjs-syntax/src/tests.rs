@@ -137,7 +137,7 @@ fn hashbang_html_and_comments() {
         " #! late",
         "\n#! second",
         "/* unclosed",
-        "a --> rest",
+        "a -->",
         "\u{feff}#! late",
     ]);
     assert!(module("#!go\nexport {};").is_ok());
@@ -250,9 +250,8 @@ fn strings_and_template_raw_cooked() {
 
 #[test]
 fn asi_and_restricted_productions() {
-    let tree =
-        script("function f() { return /*\n*/ 0\n} x\n++y; breakLabel: { break\nbreakLabel; }")
-            .unwrap();
+    let tree = script("function f() { return /*\n*/ 0\n} x\n++y; while(1) { break\nbreakLabel; }")
+        .unwrap();
     let Stmt::Function(f) = &tree.arena.stmt(tree.body[0]).kind else {
         panic!()
     };
@@ -272,6 +271,8 @@ fn asi_and_restricted_productions() {
         "do{}while(1) 2;",
         "using\nx = null;",
         "async function f(){ await\nusing; }",
+        "async function f(){ await using\nx = null; }",
+        "a --> rest",
     ]);
     invalid(&[
         "throw\n1",
@@ -279,7 +280,6 @@ fn asi_and_restricted_productions() {
         "x\n=> x",
         "(x)\n=> x",
         "async\nx => x y",
-        "async function f(){ await using\nx = null; }",
         "do let x=0; while (0)",
     ]);
 }
@@ -350,7 +350,7 @@ fn operators_and_optional_chains() {
             "(a?.b).c = 1",
             "(a ?? b) && c",
             "a ?? (b || c)",
-            "x ** -y ** z",
+            "x ** -(y ** z)",
             "(-x) ** y",
             "a &&= b; a ||= c; a ??= d",
             "x = typeof void delete f().x;",
@@ -369,6 +369,7 @@ fn operators_and_optional_chains() {
         "a ?? b || c",
         "a && b ?? c",
         "-x ** y",
+        "x ** -y ** z",
         "[a] += b",
         "++1",
         "new import('x')",
@@ -385,6 +386,8 @@ fn directives_and_strict_restrictions() {
         "function f(a,a){}",
         "function* f(a,a){}",
         "async function f(a,a){}",
+        "async function await() {}",
+        "function* yield() {}",
         "function f(a = 0) { ('use strict'); }",
         "var arguments; eval=1; with({}) {}",
         "{ 'use strict'; with(o) {} }",
@@ -403,6 +406,9 @@ fn directives_and_strict_restrictions() {
         "function eval(){'use strict'}",
         "'use strict'; label: function f(){}",
         "'use strict'; var implements",
+        "(async function await() {})",
+        "(function* yield() {})",
+        "async function f(){function await(){}}",
     ]);
 }
 
@@ -422,6 +428,11 @@ fn statement_and_binding_scopes() {
         "for (using item of items) {}",
         "async function f(){ for await (const x of y) {} }",
         "function f(){using x = y, z = w;}",
+        "using [x] = y;",
+        "for (let in y) {}",
+        "for (using of of [0, 1, 2]) {}",
+        "for (using of = null;;) {}",
+        "'use strict'; try {} catch(e){var e;}",
     ]);
     invalid(&[
         "let a; let a;",
@@ -451,7 +462,10 @@ fn statement_and_binding_scopes() {
         "for await (x of y){}",
         "for (let of y){}",
         "using x;",
-        "using [x] = y;",
+        "using {x} = y;",
+        "using x = y;",
+        "switch(x){ case true: using z = x; }",
+        "async function g(){switch(x){ default: await using z = x; }}",
     ]);
 }
 
@@ -472,6 +486,8 @@ fn annex_b_call_targets() {
         "f?.() = 1",
         "[f()] = x",
         "import('x') = 1",
+        "f() &&= 1",
+        "(f()) ??= 1",
     ]);
     assert!(
         parse(
@@ -510,6 +526,7 @@ fn class_elements_private_scopes_and_contexts() {
         "class C { f(o){ #x in o = 1; } #x; }",
         "class C { f(o){ return o.#x; } }",
         "class C extends (#x in {}) { #x; }",
+        "class C extends () => {} {}",
         "class C { #x; g(){delete this?.#x;} }",
         "class C { static { return; } }",
         "class C { static { await x; } }",
@@ -617,6 +634,18 @@ fn depth_budget() {
     assert_eq!(
         parse(&source, ParseOptions::default()).unwrap_err().kind,
         ParseErrorKind::StackOverflow
+    );
+    let nested = format!("{}0{}", "(".repeat(600), ")".repeat(600));
+    let source = SourceText::from_utf8("sample.js", &nested);
+    assert!(
+        parse(
+            &source,
+            ParseOptions {
+                max_depth: 2048,
+                ..ParseOptions::default()
+            }
+        )
+        .is_ok()
     );
 }
 

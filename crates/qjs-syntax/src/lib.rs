@@ -90,6 +90,42 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 pub fn parse(source: &SourceText, opts: ParseOptions) -> Result<ParsedProgram, ParseError> {
+    const INLINE_DEPTH: usize = 48;
+    let inline = ParseOptions {
+        max_depth: opts.max_depth.min(INLINE_DEPTH),
+        ..opts
+    };
+    match parse_inner(source, inline) {
+        Err(e) if e.kind == ParseErrorKind::StackOverflow && opts.max_depth > INLINE_DEPTH => (),
+        result => return result,
+    }
+
+    // Deep trees need more stack than the caller's thread may have.
+    let depth = opts
+        .max_depth
+        .min(source.as_bytes().len().saturating_add(1));
+    let stack_size = depth
+        .saturating_mul(32 * 1024)
+        .saturating_add(2 * 1024 * 1024);
+    std::thread::scope(|scope| {
+        let thread = std::thread::Builder::new()
+            .stack_size(stack_size)
+            .spawn_scoped(scope, move || parse_inner(source, opts))
+            .map_err(|_| {
+                ParseError::new(
+                    source,
+                    ParseErrorKind::OutOfMemory,
+                    Span::default(),
+                    "Could not allocate the parser stack",
+                )
+            })?;
+        thread
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+fn parse_inner(source: &SourceText, opts: ParseOptions) -> Result<ParsedProgram, ParseError> {
     let program = parser::Parser::new(source, opts)?.program()?;
     validate::validate(source, opts, &program)?;
     Ok(program)

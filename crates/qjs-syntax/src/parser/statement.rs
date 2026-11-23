@@ -4,6 +4,7 @@ use super::*;
 enum Position {
     Root,
     List,
+    Case,
     Embedded,
     Branch,
     Label,
@@ -51,7 +52,7 @@ impl Parser<'_> {
 
     fn statement_inner(&mut self, pos: Position) -> Result<StmtId> {
         let start = self.start();
-        let list = matches!(pos, Position::Root | Position::List);
+        let list = matches!(pos, Position::Root | Position::List | Position::Case);
         let kind = if self.eat(";")? {
             Stmt::Empty
         } else if self.eat("{")? {
@@ -79,6 +80,18 @@ impl Parser<'_> {
         } else if let Some(decl) = self.declaration_kind(false, list)? {
             if !list && decl != DeclKind::Var {
                 return Err(self.error("Lexical declaration requires a statement list"));
+            }
+            if matches!(decl, DeclKind::Using | DeclKind::AwaitUsing)
+                && (pos == Position::Case
+                    || (pos == Position::Root
+                        && matches!(
+                            self.opts.goal,
+                            ParseGoal::Script | ParseGoal::DirectEval { .. }
+                        )))
+            {
+                return Err(
+                    self.error("Resource declaration needs a block, function, loop, or module")
+                );
             }
             let declaration = self.declaration(decl, true)?;
             self.asi()?;
@@ -128,7 +141,7 @@ impl Parser<'_> {
                 self.expect(":")?;
                 let mut body = Vec::new();
                 while !self.punct("}") && !self.word("case") && !self.word("default") {
-                    let stmt = self.statement(Position::List)?;
+                    let stmt = self.statement(Position::Case)?;
                     self.push(&mut body, stmt)?;
                 }
                 self.push(&mut cases, SwitchCase { test, body })?;
@@ -266,13 +279,13 @@ impl Parser<'_> {
         if !contextual {
             return Ok(None);
         }
-        if self.word("let")
-            && matches!(
-                self.peek()?.kind,
-                TokenKind::Word(_) | TokenKind::Punct("{" | "[")
-            )
-        {
-            return Ok(Some(DeclKind::Let));
+        if self.word("let") {
+            let next = self.peek()?;
+            if matches!(next.kind, TokenKind::Word(_) | TokenKind::Punct("{" | "["))
+                && !word_is_one(&next, &["in", "instanceof"])
+            {
+                return Ok(Some(DeclKind::Let));
+            }
         }
         if self.word("using") || (self.ctx.await_expr && self.word("await")) {
             let mut look = self.lexer;
@@ -287,8 +300,14 @@ impl Parser<'_> {
             if !next.line_before
                 && matches!(next.kind, TokenKind::Word(_))
                 && !word_is_one(&next, &["in", "instanceof"])
-                && !(for_head && word_is(&next, "of") && !is_await)
             {
+                if for_head
+                    && word_is(&next, "of")
+                    && !is_await
+                    && look.next(LexicalGoal::Div)?.kind != TokenKind::Punct("=")
+                {
+                    return Ok(None);
+                }
                 return Ok(Some(if is_await {
                     DeclKind::AwaitUsing
                 } else {
@@ -329,7 +348,6 @@ impl Parser<'_> {
     fn for_statement(&mut self) -> Result<Stmt> {
         let async_loop = self.eat_word("await")?;
         self.expect("(")?;
-        let using_head = self.word("using");
         let let_head = self.word("let");
         let async_head = self.word("async");
         let init = if self.punct(";") {
@@ -356,7 +374,6 @@ impl Parser<'_> {
                 Some(ForInit::Expression(id)) => {
                     if !is_in
                         && (let_head
-                            || (using_head && self.word("of"))
                             || (async_head
                                 && !async_loop
                                 && matches!(&self.arena.expr(id).kind, Expr::Identifier(i) if i.name == "async")))
@@ -475,7 +492,14 @@ impl Parser<'_> {
             None
         };
         let extends = if self.eat_word("extends")? {
-            Some(self.left_hand_side(true)?)
+            let heritage = self.left_hand_side(true)?;
+            if self.is_arrow(heritage) {
+                return Err(self.error_at(
+                    self.arena.expr(heritage).span,
+                    "Parenthesize arrow function in class heritage",
+                ));
+            }
+            Some(heritage)
         } else {
             None
         };
