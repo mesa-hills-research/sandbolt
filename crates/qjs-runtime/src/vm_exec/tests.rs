@@ -260,6 +260,67 @@ fn handles_number_and_bigint_conversions() {
 }
 
 #[test]
+fn short_bigint_arithmetic_spills_at_the_signed_payload_limits() {
+    assert_eq!(
+        run(r#"
+        let min = -(2n ** 46n), max = 2n ** 46n - 1n;
+        let results = [max + 1n, min - 1n, min * -1n, min / -1n, -min];
+        let p = max++, q = min--;
+        results.push(p, max, q, min, min % -2n);
+        results.join('|');
+        "#),
+        "70368744177664|-70368744177665|70368744177664|70368744177664|70368744177664|70368744177663|70368744177664|-70368744177664|-70368744177665|-1"
+    );
+}
+
+#[test]
+fn short_bigint_arithmetic_keeps_js_signs_and_range_errors() {
+    assert_eq!(
+        run(r#"
+        let x = -37n, y = 2n, n = -2n;
+        let result = [x + y, x - y, x * y, x / y, x % y, -x / n, -x % n,
+            x & y, x | y, x ^ y, ~x, x << n, x >> n, x >> 64n, 3n >> -64n,
+            (-1n) ** 70368744177663n, y ** 45n, y ** 46n, 0n << 1048576n];
+        for (const op of [() => x / 0n, () => x % 0n, () => y ** -1n,
+            () => x >>> 1n, () => 1n << 1048576n]) {
+            try { op(); } catch (e) { result.push(e.name); }
+        }
+        result.join('|');
+        "#),
+        "-35|-39|-74|-18|-1|-18|1|2|-37|-39|36|-10|-148|-1|55340232221128654848|-1|35184372088832|70368744177664|0|RangeError|RangeError|RangeError|TypeError|RangeError"
+    );
+}
+
+#[test]
+fn short_bigint_multiply_divide_remainder_and_power_keep_interrupt_checks() {
+    use std::{cell::Cell, rc::Rc};
+
+    for op in ["*", "/", "%", "**"] {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        engine
+            .eval("var a = 3n, b = 2n", EvalOptions::default())
+            .unwrap();
+        let polls = Rc::new(Cell::new(0));
+        engine.set_interrupt_handler(Some(Box::new({
+            let polls = polls.clone();
+            move || {
+                polls.set(polls.get() + 1);
+                polls.get() == 2
+            }
+        })));
+        assert_eq!(
+            engine.eval(
+                &format!("try {{ a {op} b }} catch {{}}"),
+                EvalOptions::default()
+            ),
+            Err(EngineError::Interrupted),
+            "{op}"
+        );
+        assert_eq!(polls.get(), 2, "{op}");
+    }
+}
+
+#[test]
 fn primitive_property_reads_keep_the_receiver_and_string_indices() {
     assert_eq!(
         run(r#"
@@ -446,7 +507,7 @@ fn run_with_other_realm(script: &str) -> String {
 fn shares_a_frozen_throw_type_error_within_each_realm() {
     assert_eq!(
         run_with_other_realm(
-                r#"
+            r#"
                 const caller = Object.getOwnPropertyDescriptor(Function.prototype, 'caller');
                 const args = Object.getOwnPropertyDescriptor(Function.prototype, 'arguments');
                 const thrower = caller.get;
@@ -462,7 +523,8 @@ fn shares_a_frozen_throw_type_error_within_each_realm() {
                  callee(nonSimple()).get === thrower, thrower !== otherThrower,
                  Object.getOwnPropertyNames(thrower).join(','), Object.isFrozen(thrower),
                  thrower.call(sloppy) === undefined].join(';');
-                "#),
+                "#
+        ),
         "true;true;true;true;true;true;true;length,name;true;true"
     );
 }
@@ -470,7 +532,8 @@ fn shares_a_frozen_throw_type_error_within_each_realm() {
 #[test]
 fn call_and_construct_choose_the_error_realm() {
     assert_eq!(
-        run_with_other_realm(r#"
+        run_with_other_realm(
+            r#"
             function throws(ctor, run) {
                 try { run(); } catch (e) { return e.constructor === ctor; }
                 return false;
@@ -490,7 +553,8 @@ fn call_and_construct_choose_the_error_realm() {
              throws(other.TypeError, () => other.Reflect.apply(() => {}, null, 1)),
              revokeDuringPrototypeLookup(function () {}), revokeDuringPrototypeLookup(Function)]
                  .join(',');
-        "#),
+        "#
+        ),
         "true,true,true,true,true,true,true,true,true"
     );
 }
