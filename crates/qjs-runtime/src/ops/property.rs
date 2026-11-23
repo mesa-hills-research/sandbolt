@@ -296,7 +296,8 @@ pub fn new_proxy<'s>(
 ) -> JsResult<Handle<'s>> {
     let target = ctx.object_id(target)?;
     let handler = ctx.object_id(handler)?;
-    let mut flags = ObjectFlags::IS_EXOTIC;
+    // Private elements use the proxy's own storage. Ordinary queries use its traps.
+    let mut flags = ObjectFlags::IS_EXOTIC | ObjectFlags::EXTENSIBLE;
     flags.set(
         ObjectFlags::IS_CONSTRUCTOR,
         ctx.heap()
