@@ -114,6 +114,9 @@ pub(super) fn load_functions(
                         regex_flags,
                         module: None,
                         hoisted: TrackedVec::new(),
+                        eval: None,
+                        class_field_context: function.name
+                            == qjs_bytecode::BuiltinAtom::ClassFieldsInit.id(),
                         source: source_id,
                         source_start: debug.source_start,
                     }),
@@ -258,7 +261,8 @@ pub(super) fn make_function<'s>(
         ObjectFlags::IS_CONSTRUCTOR,
         prototype && kind == FunctionKind::Normal,
     );
-    let function = ctx.make_object(Some(ctx.realm().function_proto), flags, |ledger| {
+    let proto = crate::builtins::vm_internal::function_prototype(ctx, kind);
+    let function = ctx.make_object(Some(proto), flags, |ledger| {
         Ok(ObjectData::BytecodeFunction(TrackedBox::new(
             ledger,
             BytecodeFunctionData {

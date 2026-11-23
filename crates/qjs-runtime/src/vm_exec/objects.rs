@@ -237,6 +237,14 @@ pub(super) fn object_op(
                         none(3)
                     }
                     (DefinePrivateField, None) => {
+                        if !ctx
+                            .heap()
+                            .object(id)
+                            .flags
+                            .contains(ObjectFlags::EXTENSIBLE)
+                        {
+                            return Err(ctx.throw_type_error("object is not extensible"));
+                        }
                         property::private_define(ctx, id, name, ctx.get(h(1)))?;
                         none(2)
                     }
@@ -275,6 +283,14 @@ pub(super) fn object_op(
                     brand
                 };
                 if let Some(id) = ctx.get(h(2)).as_object() {
+                    if !ctx
+                        .heap()
+                        .object(id)
+                        .flags
+                        .contains(ObjectFlags::EXTENSIBLE)
+                    {
+                        return Err(ctx.throw_type_error("object is not extensible"));
+                    }
                     let brand = ctx.root(brand)?;
                     let key = private_key(ctx, brand)?;
                     if property::private_own(ctx, id, key).is_some() {

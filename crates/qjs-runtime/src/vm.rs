@@ -72,6 +72,8 @@ pub(crate) struct CompiledFunc {
     pub regex_flags: TrackedVec<(u32, u16)>,
     pub module: Option<ModId>,
     pub hoisted: TrackedVec<(u32, u32)>,
+    pub eval: Option<EvalEnvironment>,
+    pub class_field_context: bool,
 }
 
 impl CompiledFunc {
@@ -90,6 +92,49 @@ impl Trace for CompiledFunc {
         self.name.trace(tracer);
         self.source.trace(tracer);
         self.module.trace(tracer);
+        self.eval.trace(tracer);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct EvalEnvironment {
+    pub bindings: TrackedVec<EvalBinding>,
+    pub declarations: Option<ObjId>,
+    pub special: Option<[Value; 3]>,
+}
+
+impl Trace for EvalEnvironment {
+    fn trace(&self, tracer: &Tracer<'_>) {
+        self.bindings.trace(tracer);
+        self.declarations.trace(tracer);
+        if let Some(special) = &self.special {
+            special.as_slice().trace(tracer);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum EvalBinding {
+    Cell {
+        name: PropKey,
+        id: VarRefId,
+        lexical: bool,
+        writable: bool,
+    },
+    Object {
+        id: ObjId,
+        with: bool,
+    },
+}
+impl Trace for EvalBinding {
+    fn trace(&self, tracer: &Tracer<'_>) {
+        match *self {
+            Self::Cell { name, id, .. } => {
+                name.trace(tracer);
+                id.trace(tracer);
+            }
+            Self::Object { id, .. } => id.trace(tracer),
+        }
     }
 }
 impl ArenaItem for BytecodeFunc {

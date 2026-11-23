@@ -1,7 +1,8 @@
-use qjs_syntax::{ParseGoal, SourceText};
+use qjs_bytecode::FunctionKind;
+use qjs_syntax::{Expr, FunctionBody, ParseErrorKind, SourceText, Stmt};
 
 use crate::api::{EvalOptions, display_value, eval_text, parse_options};
-use crate::atom::Atom;
+use crate::atom::{Atom, PropKey};
 use crate::ops::property;
 use crate::realm::NativeFnId;
 use crate::root::{Args, ExecCtx, Handle};
@@ -9,7 +10,9 @@ use crate::shape::PropFlags;
 use crate::value::*;
 use crate::vm::exec;
 
-use super::{VM_INTERNAL_BASE as BASE, configure_ctor, define_data, install_method};
+use super::{
+    VM_INTERNAL_BASE as BASE, configure_ctor, define_data, install_method, make_native_fn,
+};
 
 pub(crate) const EVAL: NativeFnId = NativeFnId(BASE);
 const FUNCTION: NativeFnId = NativeFnId(BASE + 1);
@@ -40,6 +43,7 @@ pub(crate) const MODULE_READY: NativeFnId = NativeFnId(BASE + 28);
 pub(crate) const MODULE_FAILED: NativeFnId = NativeFnId(BASE + 29);
 pub(crate) const MODULE_IMPORT_DONE: NativeFnId = NativeFnId(BASE + 30);
 pub(crate) const MODULE_IMPORT_FAILED: NativeFnId = NativeFnId(BASE + 31);
+const SELF: NativeFnId = NativeFnId(BASE + 32);
 
 pub fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
     let global = ctx.root(Value::object(ctx.realm().global_object))?;
@@ -52,6 +56,17 @@ pub fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
         PropFlags::WRITABLE | PropFlags::CONFIGURABLE,
     )?;
     install_method(ctx, global, Atom::get("eval"), EVAL, "eval", 1)?;
+    install_function_kinds(ctx)?;
+    let async_iterator = ctx.root(Value::object(ctx.realm().async_iterator_proto))?;
+    let async_iterator_key = symbol(ctx, crate::symbol::WellKnown::AsyncIterator);
+    install_method(
+        ctx,
+        async_iterator,
+        async_iterator_key,
+        SELF,
+        "[Symbol.asyncIterator]",
+        0,
+    )?;
     for (proto, ids) in [
         (
             ctx.realm().generator_proto,
@@ -84,6 +99,106 @@ pub fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
     Ok(())
 }
 
+fn symbol(ctx: &ExecCtx<'_, '_>, symbol: crate::symbol::WellKnown) -> PropKey {
+    let symbol = ctx.heap().symbol_registry.well_known(symbol);
+    ctx.heap().symbols.get(symbol).unwrap().key()
+}
+
+fn install_function_kinds(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
+    let function_proto = ctx.root(Value::object(ctx.realm().function_proto))?;
+    let function_ctor = ctx.root(Value::object(ctx.realm().function_ctor))?;
+    let tuple = ctx.new_object_with_proto(None)?;
+    let tag = symbol(ctx, crate::symbol::WellKnown::ToStringTag);
+    for (index, (name, id, instance)) in [
+        (
+            "GeneratorFunction",
+            GENERATOR_FUNCTION,
+            Some((ctx.realm().generator_proto, "Generator")),
+        ),
+        ("AsyncFunction", ASYNC_FUNCTION, None),
+        (
+            "AsyncGeneratorFunction",
+            ASYNC_GENERATOR_FUNCTION,
+            Some((ctx.realm().async_generator_proto, "AsyncGenerator")),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let proto = ctx.new_object_with_proto(Some(function_proto))?;
+        let ctor = make_native_fn(ctx, id, name, 1, true)?;
+        property::set_prototype_of(ctx, ctor, Some(function_ctor))?;
+        define_data(
+            ctx,
+            ctor,
+            Atom::get("prototype"),
+            proto,
+            PropFlags::default(),
+        )?;
+        define_data(
+            ctx,
+            proto,
+            Atom::get("constructor"),
+            ctor,
+            PropFlags::CONFIGURABLE,
+        )?;
+        let name = ctx.new_string(name)?;
+        define_data(ctx, proto, tag, name, PropFlags::CONFIGURABLE)?;
+        if let Some((instance, name)) = instance {
+            let instance = ctx.root(Value::object(instance))?;
+            define_data(
+                ctx,
+                proto,
+                Atom::get("prototype"),
+                instance,
+                PropFlags::CONFIGURABLE,
+            )?;
+            define_data(
+                ctx,
+                instance,
+                Atom::get("constructor"),
+                proto,
+                PropFlags::CONFIGURABLE,
+            )?;
+            let name = ctx.new_string(name)?;
+            define_data(ctx, instance, tag, name, PropFlags::CONFIGURABLE)?;
+        }
+        define_data(
+            ctx,
+            tuple,
+            PropKey::index(index as u32).unwrap(),
+            proto,
+            PropFlags::default(),
+        )?;
+    }
+    property::private_define(
+        ctx,
+        ctx.realm().function_proto,
+        exec::brand_key(),
+        ctx.get(tuple),
+    )
+}
+
+pub(crate) fn function_prototype(ctx: &ExecCtx<'_, '_>, kind: FunctionKind) -> ObjId {
+    function_prototype_for(ctx, ctx.realm_id(), kind)
+}
+
+fn function_prototype_for(ctx: &ExecCtx<'_, '_>, realm: RealmId, kind: FunctionKind) -> ObjId {
+    let normal = ctx.heap().realm(realm).function_proto;
+    let index = match kind {
+        FunctionKind::Normal => return normal,
+        FunctionKind::Generator => 0,
+        FunctionKind::Async => 1,
+        FunctionKind::AsyncGenerator => 2,
+    };
+    property::private_own(ctx, normal, exec::brand_key())
+        .and_then(Value::as_object)
+        .and_then(|tuple| {
+            property::private_own(ctx, tuple, PropKey::index(index).unwrap())?.as_object()
+        })
+        .unwrap_or(normal)
+}
+
 pub(crate) fn install_host(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
     let global = ctx.root(Value::object(ctx.realm().global_object))?;
     let key = ctx.intern_str("__host")?;
@@ -107,7 +222,7 @@ pub fn dispatch<'s>(
             let Some(arg) = args.get(0) else {
                 return Ok(Value::UNDEFINED);
             };
-            eval_value(ctx, arg, ParseGoal::Script, false)
+            exec::eval::execute_indirect(ctx, arg)
         }
         FUNCTION | GENERATOR_FUNCTION | ASYNC_FUNCTION | ASYNC_GENERATOR_FUNCTION => {
             function_constructor(ctx, id, args)
@@ -194,35 +309,10 @@ pub fn dispatch<'s>(
             }
             Ok(Value::UNDEFINED)
         }
+        SELF => Ok(ctx.get(this)),
         THROW_TYPE_ERROR => Err(ctx.throw_type_error("restricted arguments property")),
         _ => Err(ctx.throw_type_error("unknown runtime builtin")),
     }
-}
-
-pub(crate) fn eval_value<'s>(
-    ctx: &mut ExecCtx<'_, 's>,
-    arg: Handle<'s>,
-    goal: ParseGoal,
-    strict: bool,
-) -> JsResult<Value> {
-    let value = ctx.get(arg);
-    let ValueKind::String(id) = value.decode() else {
-        return Ok(value);
-    };
-    let opts = EvalOptions {
-        strict,
-        ..Default::default()
-    };
-    let parse = qjs_syntax::ParseOptions {
-        goal,
-        ..parse_options(ctx.runtime, &opts)
-    };
-    let units: Vec<_> = ctx.heap().string_units(id).collect();
-    if units.len().saturating_mul(3) > parse.max_bytes {
-        return Err(ctx.throw_oom());
-    }
-    let source = SourceText::from_utf16(opts.filename, units);
-    eval_text(ctx, &source, parse)
 }
 
 fn function_constructor<'s>(
@@ -231,14 +321,14 @@ fn function_constructor<'s>(
     args: Args<'s>,
 ) -> JsResult<Value> {
     let new_target = ctx.new_target();
-    let mut text: Vec<u16> = match id {
-        GENERATOR_FUNCTION => "(function* anonymous(",
-        ASYNC_FUNCTION => "(async function anonymous(",
-        ASYNC_GENERATOR_FUNCTION => "(async function* anonymous(",
-        _ => "(function anonymous(",
-    }
-    .encode_utf16()
-    .collect();
+    let (prefix, kind) = match id {
+        GENERATOR_FUNCTION => ("(function* ", FunctionKind::Generator),
+        ASYNC_FUNCTION => ("(async function ", FunctionKind::Async),
+        ASYNC_GENERATOR_FUNCTION => ("(async function* ", FunctionKind::AsyncGenerator),
+        _ => ("(function ", FunctionKind::Normal),
+    };
+    let mut text: Vec<u16> = prefix.encode_utf16().collect();
+    text.extend("anonymous(".encode_utf16());
     let parameter_count = args.len().saturating_sub(1);
     for i in 0..parameter_count {
         if i != 0 {
@@ -246,24 +336,116 @@ fn function_constructor<'s>(
         }
         text.extend(string_units(ctx, args.get(i).unwrap())?);
     }
+    let parameter_end = encoded_len(&text);
     text.extend("\n) {\n".encode_utf16());
+    let body_start = encoded_len(&text);
     if let Some(body) = args.get(parameter_count) {
         text.extend(string_units(ctx, body)?);
     }
     text.extend("\n})".encode_utf16());
-    let source = SourceText::from_utf16("<Function>", text);
     let parse = parse_options(ctx.runtime, &EvalOptions::default());
+    if encoded_len(&text) > parse.max_bytes {
+        return Err(ctx.throw_oom());
+    }
+    let rendered_source = ctx.new_utf16(&text[1..text.len() - 1])?;
+    text[prefix.len()..prefix.len() + "anonymous".len()].fill(u16::from(b' '));
+    let source = SourceText::from_utf16("<Function>", text);
+    validate_function_source(ctx, &source, parse, parameter_end, body_start)?;
     let function = eval_text(ctx, &source, parse)?;
+    let function = ctx.root(function)?;
+    let function_id = ctx.object_id(function)?;
+    let crate::object::ObjectData::BytecodeFunction(data) = &ctx.heap().object(function_id).data
+    else {
+        unreachable!()
+    };
+    let code = data.code;
+    let ValueKind::String(rendered_source) = ctx.get(rendered_source).decode() else {
+        unreachable!()
+    };
+    ctx.runtime
+        .heap
+        .bytecode
+        .get_mut(code)
+        .unwrap()
+        .compiled
+        .as_mut()
+        .unwrap()
+        .source = Some(rendered_source);
+    let name = ctx.new_string("anonymous")?;
+    define_data(
+        ctx,
+        function,
+        Atom::get("name"),
+        name,
+        PropFlags::CONFIGURABLE,
+    )?;
     if let Some(new_target) = new_target {
-        let func = ctx.root(function)?;
         let target = ctx.root(Value::object(new_target))?;
         let prototype = property::get_property(ctx, target, Atom::get("prototype"))?;
-        if prototype.as_object().is_some() {
-            let prototype = ctx.root(prototype)?;
-            property::set_prototype_of(ctx, func, Some(prototype))?;
-        }
+        let prototype = prototype.as_object().unwrap_or_else(|| {
+            let realm =
+                crate::ops::call::function_realm(ctx.heap(), new_target).unwrap_or(ctx.realm_id());
+            function_prototype_for(ctx, realm, kind)
+        });
+        let prototype = ctx.root(Value::object(prototype))?;
+        property::set_prototype_of(ctx, function, Some(prototype))?;
     }
-    Ok(function)
+    Ok(ctx.get(function))
+}
+
+fn encoded_len(text: &[u16]) -> usize {
+    text.iter()
+        .map(|unit| match unit {
+            0..=0x7f => 1,
+            0x80..=0x7ff => 2,
+            _ => 3,
+        })
+        .sum()
+}
+
+fn validate_function_source(
+    ctx: &mut ExecCtx<'_, '_>,
+    source: &SourceText,
+    parse: qjs_syntax::ParseOptions,
+    parameter_end: usize,
+    body_start: usize,
+) -> JsResult<()> {
+    use crate::object::ErrorKind;
+    let program = qjs_syntax::parse(source, parse).map_err(|error| match error.kind {
+        ParseErrorKind::Syntax => ctx.throw_error(ErrorKind::Syntax, &error.message),
+        ParseErrorKind::OutOfMemory => ctx.throw_oom(),
+        ParseErrorKind::StackOverflow => ctx.stack_overflow(),
+    })?;
+    let invalid = |ctx: &mut ExecCtx<'_, '_>| {
+        ctx.throw_error(ErrorKind::Syntax, "invalid dynamic function source")
+    };
+    let [statement] = program.body.as_slice() else {
+        return Err(invalid(ctx));
+    };
+    let Stmt::Expression(expression) = program.arena.stmt(*statement).kind else {
+        return Err(invalid(ctx));
+    };
+    let Expr::Parenthesized(expression) = program.arena.expr(expression).kind else {
+        return Err(invalid(ctx));
+    };
+    let Expr::Function(function) = &program.arena.expr(expression).kind else {
+        return Err(invalid(ctx));
+    };
+    let FunctionBody::Block(body) = &function.body else {
+        return Err(invalid(ctx));
+    };
+    if function.span.end as usize != source.as_bytes().len() - 1
+        || function
+            .params
+            .iter()
+            .any(|&parameter| program.arena.pattern(parameter).span.end as usize > parameter_end)
+        || body
+            .iter()
+            .any(|&statement| (program.arena.stmt(statement).span.start as usize) < body_start)
+    {
+        return Err(invalid(ctx));
+    }
+    Ok(())
 }
 
 fn string_units<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<Vec<u16>> {

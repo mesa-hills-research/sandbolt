@@ -1,5 +1,6 @@
 mod bindings;
 pub(crate) mod coroutines;
+pub(crate) mod eval;
 mod iterators;
 mod load;
 pub(crate) mod modules;
@@ -24,6 +25,7 @@ pub(crate) use bindings::{read_ref, write_ref};
 pub(crate) use iterators::{async_from_sync_call, close_original, for_in_next, iterator_result};
 
 pub(crate) use coroutines::resume_generator;
+pub(crate) use objects::brand_key;
 
 impl<'s> ExecCtx<'_, 's> {
     pub fn function_source(&mut self, function: Handle<'s>) -> JsResult<Option<Handle<'s>>> {
@@ -42,48 +44,182 @@ impl<'s> ExecCtx<'_, 's> {
         source.map(|id| self.root(Value::string(id))).transpose()
     }
 
-    pub fn capture_error_stack(&mut self, error: Handle<'s>) -> JsResult<()> {
-        let id = self.object_id(error)?;
-        if !matches!(&self.heap().object(id).data, ObjectData::Error(data) if data.stack == Value::UNDEFINED)
-        {
-            return Ok(());
-        }
+    pub fn capture_stack(&mut self, skip: usize) -> JsResult<Handle<'s>> {
         use std::fmt::Write;
-        let frames = capture_frames(self);
         let mut text = String::new();
-        for frame in frames {
-            if frame.function.is_empty() {
-                writeln!(
-                    text,
-                    "    at {}:{}:{}",
-                    frame.file, frame.line, frame.column
-                )
-                .unwrap();
+        for frame in stack_frames(self, true, skip) {
+            let name = if frame.function.is_empty() || frame.function == "<eval>" {
+                "<anonymous>"
+            } else {
+                &frame.function
+            };
+            if frame.line == 0 {
+                writeln!(text, "    at {name} (native)").unwrap();
             } else {
                 writeln!(
                     text,
-                    "    at {} ({}:{}:{})",
-                    frame.function, frame.file, frame.line, frame.column
+                    "    at {name} ({}:{}:{})",
+                    frame.file, frame.line, frame.column
                 )
                 .unwrap();
             }
         }
-        let text = self.new_string(&text)?;
-        let text = self.get(text);
-        let ObjectData::Error(data) = &mut self.runtime.heap.objects.get_mut(id).unwrap().data
-        else {
-            unreachable!()
-        };
-        data.stack = text;
-        Ok(())
+        self.new_string(&text)
+    }
+
+    pub fn capture_error_stack(&mut self, error: Handle<'s>) -> JsResult<()> {
+        save_error_stack(self, error, 0)
     }
 }
 
+fn save_error_stack<'s>(ctx: &mut ExecCtx<'_, 's>, error: Handle<'s>, skip: usize) -> JsResult<()> {
+    let id = ctx.object_id(error)?;
+    match &ctx.heap().object(id).data {
+        ObjectData::Error(data) if data.stack == Value::UNDEFINED => {
+            let stack = ctx.capture_stack(skip)?;
+            let frames = store_frames(ctx)?;
+            property::private_define(ctx, id, brand_key(), frames)?;
+            let stack = ctx.get(stack);
+            let ObjectData::Error(data) = &mut ctx.runtime.heap.objects.get_mut(id).unwrap().data
+            else {
+                unreachable!()
+            };
+            data.stack = stack;
+        }
+        ObjectData::DomException(_) => {
+            let current = property::get_own_property_descriptor(ctx, error, Atom::get("stack"))?;
+            if current.is_some_and(|d| matches!(d.value.map(Value::decode), Some(ValueKind::String(s)) if ctx.heap().string(s).is_empty())) {
+                let stack = ctx.capture_stack(skip)?;
+                property::define_own_property(ctx, error, Atom::get("stack"), property::PropertyDescriptor { value: Some(stack), ..Default::default() })?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn store_frames(ctx: &mut ExecCtx<'_, '_>) -> JsResult<Value> {
+    let frames = capture_frames(ctx);
+    let list = ctx.new_array()?;
+    let list_value = ctx.get(list);
+    for (i, frame) in frames.into_iter().enumerate() {
+        ctx.with_scope(|ctx| {
+            let list = ctx.root(list_value)?;
+            let entry = ctx.new_array()?;
+            let file = ctx.new_string(&frame.file)?;
+            let function = ctx.new_string(&frame.function)?;
+            let line = ctx.root(Value::number(f64::from(frame.line)))?;
+            let column = ctx.root(Value::number(f64::from(frame.column)))?;
+            for (i, value) in [file, function, line, column].into_iter().enumerate() {
+                define_default(ctx, entry, PropKey::index(i as u32).unwrap(), value)?;
+            }
+            let key = load::index_key(ctx, i as u64)?;
+            define_default(ctx, list, key, entry)
+        })?;
+    }
+    Ok(list_value)
+}
+
+pub(crate) fn saved_frames(ctx: &ExecCtx<'_, '_>, error: Value) -> Option<Vec<crate::Frame>> {
+    let id = error.as_object()?;
+    if !matches!(ctx.heap().object(id).data, ObjectData::Error(_)) {
+        return None;
+    }
+    let list = property::private_own(ctx, id, brand_key())?.as_object()?;
+    let ObjectData::Array(list) = &ctx.heap().object(list).data else {
+        return None;
+    };
+    let mut frames = Vec::with_capacity(list.elements.len());
+    for value in list.elements.iter() {
+        let ObjectData::Array(entry) = &ctx.heap().object(value.as_object()?).data else {
+            return None;
+        };
+        let [file, function, line, column] = &entry.elements[..] else {
+            return None;
+        };
+        let (ValueKind::String(file), ValueKind::String(function)) =
+            (file.decode(), function.decode())
+        else {
+            return None;
+        };
+        frames.push(crate::Frame {
+            file: utf16_lossy(ctx.heap(), file),
+            function: utf16_lossy(ctx.heap(), function),
+            line: line.as_number()? as u32,
+            column: column.as_number()? as u32,
+        });
+    }
+    Some(frames)
+}
+
+pub(crate) fn native_stack(ctx: &mut ExecCtx<'_, '_>, value: Value) -> JsResult<Value> {
+    if value.as_object().is_some_and(|id| {
+        matches!(
+            ctx.heap().object(id).data,
+            ObjectData::Error(_) | ObjectData::DomException(_)
+        )
+    }) {
+        ctx.with_scope(|ctx| {
+            let error = ctx.root(value)?;
+            save_error_stack(ctx, error, 1)
+        })?;
+    }
+    Ok(value)
+}
+
+pub(crate) fn capture_throw(ctx: &mut ExecCtx<'_, '_>) {
+    if ctx.runtime.vm.thrown_frames.is_empty() {
+        ctx.runtime.vm.thrown_frames = capture_frames(ctx);
+    }
+    let Some(value) = ctx.pending_exception() else {
+        return;
+    };
+    if ctx.is_oom()
+        || !value.as_object().is_some_and(|id| {
+            matches!(
+                ctx.heap().object(id).data,
+                ObjectData::Error(_) | ObjectData::DomException(_)
+            )
+        })
+    {
+        return;
+    }
+    let _ = ctx.with_scope(|ctx| {
+        let root = ctx.root(value)?;
+        let _ = save_error_stack(ctx, root, 0);
+        ctx.throw_value(value, false);
+        Ok::<_, Abrupt>(())
+    });
+    ctx.throw_value(value, false);
+}
+
 pub(crate) fn capture_frames(ctx: &ExecCtx<'_, '_>) -> Vec<crate::Frame> {
+    stack_frames(ctx, false, 0)
+}
+
+fn stack_frames(ctx: &ExecCtx<'_, '_>, natives: bool, skip: usize) -> Vec<crate::Frame> {
     let heap = ctx.heap();
     let mut frames = Vec::new();
-    for frame in ctx.runtime.vm.frames.iter().rev() {
+    for frame in ctx.runtime.vm.frames.iter().rev().skip(skip) {
         let Some(code) = frame.code else {
+            if natives {
+                let function = heap.object(frame.callee);
+                let name =
+                    heap.shape(function.shape)
+                        .find(Atom::get("name"))
+                        .and_then(|(index, _)| match function.props[index].decode() {
+                            ValueKind::String(id) => Some(utf16_lossy(heap, id)),
+                            _ => None,
+                        });
+                if let Some(function) = name {
+                    frames.push(crate::Frame {
+                        file: String::new(),
+                        function,
+                        line: 0,
+                        column: 0,
+                    });
+                }
+            }
             continue;
         };
         let Some(f) = &heap.bytecode.get(code).unwrap().compiled else {
@@ -643,28 +779,38 @@ pub(crate) fn step(
             iterators::iterator_op(ctx, frame, inst)?;
         }
         Eval | ApplyEval => {
-            let (count, spread) = match inst.operands {
-                Operands::Eval { arguments, .. } => (arguments as usize, false),
-                Operands::Unsigned(_) => (1, true),
+            let (start, count, scope) = match inst.operands {
+                Operands::Eval { arguments, scope } => {
+                    let start = tail - arguments as usize - 1;
+                    ctx.reserve_stack(1)?;
+                    replace(ctx, 0, &[Value::UNDEFINED]);
+                    ctx.runtime.vm.stack[start + 1..].rotate_right(1);
+                    (start, arguments as usize, scope)
+                }
+                Operands::Unsigned(scope) => {
+                    let start = tail - 2;
+                    let callee = ctx.runtime.vm.stack[start];
+                    let count = expand_array_like(
+                        ctx,
+                        start,
+                        callee,
+                        Value::UNDEFINED,
+                        Handle::at(start + 1),
+                        false,
+                    )?;
+                    (start, count, scope as u16)
+                }
                 _ => unreachable!(),
             };
-            let start = tail - count - 1;
-            if spread {
-                ctx.reserve_stack(1)?;
-                replace(ctx, 0, &[Value::UNDEFINED]);
-                ctx.runtime.vm.stack.swap(tail - 1, tail);
-                spread_call(
-                    ctx,
-                    start,
-                    Handle::at(start),
-                    Handle::at(start + 1),
-                    Handle::at(start + 2),
-                    0,
-                )?;
+            if eval::is_intrinsic(ctx, ctx.runtime.vm.stack[start]) {
+                let input = if count == 0 {
+                    Value::UNDEFINED
+                } else {
+                    ctx.runtime.vm.stack[start + 2]
+                };
+                let result = ctx.with_scope(|ctx| eval::execute(ctx, frame, scope, input))?;
+                replace(ctx, count + 2, &[result]);
             } else {
-                ctx.reserve_stack(1)?;
-                replace(ctx, 0, &[Value::UNDEFINED]);
-                ctx.runtime.vm.stack[start + 1..].rotate_right(1);
                 call::enter(ctx, start, count, None)?;
             }
         }

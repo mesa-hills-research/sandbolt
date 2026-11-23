@@ -321,14 +321,22 @@ pub(crate) fn eval_text(
     parse: ParseOptions,
 ) -> JsResult<Value> {
     ctx.check_interrupt()?;
-    let image = qjs_compiler::compile_source(source, parse).map_err(|error| match error {
+    let image = compile_text(ctx, source, parse)?;
+    exec::execute_image(ctx, &image, Some(source))
+}
+
+pub(crate) fn compile_text(
+    ctx: &mut ExecCtx<'_, '_>,
+    source: &SourceText,
+    parse: ParseOptions,
+) -> JsResult<ProgramImage> {
+    qjs_compiler::compile_source(source, parse).map_err(|error| match error {
         CompileError::Syntax { message, .. } => ctx.throw_error(ErrorKind::Syntax, &message),
         CompileError::OutOfMemory => ctx.throw_oom(),
         CompileError::StackOverflow => ctx.stack_overflow(),
         #[allow(unreachable_patterns)]
         other => ctx.throw_error(ErrorKind::Internal, &format!("{other:?}")),
-    })?;
-    exec::execute_image(ctx, &image, Some(source))
+    })
 }
 
 pub(crate) fn parse_options(runtime: &Runtime, options: &EvalOptions) -> ParseOptions {
@@ -406,9 +414,14 @@ fn failure(runtime: &mut Runtime, error: Abrupt, phase: EvalPhase) -> EvalFailur
         );
     }
     let value = runtime.pending_exception().unwrap_or(Value::UNDEFINED);
-    let frames = std::mem::take(&mut runtime.vm.thrown_frames);
+    let mut frames = std::mem::take(&mut runtime.vm.thrown_frames);
     let result = runtime.with_scope(runtime.default_realm(), |ctx| {
         let handle = ctx.root(value)?;
+        if let Some(origin) = exec::saved_frames(ctx, value)
+            && !origin.is_empty()
+        {
+            frames = origin;
+        }
         let kind = value
             .as_object()
             .and_then(|id| match &ctx.heap().object(id).data {
@@ -449,7 +462,7 @@ fn failure(runtime: &mut Runtime, error: Abrupt, phase: EvalPhase) -> EvalFailur
                 format!("{name}: {text}")
             }
         } else {
-            display_value(ctx, handle)?
+            display_exception(ctx, handle)?
         };
         let class = if let Some(kind) = kind {
             Some(kind.name().into())
@@ -491,6 +504,35 @@ fn failure(runtime: &mut Runtime, error: Abrupt, phase: EvalPhase) -> EvalFailur
             None,
             None,
         ),
+    }
+}
+
+fn display_exception<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<String> {
+    if ctx.get(value).as_object().is_none() {
+        return display_value(ctx, value);
+    }
+    let fallback = match display_value(ctx, value) {
+        Ok(text) if !text.starts_with("[object ") => return Ok(text),
+        Ok(text) => Some(text),
+        Err(Abrupt::Interrupted) => return Err(Abrupt::Interrupted),
+        Err(Abrupt::Thrown) => {
+            ctx.take_exception();
+            None
+        }
+    };
+    let this = ctx.root(Value::UNDEFINED)?;
+    let args = ctx.args(&[value])?;
+    let id = crate::NativeFnId(crate::builtins::PROMISE_JSON_EXTRAS_BASE + 0x81);
+    match crate::builtins::promise_json_extras::dispatch(id, ctx, this, args) {
+        Ok(value) => Ok(match value.decode() {
+            ValueKind::String(id) => exec::utf16_lossy(ctx.heap(), id),
+            _ => fallback.unwrap_or_else(|| "JavaScript exception".into()),
+        }),
+        Err(Abrupt::Interrupted) => Err(Abrupt::Interrupted),
+        Err(Abrupt::Thrown) => {
+            ctx.take_exception();
+            Ok(fallback.unwrap_or_else(|| "JavaScript exception".into()))
+        }
     }
 }
 

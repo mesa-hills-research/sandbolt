@@ -321,9 +321,11 @@ pub(crate) fn drive(ctx: &mut ExecCtx<'_, '_>, depth: usize) -> JsResult<()> {
                     .and_then(|()| execute_mini(ctx, frame, index, code))
             }
         } else {
-            native(ctx, frame).map(Some)
+            native(ctx, frame)
+                .and_then(|value| exec::native_stack(ctx, value))
+                .map(Some)
         }
-        .and_then(|result| {
+        .and_then(|mut result| {
             if let Some(value) = result
                 && value.as_object().is_none()
             {
@@ -333,7 +335,7 @@ pub(crate) fn drive(ctx: &mut ExecCtx<'_, '_>, depth: usize) -> JsResult<()> {
                 if frame.new_target.is_some() {
                     let this = ctx.runtime.vm.stack[frame.base as usize + 1];
                     if this.as_object().is_some() {
-                        return Ok(Some(this));
+                        result = Some(this);
                     }
                 }
             }
@@ -353,9 +355,7 @@ pub(crate) fn drive(ctx: &mut ExecCtx<'_, '_>, depth: usize) -> JsResult<()> {
                 return Err(Abrupt::Interrupted);
             }
             Err(Abrupt::Thrown) => {
-                if ctx.runtime.vm.thrown_frames.is_empty() {
-                    ctx.runtime.vm.thrown_frames = exec::capture_frames(ctx);
-                }
+                exec::capture_throw(ctx);
                 if !unwind(ctx, depth)? {
                     return Err(Abrupt::Thrown);
                 }

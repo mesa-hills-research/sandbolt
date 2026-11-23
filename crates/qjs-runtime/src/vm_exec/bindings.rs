@@ -38,7 +38,11 @@ fn capture_slot(frame: CallFrame, slot: usize) -> usize {
     frame.capture_base as usize + slot - (frame.base as usize + 2)
 }
 
-fn local_ref(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame, slot: usize) -> JsResult<Value> {
+pub(super) fn local_ref(
+    ctx: &mut ExecCtx<'_, '_>,
+    frame: CallFrame,
+    slot: usize,
+) -> JsResult<Value> {
     let cell = capture_slot(frame, slot);
     let cached = ctx.runtime.vm.stack[cell];
     if cached != Value::UNDEFINED {
@@ -67,7 +71,7 @@ pub(crate) fn close_frame(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame) {
     }
 }
 
-fn captured(ctx: &ExecCtx<'_, '_>, frame: CallFrame, index: u16) -> Value {
+pub(super) fn captured(ctx: &ExecCtx<'_, '_>, frame: CallFrame, index: u16) -> Value {
     let ObjectData::BytecodeFunction(data) = &ctx.heap().object(frame.callee).data else {
         unreachable!()
     };
@@ -78,6 +82,23 @@ fn captured(ctx: &ExecCtx<'_, '_>, frame: CallFrame, index: u16) -> Value {
 }
 
 pub(super) fn closure(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame, child: BcId) -> JsResult<Value> {
+    if frame
+        .code
+        .is_some_and(|parent| compiled(ctx, parent).class_field_context)
+    {
+        let f = ctx
+            .runtime
+            .heap
+            .bytecode
+            .get_mut(child)
+            .unwrap()
+            .compiled
+            .as_mut()
+            .unwrap();
+        if !f.flags.has_prototype && !f.flags.need_home_object && !f.flags.new_target_allowed {
+            f.class_field_context = true;
+        }
+    }
     let mut captures = TrackedVec::new();
     let len = compiled(ctx, child).closures.len();
     ctx.allocate(|rt| captures.try_reserve_exact(&rt.heap.ledger, len))?;
@@ -201,7 +222,10 @@ fn define_lexical(ctx: &mut ExecCtx<'_, '_>, key: PropKey, writable: bool) -> Js
     })
 }
 
-fn global_ref<'s>(ctx: &mut ExecCtx<'_, 's>, key: PropKey) -> JsResult<Value> {
+fn global_ref<'s>(ctx: &mut ExecCtx<'_, 's>, code: BcId, key: PropKey) -> JsResult<Value> {
+    if let Some(binding) = super::eval::lookup(ctx, code, key)? {
+        return Ok(binding);
+    }
     if let Some((id, _)) = lexical(ctx, key) {
         return Ok(Value::var_ref(id));
     }
@@ -246,7 +270,7 @@ fn write_binding<'s>(
         ValueKind::VarRef(id) => {
             if !initialize {
                 check_initialized(ctx, read_ref(ctx, id))?;
-                if lexical(ctx, key) == Some((id, false)) {
+                if lexical(ctx, key) == Some((id, false)) || !super::eval::writable(ctx, id) {
                     return Err(ctx.throw_type_error("assignment to constant binding"));
                 }
             }
@@ -289,7 +313,7 @@ pub(super) fn binding_op(
         let result = match op {
             GetVar | GetVarUndef => {
                 let key = atom.unwrap();
-                let binding = global_ref(ctx, key)?;
+                let binding = global_ref(ctx, code, key)?;
                 let binding = ctx.root(binding)?;
                 (
                     0,
@@ -302,18 +326,32 @@ pub(super) fn binding_op(
             }
             PutVar | PutVarInit => {
                 let key = atom.unwrap();
-                let binding = global_ref(ctx, key)?;
+                let binding = global_ref(ctx, code, key)?;
                 let binding = ctx.root(binding)?;
                 write_binding(ctx, binding, key, h(1), strict, op == PutVarInit)?;
                 (1, [Value::EMPTY; 2], None)
             }
             CheckDefineVar | DefineVar | DefineFunc | DeleteVar => {
                 let key = atom.unwrap();
+                if op != DeleteVar
+                    && super::eval::declaration(
+                        ctx,
+                        code,
+                        key,
+                        op,
+                        (op == DefineFunc).then(|| h(1)),
+                    )?
+                {
+                    return Ok((usize::from(op == DefineFunc), [Value::EMPTY; 2], None));
+                }
                 let global = ctx.root(Value::object(ctx.realm().global_object))?;
-                let flags = match inst.operands {
+                let mut flags = match inst.operands {
                     Operands::AtomU8(_, flags) => flags,
                     _ => 0,
                 };
+                if compiled(ctx, code).eval.is_some() {
+                    flags |= 1;
+                }
                 let lexical_binding = flags & 0x80 != 0;
                 let existing = property::get_own_property_descriptor(ctx, global, key)?;
                 match op {
@@ -395,7 +433,7 @@ pub(super) fn binding_op(
             MakeVarRef | MakeLocRef | MakeArgRef | MakeVarRefRef => {
                 let key = atom.unwrap();
                 let value = match inst.operands {
-                    Operands::Atom(_) => global_ref(ctx, key)?,
+                    Operands::Atom(_) => global_ref(ctx, code, key)?,
                     Operands::AtomU16(_, n) => match op {
                         MakeLocRef => {
                             local_ref(ctx, frame, arg + frame.arg_slots as usize + n as usize)?
@@ -518,6 +556,14 @@ pub(super) fn special_object(
     code: BcId,
     selector: u32,
 ) -> JsResult<Value> {
+    if (2..=4).contains(&selector)
+        && let Some(frame) = compiled(ctx, code)
+            .eval
+            .as_ref()
+            .and_then(|env| env.special)
+    {
+        return Ok(frame[selector as usize - 2]);
+    }
     Ok(match selector {
         0 | 1 => return arguments(ctx, frame, code, selector == 1),
         2 => Value::object(frame.callee),

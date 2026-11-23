@@ -448,9 +448,16 @@ fn drain(ctx: &mut ExecCtx<'_, '_>, id: CoroId) -> JsResult<()> {
                 NEXT => complete_request(ctx, id, Value::UNDEFINED, true, false)?,
                 THROW => complete_request(ctx, id, request.value, true, true)?,
                 RETURN => {
-                    await_value(ctx, id, request.value)?;
                     state_mut(ctx, id).status = CoroStatus::AwaitReturn;
-                    return Ok(());
+                    match await_value(ctx, id, request.value) {
+                        Ok(()) => return Ok(()),
+                        Err(Abrupt::Interrupted) => return Err(Abrupt::Interrupted),
+                        Err(Abrupt::Thrown) => {
+                            let (reason, _) = ctx.take_exception().unwrap();
+                            state_mut(ctx, id).status = CoroStatus::Done;
+                            complete_request(ctx, id, reason, true, true)?;
+                        }
+                    }
                 }
                 _ => unreachable!(),
             }
@@ -491,18 +498,18 @@ fn complete_request(
     reject: bool,
 ) -> JsResult<()> {
     let capability = state(ctx, id).requests[0].capability;
-    // Keep the queue entry pinned across promise resolution.
     ctx.with_scope(|ctx| {
+        let value = ctx.root(value)?;
+        ctx.root(capability[if reject { 2 } else { 1 }])?;
         let value = if reject {
-            value
+            ctx.get(value)
         } else {
-            let value = ctx.root(value)?;
             iterators::iterator_result(ctx, value, done)?
         };
+        // Resolving the iterator result can run a then getter that queues another request.
+        state_mut(ctx, id).requests.remove(0);
         settle(ctx, capability, value, reject)
-    })?;
-    state_mut(ctx, id).requests.remove(0);
-    Ok(())
+    })
 }
 
 pub(crate) fn resume_await<'s>(

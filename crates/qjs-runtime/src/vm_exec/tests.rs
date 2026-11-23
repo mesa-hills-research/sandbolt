@@ -371,6 +371,173 @@ fn module_graph_links_live_bindings_and_waits_for_cycle_roots() {
 }
 
 #[test]
+fn direct_eval_shares_lexical_bindings_and_sloppy_variables() {
+    assert_eq!(
+        run(r#"
+        var marker = 'global';
+        function f(x) {
+            let y = 1;
+            eval('x += 2; y += 1; var z = 6; function p(t) { return x + y + t }');
+            const read = eval('() => y');
+            y++;
+            return [p(z), z, eval(...['x']), (0, eval)('marker'), read()].join(',');
+        }
+        f(7)
+    "#),
+        "18,6,9,global,3"
+    );
+    assert_eq!(
+        run(r#"
+        let outer = 42;
+        function f() {
+            'use strict';
+            eval('var temp = outer');
+            return [eval('outer'), typeof temp].join(',');
+        }
+        f()
+    "#),
+        "42,undefined"
+    );
+}
+
+#[test]
+fn constructs_functions_and_captures_error_stacks() {
+    assert_eq!(
+        run(r#"
+        const ctor = (function*(){}).constructor;
+        const gen = ctor('x', 'yield x + 1');
+        [ctor.name, gen(41).next().value, Function('x','return ++x')(41), (async () => {}).constructor.name].join(',')
+    "#),
+        "GeneratorFunction,42,42,AsyncFunction"
+    );
+    assert_eq!(
+        run(r#"
+        function f() { return new Error('message').stack; }
+        function g() { try { btoa('⚡'); } catch (e) { return e.stack; } }
+        [f().includes('at f ('), g().includes('at btoa (native)')].join(',')
+    "#),
+        "true,true"
+    );
+}
+
+#[test]
+fn classes_use_super_and_private_brands() {
+    assert_eq!(
+        run(r#"
+        class Parent { constructor(n) {this.n = n} get value() { return this.n } }
+        class Child extends Parent {
+          #x = 2;
+          constructor(n) { super(n); }
+          get value() { return super.value + this.#x; }
+          static has(o) { return #x in o; }
+        }
+        const obj = new Child(40);
+        [obj.value, Child.has(obj), Child.has(new Parent(1)), Reflect.ownKeys(obj)].join(',')
+    "#),
+        "42,true,false,n"
+    );
+}
+
+#[test]
+fn rethrow_keeps_error_creation_frames() {
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    engine
+        .eval(
+            "function create() { return new Error('origin'); }\nvar saved = create();",
+            EvalOptions {
+                filename: "user.js".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .eval(
+            "function rethrow() { throw saved; }",
+            EvalOptions {
+                filename: "adapter.js".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let Err(EngineError::Thrown { message, frames }) = engine.call_global("rethrow", "") else {
+        panic!("expected a throw");
+    };
+    assert_eq!(message, "Error: origin");
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.file == "user.js" && frame.function == "create" && frame.line == 1)
+    );
+    assert!(!frames.iter().any(|frame| frame.file == "adapter.js"));
+    let Err(EngineError::Thrown { message, .. }) =
+        engine.eval("throw { n: 1 }", EvalOptions::default())
+    else {
+        panic!("expected a throw");
+    };
+    assert_eq!(message, "{\"n\":1}");
+}
+
+#[test]
+fn trampoline_calls_do_not_consume_native_reentry_budget() {
+    assert_eq!(
+        run("function f(n) { return n ? Reflect.apply(f, null, [n-1]) : 42; } f(500)"),
+        "42"
+    );
+    assert_eq!(
+        run("function f(n) { return n ? f.apply(null,[n-1]) : 42; } f(500)"),
+        "42"
+    );
+    assert_eq!(
+        run("function f(n) { return n ? f.call(null,n-1) : 42; } f(500)"),
+        "42"
+    );
+    let mut engine = JsEngine::new(EngineLimits {
+        stack_bytes: 64 * 1024,
+        ..Default::default()
+    })
+    .unwrap();
+    let Err(EngineError::Thrown { message, frames }) = engine.eval(
+        "function f() { return f.call(null); } f()",
+        EvalOptions::default(),
+    ) else {
+        panic!("expected stack overflow");
+    };
+    assert_eq!(message, "RangeError: Maximum call stack size exceeded");
+    assert_eq!(frames[0].function, "f");
+}
+
+#[test]
+fn bytecode_oom_is_catchable_but_host_classifies_uncaught_oom() {
+    let mut engine = JsEngine::new(EngineLimits {
+        heap_bytes: 8 * 1024 * 1024,
+        ..Default::default()
+    })
+    .unwrap();
+    let options = EvalOptions::default();
+    assert_eq!(engine.eval_to_string("var text; try { new Array(1000000000).fill(1); } catch (e) { text = e.message; } text", options.clone()).unwrap(), "out of memory");
+    assert_eq!(
+        engine.eval("new Array(1000000000).fill(1);", options),
+        Err(EngineError::OutOfMemory)
+    );
+}
+
+#[test]
+fn interrupt_during_async_resume_does_not_run_handlers() {
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let options = EvalOptions::default();
+    engine.eval("var handled = false; (async () => { try { await 1; for (;;) {} } finally { handled = true; } })().catch(() => { handled = true; });", options.clone()).unwrap();
+    let mut remaining = 30;
+    engine.set_interrupt_handler(Some(Box::new(move || {
+        remaining -= 1;
+        remaining <= 0
+    })));
+    assert_eq!(engine.run_jobs(), Err(EngineError::Interrupted));
+    engine.set_interrupt_handler(None);
+    engine.run_jobs().unwrap();
+    assert_eq!(engine.eval_to_string("handled", options).unwrap(), "false");
+}
+
+#[test]
 fn host_bridge_and_print_are_opt_in() {
     let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
     let opts = EvalOptions::default();
