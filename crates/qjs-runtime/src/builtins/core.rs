@@ -197,7 +197,9 @@ fn for_each_iterator<'s>(
     mut f: impl for<'a> FnMut(&mut ExecCtx<'_, 'a>, Handle<'a>, u64) -> JsResult<()>,
 ) -> JsResult<()> {
     let boxed = convert::to_object(ctx, iterable)?;
-    let method = get(ctx, boxed, symbol_key(ctx, WellKnown::Iterator))?;
+    let key = symbol_key(ctx, WellKnown::Iterator);
+    let method = property::get_property_with_receiver(ctx, boxed, key, iterable)?;
+    let method = ctx.root(method)?;
     let result = call::call(ctx, method, iterable, Args::empty())?;
     let iterator = ctx.root(result)?;
     ctx.object_id(iterator)?;

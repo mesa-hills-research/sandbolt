@@ -464,7 +464,7 @@ fn object_descriptors_copy_enumeration_and_integrity() {
     });
 }
 
-const CALLBACKS: [NativeFn; 11] = [
+const CALLBACKS: [NativeFn; 12] = [
     iterator_this,
     iterator_next,
     iterator_return,
@@ -476,7 +476,12 @@ const CALLBACKS: [NativeFn; 11] = [
     count_call,
     interrupt_then_throw,
     delete_symbol_keys,
+    throw_this,
 ];
+
+fn throw_this<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>, _: Args<'s>) -> JsResult<Value> {
+    Err(ctx.throw(this))
+}
 
 fn iterator_this<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>, _: Args<'s>) -> JsResult<Value> {
     Ok(ctx.get(this))
@@ -631,6 +636,31 @@ fn object_iterable_operations_keep_keys_values_and_original_exceptions() {
         throws(ctx, result, ErrorKind::Type);
         let closed = named(ctx, bad, "closed")?;
         ok_bool(ctx, ctx.get(closed), true);
+        Ok(())
+    });
+}
+
+#[test]
+fn iterator_method_getter_receives_the_unboxed_value() {
+    run(|ctx| {
+        let object = global(ctx, "Object")?;
+        let proto = ctx.root(Value::object(ctx.realm().string_proto))?;
+        let getter = ctx.new_native(NativeFnId(11), false)?;
+        let key = symbol_key(ctx, WellKnown::Iterator);
+        define_or_throw(
+            ctx,
+            proto,
+            key,
+            PropertyDescriptor {
+                get: Some(getter),
+                ..PropertyDescriptor::default()
+            },
+        )?;
+        let input = ctx.new_string("input")?;
+        let result = method(ctx, object, "fromEntries", &[input]);
+        assert_eq!(result.unwrap_err(), Abrupt::Thrown);
+        let thrown = ctx.take_exception().unwrap().0;
+        eq(ctx, thrown, ctx.get(input));
         Ok(())
     });
 }
