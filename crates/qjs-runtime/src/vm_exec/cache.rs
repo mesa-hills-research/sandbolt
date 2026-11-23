@@ -9,31 +9,26 @@ use crate::shape::PropFlags;
 use crate::value::*;
 use crate::vm::{CompiledFunc, InlineCache};
 
+pub(super) fn supports(op: Opcode) -> bool {
+    use Opcode::*;
+    matches!(
+        op,
+        GetField
+            | GetField2
+            | PutField
+            | GetVar
+            | GetVarUndef
+            | PutVar
+            | MakeVarRef
+            | GetRefValue
+            | PutRefValue
+    )
+}
+
 pub(super) fn slots(
     ledger: &HeapLedger,
-    code: &[u8],
+    count: usize,
 ) -> AllocResult<TrackedVec<Cell<Option<InlineCache>>>> {
-    use Opcode::*;
-    let mut count = 0;
-    let mut pc = 0;
-    while pc < code.len() && count < 16 {
-        let op = Opcode::ALL[code[pc] as usize];
-        if matches!(
-            op,
-            GetField
-                | GetField2
-                | PutField
-                | GetVar
-                | GetVarUndef
-                | PutVar
-                | MakeVarRef
-                | GetRefValue
-                | PutRefValue
-        ) {
-            count += 1;
-        }
-        pc += usize::from(op.info().size);
-    }
     let mut entries = TrackedVec::new();
     if count != 0 {
         // A bounded direct-mapped table avoids a cache-sized field for each bytecode byte.

@@ -1,9 +1,11 @@
+use qjs_bytecode::FunctionKind;
+
 use crate::atom::Atom;
 use crate::heap::Heap;
 use crate::object::{ObjectData, ObjectFlags};
 use crate::root::{Args, ExecCtx, Handle, RootScope};
 use crate::value::*;
-use crate::vm::{CallFrame, MiniOp, exec};
+use crate::vm::{CallFrame, CompiledFunc, MiniOp, VmState, exec};
 
 const FINALLY: u32 = 1 << 31;
 
@@ -100,6 +102,148 @@ fn invoke<'s>(
     ctx.runtime.vm.reentry_depth -= reentry;
     ctx.realm = caller;
     result
+}
+
+#[derive(Clone, Copy)]
+struct FrameLayout {
+    base: usize,
+    count: usize,
+    arg_slots: usize,
+    capture_base: usize,
+    floor: usize,
+    operands: usize,
+}
+
+impl FrameLayout {
+    #[inline]
+    fn new(base: usize, count: usize, function: Option<&CompiledFunc>) -> Self {
+        let (arg_slots, locals, operands, capture_slots) = function.map_or((count, 0, 0, 0), |f| {
+            let slots = count.max(f.arg_count as usize);
+            (
+                slots,
+                f.var_count as usize,
+                f.stack_size as usize,
+                slots + f.var_count as usize,
+            )
+        });
+        let capture_base = base + 2 + arg_slots + locals;
+        Self {
+            base,
+            count,
+            arg_slots,
+            capture_base,
+            floor: capture_base + capture_slots,
+            operands,
+        }
+    }
+
+    #[inline]
+    fn storage(self) -> usize {
+        self.floor - (self.base + 2 + self.count)
+    }
+
+    #[inline]
+    fn needed(self) -> usize {
+        self.storage() + self.operands
+    }
+
+    #[inline]
+    fn frame(
+        self,
+        callee: ObjId,
+        realm: RealmId,
+        caller_realm: RealmId,
+        code: Option<BcId>,
+        new_target: Option<ObjId>,
+        require_object: bool,
+    ) -> CallFrame {
+        CallFrame {
+            callee,
+            realm,
+            caller_realm,
+            code,
+            new_target,
+            pc: 0,
+            base: self.base as u32,
+            arg_count: self.count as u32,
+            arg_slots: self.arg_slots as u32,
+            capture_base: self.capture_base as u32,
+            floor: self.floor as u32,
+            last_pc: 0,
+            return_call: false,
+            require_object,
+            coroutine: None,
+        }
+    }
+}
+
+pub(crate) struct PlainCall {
+    frame: CallFrame,
+    method: bool,
+}
+
+impl PlainCall {
+    #[inline]
+    pub(crate) fn enter(self, ctx: &mut ExecCtx<'_, '_>) -> JsResult<(BcId, RealmId)> {
+        let vm = &mut ctx.runtime.vm;
+        let base = self.frame.base as usize;
+        if self.method {
+            vm.stack.swap(base, base + 1);
+        } else {
+            vm.stack.push_reserved(Value::UNDEFINED);
+            vm.stack[base + 1..].rotate_right(1);
+        }
+        if vm.interrupt_handler.is_some() {
+            ctx.check_interrupt()?;
+        }
+        let vm = &mut ctx.runtime.vm;
+        while vm.stack.len() < self.frame.floor as usize {
+            vm.stack.push_reserved(Value::UNDEFINED);
+        }
+        vm.frames.push_reserved(self.frame);
+        Ok((self.frame.code.unwrap(), self.frame.realm))
+    }
+}
+
+#[inline]
+pub(crate) fn prepare_plain(
+    heap: &Heap,
+    vm: &VmState,
+    caller: RealmId,
+    count: usize,
+    method: bool,
+) -> Option<PlainCall> {
+    if vm.frames.len() == vm.frames.capacity() {
+        return None;
+    }
+    let inserted = usize::from(!method);
+    let tail = vm.stack.len();
+    let base = tail - (count + 2 - inserted);
+    let callee = vm.stack[base + usize::from(method)].as_object()?;
+    let ObjectData::BytecodeFunction(data) = &heap.object(callee).data else {
+        return None;
+    };
+    if data.is_class_constructor {
+        return None;
+    }
+    let code = data.code;
+    let function = heap.bytecode.get(code).unwrap().compiled.as_ref()?;
+    if function.kind != FunctionKind::Normal || function.needs_arguments {
+        return None;
+    }
+    let layout = FrameLayout::new(base, count, Some(function));
+    let needed = layout.needed() + inserted;
+    // A non-method call also needs the spare root slot reserved by reserve_stack(1).
+    if vm.stack.capacity() - tail < needed.max(inserted * 2)
+        || (!method && tail + 1 >= u32::MAX as usize)
+        || !vm.check_budget(needed, 1, 0)
+    {
+        return None;
+    }
+    Some(PlainCall {
+        frame: layout.frame(callee, data.realm, caller, Some(code), None, false),
+        method,
+    })
 }
 
 pub(crate) fn enter(
@@ -213,23 +357,12 @@ fn enter_call(
         }
         _ => unreachable!(),
     };
-    let (arg_slots, locals, operands, capture_slots) = code
-        .and_then(|id| ctx.heap().bytecode.get(id).unwrap().compiled.as_ref())
-        .map_or((count, 0, 0, 0), |f| {
-            let slots = count.max(f.arg_count as usize);
-            (
-                slots,
-                f.var_count as usize,
-                f.stack_size as usize,
-                slots + f.var_count as usize,
-            )
-        });
-    let storage = arg_slots - count + locals + capture_slots;
-    if !ctx.runtime.vm.check_budget(storage + operands, 1, 0) {
+    let compiled = code.and_then(|id| ctx.heap().bytecode.get(id).unwrap().compiled.as_ref());
+    let layout = FrameLayout::new(base, count, compiled);
+    let needed = layout.needed();
+    if !ctx.runtime.vm.check_budget(needed, 1, 0) {
         return Err(ctx.stack_overflow());
     }
-    let capture_base = base + 2 + arg_slots + locals;
-    let floor = capture_base + capture_slots;
     let this = if let Some(new_target) = new_target {
         if preallocate {
             ctx.with_scope(|ctx| {
@@ -247,31 +380,15 @@ fn enter_call(
     } else {
         ctx.runtime.vm.stack[base + 1]
     };
-    if ctx.runtime.vm.stack.capacity() - ctx.runtime.vm.stack.len() < storage + operands {
+    if ctx.runtime.vm.stack.capacity() - ctx.runtime.vm.stack.len() < needed {
         ctx.root(this)?;
-        ctx.reserve_stack(storage + operands)?;
+        ctx.reserve_stack(needed)?;
         ctx.runtime.vm.stack.pop();
     }
-    for _ in 0..storage {
+    for _ in 0..layout.storage() {
         ctx.runtime.vm.stack.push_reserved(Value::UNDEFINED);
     }
-    let frame = CallFrame {
-        callee,
-        realm,
-        caller_realm: ctx.realm,
-        code,
-        new_target,
-        pc: 0,
-        base: base as u32,
-        arg_count: count as u32,
-        arg_slots: arg_slots as u32,
-        capture_base: capture_base as u32,
-        floor: floor as u32,
-        last_pc: 0,
-        return_call: false,
-        require_object,
-        coroutine: None,
-    };
+    let frame = layout.frame(callee, realm, ctx.realm, code, new_target, require_object);
     // The original call operands still contain new.target until the frame is live.
     if ctx.runtime.vm.frames.len() < ctx.runtime.vm.frames.capacity() {
         ctx.runtime.vm.frames.push_reserved(frame);

@@ -1,4 +1,4 @@
-use qjs_bytecode::{ConstEntry, ConstString, FunctionKind, ProgramImage, TemplateObject};
+use qjs_bytecode::{ConstEntry, ConstString, FunctionKind, Opcode, ProgramImage, TemplateObject};
 use qjs_syntax::{SourceText, Span};
 
 use crate::atom::{Atom, PropKey};
@@ -38,6 +38,7 @@ pub(super) fn load_functions(
     let mut functions = TrackedVec::new();
     ctx.allocate(|rt| functions.try_reserve_exact(&rt.heap.ledger, image.functions.len()))?;
     for function in &image.functions {
+        let (cache_sites, needs_arguments) = execution_metadata(&function.code);
         let atom = function.name;
         let name = if atom.is_none() {
             None
@@ -93,11 +94,12 @@ pub(super) fn load_functions(
                     constants,
                     compiled: Some(CompiledFunc {
                         code: TrackedVec::from_slice(ledger, &function.code)?,
-                        inline_caches: super::cache::slots(ledger, &function.code)?,
+                        inline_caches: super::cache::slots(ledger, cache_sites)?,
                         atoms: TrackedVec::from_slice(ledger, &atoms)?,
                         name,
                         flags: function.flags,
                         kind: function.kind.unwrap_or_default(),
+                        needs_arguments,
                         strict: function.strict,
                         arg_count: function.arg_count,
                         var_count: function.var_count,
@@ -141,6 +143,19 @@ pub(super) fn load_functions(
         }
     }
     Ok(functions)
+}
+
+fn execution_metadata(code: &[u8]) -> (usize, bool) {
+    let mut pc = 0;
+    let mut cache_sites = 0;
+    let mut needs_arguments = false;
+    while pc < code.len() {
+        let op = Opcode::ALL[code[pc] as usize];
+        cache_sites += usize::from(super::cache::supports(op));
+        needs_arguments |= op == Opcode::SpecialObject && code[pc + 1] <= 1;
+        pc += usize::from(op.info().size);
+    }
+    (cache_sites.min(16), needs_arguments)
 }
 
 fn clone_items<T: Clone>(

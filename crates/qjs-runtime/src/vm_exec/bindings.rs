@@ -1,5 +1,6 @@
 use qjs_bytecode::{ClosureKind, Instruction, Opcode, Operands};
 
+use crate::arena::Arena;
 use crate::atom::{Atom, PropKey};
 use crate::heap::Heap;
 use crate::ledger::{TrackedBox, TrackedVec};
@@ -57,18 +58,37 @@ pub(super) fn local_ref(
 }
 
 pub(super) fn close_local(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame, slot: usize) {
-    let cell = capture_slot(frame, slot);
-    if let ValueKind::VarRef(reference) = ctx.runtime.vm.stack[cell].decode() {
-        let value = ctx.runtime.vm.stack[slot];
-        ctx.runtime.heap.var_refs.get_mut(reference).unwrap().state = VarRefState::Closed(value);
-        ctx.runtime.vm.stack[cell] = Value::UNDEFINED;
+    close_slot(
+        &mut ctx.runtime.heap.var_refs,
+        &mut ctx.runtime.vm.stack,
+        slot,
+        capture_slot(frame, slot),
+    );
+}
+
+#[inline]
+fn close_slot(var_refs: &mut Arena<VarRef>, stack: &mut [Value], slot: usize, cell: usize) {
+    if let ValueKind::VarRef(reference) = stack[cell].decode() {
+        var_refs.get_mut(reference).unwrap().state = VarRefState::Closed(stack[slot]);
+        stack[cell] = Value::UNDEFINED;
     }
 }
 
 pub(crate) fn close_frame(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame) {
-    for slot in frame.capture_base as usize..frame.floor as usize {
-        let local = slot - frame.capture_base as usize + frame.base as usize + 2;
-        close_local(ctx, frame, local);
+    close_frame_slots(
+        &mut ctx.runtime.heap.var_refs,
+        &mut ctx.runtime.vm.stack,
+        frame,
+    );
+}
+
+pub(super) fn close_frame_slots(
+    var_refs: &mut Arena<VarRef>,
+    stack: &mut [Value],
+    frame: CallFrame,
+) {
+    for (i, cell) in (frame.capture_base as usize..frame.floor as usize).enumerate() {
+        close_slot(var_refs, stack, frame.base as usize + 2 + i, cell);
     }
 }
 

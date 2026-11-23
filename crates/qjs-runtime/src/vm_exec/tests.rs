@@ -305,7 +305,7 @@ fn short_bigint_multiply_divide_remainder_and_power_keep_interrupt_checks() {
             let polls = polls.clone();
             move || {
                 polls.set(polls.get() + 1);
-                polls.get() == 2
+                polls.get() == 3
             }
         })));
         assert_eq!(
@@ -316,7 +316,7 @@ fn short_bigint_multiply_divide_remainder_and_power_keep_interrupt_checks() {
             Err(EngineError::Interrupted),
             "{op}"
         );
-        assert_eq!(polls.get(), 2, "{op}");
+        assert_eq!(polls.get(), 3, "{op}");
     }
 }
 
@@ -1372,6 +1372,67 @@ fn rethrow_keeps_error_creation_frames() {
         panic!("expected a throw");
     };
     assert_eq!(message, "{\"n\":1}");
+}
+
+#[test]
+fn direct_calls_restore_the_receiver_and_close_captured_slots() {
+    assert_eq!(
+        run(r#"
+        function wrap(first) {
+            let add = (second) => first += second;
+            add(2);
+            return add;
+        }
+        const receiver = {
+            name: 'receiver',
+            call(a, b) { return [this.name, a, b].join(':'); },
+        };
+        const add = wrap(3);
+        [add(7), receiver.call(8), receiver.call(9, 10), add(1)].join('|');
+        "#),
+        "12|receiver:8:|receiver:9:10|13"
+    );
+}
+
+#[test]
+fn direct_calls_poll_once_per_entry_and_skip_finally_on_interrupt() {
+    use std::{cell::Cell, rc::Rc};
+
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let options = EvalOptions::default();
+    engine
+        .eval(
+            r#"
+        var reached = 0;
+        function outer() {
+            const leaf = () => ++reached;
+            leaf();
+            leaf();
+        }
+        outer();
+        reached = 0;
+    "#,
+            options.clone(),
+        )
+        .unwrap();
+    let polls = Rc::new(Cell::new(0));
+    engine.set_interrupt_handler(Some(Box::new({
+        let polls = polls.clone();
+        move || {
+            polls.set(polls.get() + 1);
+            polls.get() == 5
+        }
+    })));
+    assert_eq!(
+        engine.eval(
+            "try { outer(); } finally { reached = -1; }",
+            options.clone()
+        ),
+        Err(EngineError::Interrupted)
+    );
+    assert_eq!(polls.get(), 5);
+    engine.set_interrupt_handler(None);
+    assert_eq!(engine.eval_to_string("reached", options).unwrap(), "1");
 }
 
 #[test]

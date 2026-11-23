@@ -128,433 +128,487 @@ fn branch(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame, index: usize, target: u32
 
 pub(crate) fn run_frame(
     ctx: &mut ExecCtx<'_, '_>,
-    index: usize,
-    code: BcId,
+    mut index: usize,
+    mut code: BcId,
 ) -> JsResult<Option<Value>> {
     use Opcode::*;
-    let frame = ctx.runtime.vm.frames[index];
-    let arg_base = frame.base as usize + 2;
-    let var_base = arg_base + frame.arg_slots as usize;
-    let mut pc = frame.pc;
-    loop {
-        // A slow instruction can collect or reenter the VM. Take these borrows again after it.
-        let heap = &mut ctx.runtime.heap;
-        let vm = &mut ctx.runtime.vm;
-        let bytecode = heap.bytecode.get(code).unwrap();
-        let function = bytecode.compiled.as_ref().unwrap();
-        let bytes = &function.code;
-        let (at, op) = loop {
-            if !function.hoisted.is_empty()
-                && let Ok(i) = function.hoisted.binary_search_by_key(&pc, |&(at, _)| at)
-            {
-                pc = function.hoisted[i].1;
-                continue;
-            }
-            let at = pc;
-            let pos = at as usize + 1;
-            let byte = bytes[at as usize];
-            let op = Opcode::ALL[byte as usize];
-            pc += u32::from(op.info().size);
-            let u16 = || u16::from_le_bytes([bytes[pos], bytes[pos + 1]]);
-            let u32 =
-                || u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]);
-            let stack = &mut vm.stack;
-            let tail = stack.len();
-            match op {
-                Nop => {}
-                PushI32 | PushI16 | PushI8 | PushMinus1 | Push0 | Push1 | Push2 | Push3 | Push4
-                | Push5 | Push6 | Push7 => stack.push_reserved(Value::int32(match op {
-                    PushI32 => u32() as i32,
-                    PushI16 => i32::from(u16() as i16),
-                    PushI8 => i32::from(bytes[pos] as i8),
-                    _ => i32::from(byte) - Push0 as i32,
-                })),
-                PushBigintI32 => {
-                    stack.push_reserved(Value::short_bigint(i64::from(u32() as i32)).unwrap());
+    let entry_index = index;
+    'frames: loop {
+        let frame = ctx.runtime.vm.frames[index];
+        let arg_base = frame.base as usize + 2;
+        let var_base = arg_base + frame.arg_slots as usize;
+        let mut pc = frame.pc;
+        loop {
+            // A slow instruction can collect or reenter the VM. Take these borrows again after it.
+            let heap = &mut ctx.runtime.heap;
+            let vm = &mut ctx.runtime.vm;
+            let bytecode = heap.bytecode.get(code).unwrap();
+            let function = bytecode.compiled.as_ref().unwrap();
+            let bytes = &function.code;
+            let (at, op) = loop {
+                if !function.hoisted.is_empty()
+                    && let Ok(i) = function.hoisted.binary_search_by_key(&pc, |&(at, _)| at)
+                {
+                    pc = function.hoisted[i].1;
+                    continue;
                 }
-                Undefined => stack.push_reserved(Value::UNDEFINED),
-                Null => stack.push_reserved(Value::NULL),
-                PushFalse | PushTrue => stack.push_reserved(Value::bool(op == PushTrue)),
-                PushConst | PushConst8 => {
-                    let i = if op == PushConst8 {
-                        bytes[pos].into()
-                    } else {
-                        u32()
-                    };
-                    if !function.regex_constants.is_empty()
-                        && function.regex_constants.binary_search(&i).is_ok()
-                    {
-                        break (at, op);
+                let at = pc;
+                let pos = at as usize + 1;
+                let byte = bytes[at as usize];
+                let op = Opcode::ALL[byte as usize];
+                pc += u32::from(op.info().size);
+                let u16 = || u16::from_le_bytes([bytes[pos], bytes[pos + 1]]);
+                let u32 = || {
+                    u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                };
+                let stack = &mut vm.stack;
+                let tail = stack.len();
+                match op {
+                    Nop => {}
+                    PushI32 | PushI16 | PushI8 | PushMinus1 | Push0 | Push1 | Push2 | Push3
+                    | Push4 | Push5 | Push6 | Push7 => {
+                        stack.push_reserved(Value::int32(match op {
+                            PushI32 => u32() as i32,
+                            PushI16 => i32::from(u16() as i16),
+                            PushI8 => i32::from(bytes[pos] as i8),
+                            _ => i32::from(byte) - Push0 as i32,
+                        }))
                     }
-                    stack.push_reserved(bytecode.constants[i as usize]);
-                }
-                Drop => {
-                    stack.pop();
-                }
-                Dup => stack.push_reserved(stack[tail - 1]),
-                Dup1 => {
-                    let last = stack[tail - 1];
-                    stack[tail - 1] = stack[tail - 2];
-                    stack.push_reserved(last);
-                }
-                Swap => stack.swap(tail - 2, tail - 1),
-                Nip => {
-                    let last = stack.pop().unwrap();
-                    stack[tail - 2] = last;
-                }
-                GetLoc0Loc1 => {
-                    stack.push_reserved(stack[var_base]);
-                    stack.push_reserved(stack[var_base + 1]);
-                }
-                GetLoc | GetLoc8 | GetLoc0 | GetLoc1 | GetLoc2 | GetLoc3 | PutLoc | PutLoc8
-                | PutLoc0 | PutLoc1 | PutLoc2 | PutLoc3 | SetLoc | SetLoc8 | SetLoc0 | SetLoc1
-                | SetLoc2 | SetLoc3 => {
-                    let slot = var_base
-                        + match op {
-                            GetLoc | PutLoc | SetLoc => usize::from(u16()),
-                            GetLoc8 | PutLoc8 | SetLoc8 => usize::from(bytes[pos]),
-                            _ => usize::from((byte - GetLoc0 as u8) % 4),
-                        };
-                    match op {
-                        GetLoc | GetLoc8 | GetLoc0 | GetLoc1 | GetLoc2 | GetLoc3 => {
-                            stack.push_reserved(stack[slot]);
-                        }
-                        PutLoc | PutLoc8 | PutLoc0 | PutLoc1 | PutLoc2 | PutLoc3 => {
-                            stack[slot] = stack.pop().unwrap();
-                        }
-                        _ => stack[slot] = stack[tail - 1],
+                    PushBigintI32 => {
+                        stack.push_reserved(Value::short_bigint(i64::from(u32() as i32)).unwrap());
                     }
-                }
-                GetArg | GetArg0 | GetArg1 | GetArg2 | GetArg3 | PutArg | PutArg0 | PutArg1
-                | PutArg2 | PutArg3 | SetArg | SetArg0 | SetArg1 | SetArg2 | SetArg3 => {
-                    let slot = arg_base
-                        + match op {
-                            GetArg | PutArg | SetArg => usize::from(u16()),
-                            _ => usize::from((byte - GetArg0 as u8) % 4),
-                        };
-                    match op {
-                        GetArg | GetArg0 | GetArg1 | GetArg2 | GetArg3 => {
-                            stack.push_reserved(stack[slot]);
-                        }
-                        PutArg | PutArg0 | PutArg1 | PutArg2 | PutArg3 => {
-                            stack[slot] = stack.pop().unwrap();
-                        }
-                        _ => stack[slot] = stack[tail - 1],
-                    }
-                }
-                GetVarRef | GetVarRef0 | GetVarRef1 | GetVarRef2 | GetVarRef3 | PutVarRef
-                | PutVarRef0 | PutVarRef1 | PutVarRef2 | PutVarRef3 | SetVarRef | SetVarRef0
-                | SetVarRef1 | SetVarRef2 | SetVarRef3 => {
-                    let i = match op {
-                        GetVarRef | PutVarRef | SetVarRef => usize::from(u16()),
-                        _ => usize::from((byte - GetVarRef0 as u8) % 4),
-                    };
-                    let ObjectData::BytecodeFunction(data) = &heap.object(frame.callee).data else {
-                        unreachable!()
-                    };
-                    let Some(ValueKind::VarRef(id)) = data.closure.get(i).map(|v| v.decode())
-                    else {
-                        break (at, op);
-                    };
-                    if matches!(
-                        op,
-                        GetVarRef | GetVarRef0 | GetVarRef1 | GetVarRef2 | GetVarRef3
-                    ) {
-                        let value = match heap.var_refs.get(id).unwrap().state {
-                            VarRefState::OpenStack(i) => stack[i as usize],
-                            VarRefState::OpenCoro { coro, local } => {
-                                heap.coroutines.get(coro).unwrap().stack[local as usize]
-                            }
-                            VarRefState::Closed(value) => value,
+                    Undefined => stack.push_reserved(Value::UNDEFINED),
+                    Null => stack.push_reserved(Value::NULL),
+                    PushFalse | PushTrue => stack.push_reserved(Value::bool(op == PushTrue)),
+                    PushThis => {
+                        let raw = stack[arg_base - 1];
+                        let value = if function.strict || raw.as_object().is_some() {
+                            raw
+                        } else if raw == Value::NULL || raw == Value::UNDEFINED {
+                            Value::object(heap.realm(frame.realm).global_object)
+                        } else {
+                            break (at, op);
                         };
                         stack.push_reserved(value);
-                    } else {
-                        let value = stack[tail - 1];
-                        let entry = heap.var_refs.get_mut(id).unwrap();
-                        match entry.state {
-                            VarRefState::OpenStack(i) => stack[i as usize] = value,
-                            VarRefState::OpenCoro { coro, local } => {
-                                heap.coroutines.get_mut(coro).unwrap().stack[local as usize] =
-                                    value;
-                            }
-                            VarRefState::Closed(_) => entry.state = VarRefState::Closed(value),
-                        }
-                        if matches!(
-                            op,
-                            PutVarRef | PutVarRef0 | PutVarRef1 | PutVarRef2 | PutVarRef3
-                        ) {
-                            stack.pop();
-                        }
                     }
-                }
-                Add | Sub | Mul | Div | Mod | Shl | Sar | Shr | And | Or | Xor | Pow | AddLoc => {
-                    let lhs = if op == AddLoc {
-                        var_base + usize::from(bytes[pos])
-                    } else {
-                        tail - 2
-                    };
-                    let binop = if op == AddLoc { Add } else { op };
-                    let Some(result) = fast_binary(
-                        binop,
-                        stack[lhs],
-                        stack[tail - 1],
-                        vm.interrupt_handler.is_some(),
-                    ) else {
-                        break (at, op);
-                    };
-                    stack[lhs] = result;
-                    stack.pop();
-                }
-                Neg | Plus | Not | Inc | Dec | PostInc | PostDec | IncLoc | DecLoc => {
-                    let slot = if matches!(op, IncLoc | DecLoc) {
-                        var_base + usize::from(bytes[pos])
-                    } else {
-                        tail - 1
-                    };
-                    let Some((before, after)) = fast_unary(op, stack[slot]) else {
-                        break (at, op);
-                    };
-                    if matches!(op, PostInc | PostDec) {
-                        stack[slot] = before;
-                        stack.push_reserved(after);
-                    } else {
-                        stack[slot] = after;
-                    }
-                }
-                Eq | Neq | StrictEq | StrictNeq | Lt | Lte | Gt | Gte => {
-                    let (Some(a), Some(b)) =
-                        (stack[tail - 2].as_number(), stack[tail - 1].as_number())
-                    else {
-                        break (at, op);
-                    };
-                    stack[tail - 2] = Value::bool(match op {
-                        Eq | StrictEq => a == b,
-                        Neq | StrictNeq => a != b,
-                        Lt => a < b,
-                        Lte => a <= b,
-                        Gt => a > b,
-                        Gte => a >= b,
-                        _ => unreachable!(),
-                    });
-                    stack.pop();
-                }
-                Lnot => {
-                    stack[tail - 1] =
-                        Value::bool(!convert::to_boolean_value(heap, stack[tail - 1]));
-                }
-                GetField | GetField2 | PutField => {
-                    let writing = op == PutField;
-                    let object_slot = tail - 1 - usize::from(writing);
-                    let Some(id) = stack[object_slot].as_object() else {
-                        break (at, op);
-                    };
-                    let name = cache::Key::Field(qjs_bytecode::UnitAtom(u32()));
-                    let Some(entry) = cache::own_slot(
-                        heap,
-                        function,
-                        at,
-                        id,
-                        writing,
-                        (0, name),
-                        (&[], frame.realm),
-                    ) else {
-                        break (at, op);
-                    };
-                    let slot = entry.slot as usize;
-                    match op {
-                        PutField => {
-                            heap.objects.get_mut(id).unwrap().props[slot] = stack[tail - 1];
-                            stack.truncate(tail - 2);
-                        }
-                        GetField2 => stack.push_reserved(heap.object(id).props[slot]),
-                        _ => stack[object_slot] = heap.object(id).props[slot],
-                    }
-                }
-                GetVar | GetVarUndef | PutVar | MakeVarRef => {
-                    if function.eval.is_some() {
-                        break (at, op);
-                    }
-                    let id = heap.realm(frame.realm).global_object;
-                    let atom = qjs_bytecode::UnitAtom(u32());
-                    let name = if op == MakeVarRef {
-                        cache::Key::GlobalRef(atom)
-                    } else {
-                        cache::Key::Global(atom)
-                    };
-                    let Some(entry) = cache::own_slot(
-                        heap,
-                        function,
-                        at,
-                        id,
-                        op == PutVar,
-                        (vm.global_lexical_epoch, name),
-                        (&ctx.runtime.modules, frame.realm),
-                    ) else {
-                        break (at, op);
-                    };
-                    let slot = entry.slot as usize;
-                    match op {
-                        PutVar => {
-                            heap.objects.get_mut(id).unwrap().props[slot] = stack.pop().unwrap()
-                        }
-                        MakeVarRef => {
-                            stack.push_reserved(Value::object(id));
-                            stack.push_reserved(entry.key);
-                        }
-                        _ => stack.push_reserved(heap.object(id).props[slot]),
-                    }
-                }
-                GetRefValue | PutRefValue => {
-                    let writing = op == PutRefValue;
-                    let source = tail - 2 - usize::from(writing);
-                    let global = heap.realm(frame.realm).global_object;
-                    if stack[source] != Value::object(global) {
-                        break (at, op);
-                    }
-                    let ValueKind::String(str) = stack[source + 1].decode() else {
-                        break (at, op);
-                    };
-                    let Some(entry) = cache::own_slot(
-                        heap,
-                        function,
-                        at,
-                        global,
-                        writing,
-                        (0, cache::Key::ResolvedRef(str)),
-                        (&[], frame.realm),
-                    ) else {
-                        break (at, op);
-                    };
-                    let slot = entry.slot as usize;
-                    if writing {
-                        heap.objects.get_mut(global).unwrap().props[slot] = stack[tail - 1];
-                        stack.truncate(source);
-                    } else {
-                        stack.push_reserved(heap.object(global).props[slot]);
-                    }
-                }
-                GetArrayEl | GetArrayEl2 | PutArrayEl => {
-                    let writing = op == PutArrayEl;
-                    let object_slot = tail - 2 - usize::from(writing);
-                    let Some(id) = stack[object_slot].as_object() else {
-                        break (at, op);
-                    };
-                    let ValueKind::Int32(index) = stack[object_slot + 1].decode() else {
-                        break (at, op);
-                    };
-                    let Ok(index) = usize::try_from(index) else {
-                        break (at, op);
-                    };
-                    let object = heap.object(id);
-                    if writing {
-                        let value = stack[tail - 1];
-                        match &object.data {
-                            ObjectData::Array(array)
-                                if object.flags.contains(
-                                    ObjectFlags::FAST_ARRAY | ObjectFlags::EXTENSIBLE,
-                                ) && !object.flags.contains(ObjectFlags::IS_PROTOTYPE)
-                                    && array
-                                        .elements
-                                        .get(index)
-                                        .is_some_and(|&v| v != Value::EMPTY) =>
-                            {
-                                let ObjectData::Array(array) =
-                                    &mut heap.objects.get_mut(id).unwrap().data
-                                else {
-                                    unreachable!()
-                                };
-                                array.elements[index] = value;
-                            }
-                            ObjectData::TypedArray(view) => {
-                                let view = **view;
-                                if crate::builtins::typed_atomics::fast_typed_array_set(
-                                    &mut heap.objects,
-                                    view,
-                                    index,
-                                    value,
-                                )
-                                .is_none()
-                                {
-                                    break (at, op);
-                                }
-                            }
-                            _ => break (at, op),
-                        }
-                        stack.truncate(object_slot);
-                    } else {
-                        let value = match &object.data {
-                            ObjectData::Array(array)
-                                if object.flags.contains(ObjectFlags::FAST_ARRAY) =>
-                            {
-                                array
-                                    .elements
-                                    .get(index)
-                                    .copied()
-                                    .filter(|&v| v != Value::EMPTY)
-                            }
-                            ObjectData::TypedArray(view) => {
-                                crate::builtins::typed_atomics::fast_typed_array_get(
-                                    heap, **view, index,
-                                )
-                            }
-                            _ => None,
-                        };
-                        let Some(value) = value else { break (at, op) };
-                        if op == GetArrayEl2 {
-                            stack[tail - 1] = value;
+                    SpecialObject if matches!(bytes[pos], 2 | 3) && function.eval.is_none() => {
+                        let value = if bytes[pos] == 2 {
+                            Value::object(frame.callee)
                         } else {
-                            stack[object_slot] = value;
-                            stack.pop();
-                        }
-                    }
-                }
-                Goto | Goto8 | Goto16 | IfFalse | IfTrue | IfFalse8 | IfTrue8 => {
-                    let conditional = !matches!(op, Goto | Goto8 | Goto16);
-                    if !conditional
-                        || matches!(op, IfTrue | IfTrue8)
-                            == convert::to_boolean_value(heap, stack[tail - 1])
-                    {
-                        let offset = match op {
-                            Goto8 | IfFalse8 | IfTrue8 => i32::from(bytes[pos] as i8),
-                            Goto16 => i32::from(u16() as i16),
-                            _ => u32() as i32,
+                            frame.new_target.map_or(Value::UNDEFINED, Value::object)
                         };
-                        let target = (at + 1).wrapping_add_signed(offset);
-                        if target <= at && vm.interrupt_handler.is_some() {
+                        stack.push_reserved(value);
+                    }
+                    PushConst | PushConst8 => {
+                        let i = if op == PushConst8 {
+                            bytes[pos].into()
+                        } else {
+                            u32()
+                        };
+                        if !function.regex_constants.is_empty()
+                            && function.regex_constants.binary_search(&i).is_ok()
+                        {
                             break (at, op);
                         }
-                        pc = target;
+                        stack.push_reserved(bytecode.constants[i as usize]);
                     }
-                    if conditional {
+                    Drop => {
                         stack.pop();
                     }
+                    Dup => stack.push_reserved(stack[tail - 1]),
+                    Dup1 => {
+                        let last = stack[tail - 1];
+                        stack[tail - 1] = stack[tail - 2];
+                        stack.push_reserved(last);
+                    }
+                    Swap => stack.swap(tail - 2, tail - 1),
+                    Nip => {
+                        let last = stack.pop().unwrap();
+                        stack[tail - 2] = last;
+                    }
+                    GetLoc0Loc1 => {
+                        stack.push_reserved(stack[var_base]);
+                        stack.push_reserved(stack[var_base + 1]);
+                    }
+                    GetLoc | GetLoc8 | GetLoc0 | GetLoc1 | GetLoc2 | GetLoc3 | PutLoc | PutLoc8
+                    | PutLoc0 | PutLoc1 | PutLoc2 | PutLoc3 | SetLoc | SetLoc8 | SetLoc0
+                    | SetLoc1 | SetLoc2 | SetLoc3 => {
+                        let slot = var_base
+                            + match op {
+                                GetLoc | PutLoc | SetLoc => usize::from(u16()),
+                                GetLoc8 | PutLoc8 | SetLoc8 => usize::from(bytes[pos]),
+                                _ => usize::from((byte - GetLoc0 as u8) % 4),
+                            };
+                        match op {
+                            GetLoc | GetLoc8 | GetLoc0 | GetLoc1 | GetLoc2 | GetLoc3 => {
+                                stack.push_reserved(stack[slot]);
+                            }
+                            PutLoc | PutLoc8 | PutLoc0 | PutLoc1 | PutLoc2 | PutLoc3 => {
+                                stack[slot] = stack.pop().unwrap();
+                            }
+                            _ => stack[slot] = stack[tail - 1],
+                        }
+                    }
+                    GetArg | GetArg0 | GetArg1 | GetArg2 | GetArg3 | PutArg | PutArg0 | PutArg1
+                    | PutArg2 | PutArg3 | SetArg | SetArg0 | SetArg1 | SetArg2 | SetArg3 => {
+                        let slot = arg_base
+                            + match op {
+                                GetArg | PutArg | SetArg => usize::from(u16()),
+                                _ => usize::from((byte - GetArg0 as u8) % 4),
+                            };
+                        match op {
+                            GetArg | GetArg0 | GetArg1 | GetArg2 | GetArg3 => {
+                                stack.push_reserved(stack[slot]);
+                            }
+                            PutArg | PutArg0 | PutArg1 | PutArg2 | PutArg3 => {
+                                stack[slot] = stack.pop().unwrap();
+                            }
+                            _ => stack[slot] = stack[tail - 1],
+                        }
+                    }
+                    GetVarRef | GetVarRef0 | GetVarRef1 | GetVarRef2 | GetVarRef3 | PutVarRef
+                    | PutVarRef0 | PutVarRef1 | PutVarRef2 | PutVarRef3 | SetVarRef
+                    | SetVarRef0 | SetVarRef1 | SetVarRef2 | SetVarRef3 => {
+                        let i = match op {
+                            GetVarRef | PutVarRef | SetVarRef => usize::from(u16()),
+                            _ => usize::from((byte - GetVarRef0 as u8) % 4),
+                        };
+                        let ObjectData::BytecodeFunction(data) = &heap.object(frame.callee).data
+                        else {
+                            unreachable!()
+                        };
+                        let Some(ValueKind::VarRef(id)) = data.closure.get(i).map(|v| v.decode())
+                        else {
+                            break (at, op);
+                        };
+                        if matches!(
+                            op,
+                            GetVarRef | GetVarRef0 | GetVarRef1 | GetVarRef2 | GetVarRef3
+                        ) {
+                            let value = match heap.var_refs.get(id).unwrap().state {
+                                VarRefState::OpenStack(i) => stack[i as usize],
+                                VarRefState::OpenCoro { coro, local } => {
+                                    heap.coroutines.get(coro).unwrap().stack[local as usize]
+                                }
+                                VarRefState::Closed(value) => value,
+                            };
+                            stack.push_reserved(value);
+                        } else {
+                            let value = stack[tail - 1];
+                            let entry = heap.var_refs.get_mut(id).unwrap();
+                            match entry.state {
+                                VarRefState::OpenStack(i) => stack[i as usize] = value,
+                                VarRefState::OpenCoro { coro, local } => {
+                                    heap.coroutines.get_mut(coro).unwrap().stack[local as usize] =
+                                        value;
+                                }
+                                VarRefState::Closed(_) => entry.state = VarRefState::Closed(value),
+                            }
+                            if matches!(
+                                op,
+                                PutVarRef | PutVarRef0 | PutVarRef1 | PutVarRef2 | PutVarRef3
+                            ) {
+                                stack.pop();
+                            }
+                        }
+                    }
+                    Add | Sub | Mul | Div | Mod | Shl | Sar | Shr | And | Or | Xor | Pow
+                    | AddLoc => {
+                        let lhs = if op == AddLoc {
+                            var_base + usize::from(bytes[pos])
+                        } else {
+                            tail - 2
+                        };
+                        let binop = if op == AddLoc { Add } else { op };
+                        let Some(result) = fast_binary(
+                            binop,
+                            stack[lhs],
+                            stack[tail - 1],
+                            vm.interrupt_handler.is_some(),
+                        ) else {
+                            break (at, op);
+                        };
+                        stack[lhs] = result;
+                        stack.pop();
+                    }
+                    Neg | Plus | Not | Inc | Dec | PostInc | PostDec | IncLoc | DecLoc => {
+                        let slot = if matches!(op, IncLoc | DecLoc) {
+                            var_base + usize::from(bytes[pos])
+                        } else {
+                            tail - 1
+                        };
+                        let Some((before, after)) = fast_unary(op, stack[slot]) else {
+                            break (at, op);
+                        };
+                        if matches!(op, PostInc | PostDec) {
+                            stack[slot] = before;
+                            stack.push_reserved(after);
+                        } else {
+                            stack[slot] = after;
+                        }
+                    }
+                    Eq | Neq | StrictEq | StrictNeq | Lt | Lte | Gt | Gte => {
+                        let (Some(a), Some(b)) =
+                            (stack[tail - 2].as_number(), stack[tail - 1].as_number())
+                        else {
+                            break (at, op);
+                        };
+                        stack[tail - 2] = Value::bool(match op {
+                            Eq | StrictEq => a == b,
+                            Neq | StrictNeq => a != b,
+                            Lt => a < b,
+                            Lte => a <= b,
+                            Gt => a > b,
+                            Gte => a >= b,
+                            _ => unreachable!(),
+                        });
+                        stack.pop();
+                    }
+                    Lnot => {
+                        stack[tail - 1] =
+                            Value::bool(!convert::to_boolean_value(heap, stack[tail - 1]));
+                    }
+                    GetField | GetField2 | PutField => {
+                        let writing = op == PutField;
+                        let object_slot = tail - 1 - usize::from(writing);
+                        let Some(id) = stack[object_slot].as_object() else {
+                            break (at, op);
+                        };
+                        let name = cache::Key::Field(qjs_bytecode::UnitAtom(u32()));
+                        let Some(entry) = cache::own_slot(
+                            heap,
+                            function,
+                            at,
+                            id,
+                            writing,
+                            (0, name),
+                            (&[], frame.realm),
+                        ) else {
+                            break (at, op);
+                        };
+                        let slot = entry.slot as usize;
+                        match op {
+                            PutField => {
+                                heap.objects.get_mut(id).unwrap().props[slot] = stack[tail - 1];
+                                stack.truncate(tail - 2);
+                            }
+                            GetField2 => stack.push_reserved(heap.object(id).props[slot]),
+                            _ => stack[object_slot] = heap.object(id).props[slot],
+                        }
+                    }
+                    GetVar | GetVarUndef | PutVar | MakeVarRef => {
+                        if function.eval.is_some() {
+                            break (at, op);
+                        }
+                        let id = heap.realm(frame.realm).global_object;
+                        let atom = qjs_bytecode::UnitAtom(u32());
+                        let name = if op == MakeVarRef {
+                            cache::Key::GlobalRef(atom)
+                        } else {
+                            cache::Key::Global(atom)
+                        };
+                        let Some(entry) = cache::own_slot(
+                            heap,
+                            function,
+                            at,
+                            id,
+                            op == PutVar,
+                            (vm.global_lexical_epoch, name),
+                            (&ctx.runtime.modules, frame.realm),
+                        ) else {
+                            break (at, op);
+                        };
+                        let slot = entry.slot as usize;
+                        match op {
+                            PutVar => {
+                                heap.objects.get_mut(id).unwrap().props[slot] = stack.pop().unwrap()
+                            }
+                            MakeVarRef => {
+                                stack.push_reserved(Value::object(id));
+                                stack.push_reserved(entry.key);
+                            }
+                            _ => stack.push_reserved(heap.object(id).props[slot]),
+                        }
+                    }
+                    GetRefValue | PutRefValue => {
+                        let writing = op == PutRefValue;
+                        let source = tail - 2 - usize::from(writing);
+                        let global = heap.realm(frame.realm).global_object;
+                        if stack[source] != Value::object(global) {
+                            break (at, op);
+                        }
+                        let ValueKind::String(str) = stack[source + 1].decode() else {
+                            break (at, op);
+                        };
+                        let Some(entry) = cache::own_slot(
+                            heap,
+                            function,
+                            at,
+                            global,
+                            writing,
+                            (0, cache::Key::ResolvedRef(str)),
+                            (&[], frame.realm),
+                        ) else {
+                            break (at, op);
+                        };
+                        let slot = entry.slot as usize;
+                        if writing {
+                            heap.objects.get_mut(global).unwrap().props[slot] = stack[tail - 1];
+                            stack.truncate(source);
+                        } else {
+                            stack.push_reserved(heap.object(global).props[slot]);
+                        }
+                    }
+                    GetArrayEl | GetArrayEl2 | PutArrayEl => {
+                        let writing = op == PutArrayEl;
+                        let object_slot = tail - 2 - usize::from(writing);
+                        let Some(id) = stack[object_slot].as_object() else {
+                            break (at, op);
+                        };
+                        let ValueKind::Int32(index) = stack[object_slot + 1].decode() else {
+                            break (at, op);
+                        };
+                        let Ok(index) = usize::try_from(index) else {
+                            break (at, op);
+                        };
+                        let object = heap.object(id);
+                        if writing {
+                            let value = stack[tail - 1];
+                            match &object.data {
+                                ObjectData::Array(array)
+                                    if object.flags.contains(
+                                        ObjectFlags::FAST_ARRAY | ObjectFlags::EXTENSIBLE,
+                                    ) && !object.flags.contains(ObjectFlags::IS_PROTOTYPE)
+                                        && array
+                                            .elements
+                                            .get(index)
+                                            .is_some_and(|&v| v != Value::EMPTY) =>
+                                {
+                                    let ObjectData::Array(array) =
+                                        &mut heap.objects.get_mut(id).unwrap().data
+                                    else {
+                                        unreachable!()
+                                    };
+                                    array.elements[index] = value;
+                                }
+                                ObjectData::TypedArray(view) => {
+                                    let view = **view;
+                                    if crate::builtins::typed_atomics::fast_typed_array_set(
+                                        &mut heap.objects,
+                                        view,
+                                        index,
+                                        value,
+                                    )
+                                    .is_none()
+                                    {
+                                        break (at, op);
+                                    }
+                                }
+                                _ => break (at, op),
+                            }
+                            stack.truncate(object_slot);
+                        } else {
+                            let value = match &object.data {
+                                ObjectData::Array(array)
+                                    if object.flags.contains(ObjectFlags::FAST_ARRAY) =>
+                                {
+                                    array
+                                        .elements
+                                        .get(index)
+                                        .copied()
+                                        .filter(|&v| v != Value::EMPTY)
+                                }
+                                ObjectData::TypedArray(view) => {
+                                    crate::builtins::typed_atomics::fast_typed_array_get(
+                                        heap, **view, index,
+                                    )
+                                }
+                                _ => None,
+                            };
+                            let Some(value) = value else { break (at, op) };
+                            if op == GetArrayEl2 {
+                                stack[tail - 1] = value;
+                            } else {
+                                stack[object_slot] = value;
+                                stack.pop();
+                            }
+                        }
+                    }
+                    Goto | Goto8 | Goto16 | IfFalse | IfTrue | IfFalse8 | IfTrue8 => {
+                        let conditional = !matches!(op, Goto | Goto8 | Goto16);
+                        if !conditional
+                            || matches!(op, IfTrue | IfTrue8)
+                                == convert::to_boolean_value(heap, stack[tail - 1])
+                        {
+                            let offset = match op {
+                                Goto8 | IfFalse8 | IfTrue8 => i32::from(bytes[pos] as i8),
+                                Goto16 => i32::from(u16() as i16),
+                                _ => u32() as i32,
+                            };
+                            let target = (at + 1).wrapping_add_signed(offset);
+                            if target <= at && vm.interrupt_handler.is_some() {
+                                break (at, op);
+                            }
+                            pc = target;
+                        }
+                        if conditional {
+                            stack.pop();
+                        }
+                    }
+                    Call | Call0 | Call1 | Call2 | Call3 | CallMethod => {
+                        let count = match op {
+                            Call | CallMethod => usize::from(u16()),
+                            _ => usize::from(byte - Call0 as u8),
+                        };
+                        let Some(plain) =
+                            call::prepare_plain(heap, vm, frame.realm, count, op == CallMethod)
+                        else {
+                            break (at, op);
+                        };
+                        vm.frames[index].last_pc = at;
+                        vm.frames[index].pc = pc;
+                        (code, ctx.realm) = plain.enter(ctx)?;
+                        index += 1;
+                        continue 'frames;
+                    }
+                    Return | ReturnUndef | ReturnAsync => {
+                        let value = if op == ReturnUndef {
+                            Value::UNDEFINED
+                        } else {
+                            stack[tail - 1]
+                        };
+                        if index == entry_index {
+                            vm.frames[index].last_pc = at;
+                            vm.frames[index].pc = pc;
+                            return Ok(Some(value));
+                        }
+                        bindings::close_frame_slots(&mut heap.var_refs, stack, frame);
+                        vm.frames.pop();
+                        stack.truncate(frame.base as usize);
+                        stack.push_reserved(value);
+                        index -= 1;
+                        let caller = &vm.frames[index];
+                        code = caller.code.unwrap();
+                        ctx.realm = caller.realm;
+                        continue 'frames;
+                    }
+                    _ => break (at, op),
                 }
-                Return | ReturnUndef => {
-                    let value = if op == Return {
-                        stack[tail - 1]
-                    } else {
-                        Value::UNDEFINED
-                    };
-                    vm.frames[index].last_pc = at;
-                    vm.frames[index].pc = pc;
-                    return Ok(Some(value));
-                }
-                _ => break (at, op),
+            };
+            let strict = function.strict;
+            let inst = Instruction::decode(bytes, at as usize).expect("verified instruction");
+            debug_assert_eq!(inst.opcode, op);
+            let frame = &mut vm.frames[index];
+            frame.last_pc = at;
+            frame.pc = pc;
+            let mut original = *frame;
+            original.pc = at;
+            let result = slow_op(ctx, original, index, code, inst, strict, pc)?;
+            if result.is_some() || ctx.runtime.vm.frames.len() != index + 1 {
+                return Ok(result);
             }
-        };
-        let strict = function.strict;
-        let inst = Instruction::decode(bytes, at as usize).expect("verified instruction");
-        debug_assert_eq!(inst.opcode, op);
-        let frame = &mut vm.frames[index];
-        frame.last_pc = at;
-        frame.pc = pc;
-        let mut original = *frame;
-        original.pc = at;
-        let result = slow_op(ctx, original, index, code, inst, strict, pc)?;
-        if result.is_some() || ctx.runtime.vm.frames.len() != index + 1 {
-            return Ok(result);
+            pc = ctx.runtime.vm.frames[index].pc;
         }
-        pc = ctx.runtime.vm.frames[index].pc;
     }
 }
 
@@ -794,7 +848,6 @@ fn slow_op(
             };
             spread_call(ctx, tail - 3, handle(3), handle(2), handle(1), mode)?;
         }
-        ReturnAsync => return Ok(Some(value(ctx, 1))),
         Throw => return Err(ctx.throw_value(value(ctx, 1), false)),
         ThrowError => {
             let Operands::AtomU8(atom, kind) = inst.operands else {

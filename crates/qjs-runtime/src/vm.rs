@@ -60,6 +60,7 @@ pub(crate) struct CompiledFunc {
     pub name: Option<PropKey>,
     pub flags: FunctionFlags,
     pub kind: FunctionKind,
+    pub(crate) needs_arguments: bool,
     pub strict: bool,
     pub arg_count: u16,
     pub var_count: u16,
