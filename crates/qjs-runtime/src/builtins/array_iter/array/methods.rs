@@ -434,26 +434,6 @@ pub(super) fn join<'s>(
     Ok(ctx.get(text))
 }
 
-fn append_string(
-    ctx: &mut ExecCtx<'_, '_>,
-    text: &mut TrackedVec<u16>,
-    string: Value,
-) -> JsResult<()> {
-    let ValueKind::String(id) = string.decode() else {
-        unreachable!()
-    };
-    let len = ctx.heap().string(id).len() as usize;
-    if len != 0 {
-        if text.capacity() - text.len() < len {
-            ctx.allocate(|runtime| text.try_reserve(&runtime.heap.ledger, len))?;
-        }
-        for unit in ctx.heap().string_units(id) {
-            text.push_reserved(unit);
-        }
-    }
-    Ok(())
-}
-
 pub(super) fn remove_end<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     r: Receiver<'s>,

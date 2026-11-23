@@ -1,4 +1,5 @@
 use super::*;
+use crate::builtins::typed_atomics::{typed_array_get_index, typed_array_length};
 use crate::builtins::{configure_ctor, define_data, install_accessor, install_method};
 use crate::ledger::TrackedBox;
 use crate::object::{HelperData, HelperOp, IteratorData, IteratorKind, IteratorRecordData};
@@ -7,6 +8,7 @@ use crate::ops::property::{get_own_property_descriptor, get_prototype_of, set_pr
 use crate::shape::PropFlags;
 use crate::value::{ObjId, ValueKind};
 
+mod extensions;
 mod zip;
 
 const CTOR: u16 = 0;
@@ -36,6 +38,10 @@ const WRAP_NEXT: u16 = 23;
 const WRAP_RETURN: u16 = 24;
 const HELPER_NEXT: u16 = 25;
 const HELPER_RETURN: u16 = 26;
+const CHUNKS: u16 = 27;
+const WINDOWS: u16 = 28;
+const INCLUDES: u16 = 29;
+const JOIN: u16 = 30;
 
 const fn id(n: u16) -> NativeFnId {
     NativeFnId(ARRAY_ITER_BASE + 128 + n)
@@ -74,6 +80,10 @@ pub(super) fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
         ("some", SOME, 1),
         ("every", EVERY, 1),
         ("find", FIND, 1),
+        ("chunks", CHUNKS, 1),
+        ("windows", WINDOWS, 1),
+        ("includes", INCLUDES, 1),
+        ("join", JOIN, 1),
     ] {
         let key = key(ctx, name)?;
         install_method(ctx, proto, key, id(op), name, len)?;
@@ -212,6 +222,9 @@ pub(super) fn dispatch<'s>(
         ARRAY_NEXT => array_next(ctx, this),
         WRAP_NEXT | WRAP_RETURN => wrap(ctx, this, n == WRAP_RETURN),
         MAP | FILTER | FLAT_MAP | TAKE | DROP => make_helper(ctx, this, args, n),
+        CHUNKS | WINDOWS => extensions::chunk_helper(ctx, this, args, n == WINDOWS),
+        INCLUDES => extensions::includes(ctx, this, args),
+        JOIN => extensions::join(ctx, this, args),
         HELPER_NEXT | HELPER_RETURN => helper_next(ctx, this, n == HELPER_RETURN),
         REDUCE | TO_ARRAY | FOR_EACH | SOME | EVERY | FIND => consume(ctx, this, args, n),
         _ => Err(ctx.throw_type_error("Unknown iterator builtin")),
@@ -298,8 +311,15 @@ fn array_next<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>) -> JsResult<Value
     if target == Value::UNDEFINED {
         return result(ctx, None);
     }
+    let target_id = target.as_object().unwrap();
     let target = ctx.root(target)?;
-    let len = get_length(ctx, target)?;
+    let typed = matches!(ctx.heap().object(target_id).data, ObjectData::TypedArray(_));
+    let len = if typed {
+        typed_array_length(ctx.heap(), target_id)
+            .ok_or_else(|| ctx.throw_type_error("Typed array is out of bounds"))? as u64
+    } else {
+        get_length(ctx, target)?
+    };
     let IteratorKind::Array {
         target: live_target,
         index: live_index,
@@ -313,12 +333,19 @@ fn array_next<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>) -> JsResult<Value
         return result(ctx, None);
     }
     *live_index = index + 1;
+    let read = |ctx: &mut ExecCtx<'_, 's>| {
+        if typed {
+            typed_array_get_index(ctx, target_id, index as usize)
+        } else {
+            get_index(ctx, target, index)
+        }
+    };
     let key = Value::number(index as f64);
     let item = match kind {
         ArrayIteratorKind::Key => key,
-        ArrayIteratorKind::Value => get_index(ctx, target, index)?,
+        ArrayIteratorKind::Value => read(ctx)?,
         ArrayIteratorKind::Entry => {
-            let value = get_index(ctx, target, index)?;
+            let value = read(ctx)?;
             let value = ctx.root(value)?;
             let pair = ctx.new_array()?;
             create_index(ctx, pair, 0, key)?;
@@ -545,6 +572,11 @@ fn helper_next<'s>(ctx: &mut ExecCtx<'_, 's>, this: Handle<'s>, close: bool) -> 
         match op {
             HelperOp::Zip { keyed, mode } => zip::step(ctx, id, keyed, mode),
             HelperOp::Concat => concat_step(ctx, id),
+            HelperOp::Chunks { size } => extensions::chunk_step(ctx, id, size, false, true),
+            HelperOp::Windows {
+                size,
+                allow_partial,
+            } => extensions::chunk_step(ctx, id, size, true, allow_partial),
             _ => simple_step(ctx, id, op),
         }
     };

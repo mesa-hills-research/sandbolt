@@ -1,5 +1,6 @@
 use crate::atom::{Atom, PropKey};
 use crate::builtins::ARRAY_ITER_BASE;
+use crate::ledger::TrackedVec;
 use crate::object::{ArrayIteratorKind, ObjectData, ObjectFlags};
 use crate::ops::call::{call, is_callable};
 use crate::ops::convert::{to_boolean, to_length};
@@ -7,7 +8,7 @@ use crate::ops::property::{PropertyDescriptor, define_own_property, get_property
 use crate::realm::NativeFnId;
 use crate::root::{Args, ExecCtx, Handle};
 use crate::symbol::WellKnown;
-use crate::value::{Abrupt, JsResult, Value};
+use crate::value::{Abrupt, JsResult, Value, ValueKind};
 
 mod array;
 mod iterator;
@@ -101,6 +102,24 @@ fn create_index<'s>(
     let value = ctx.root(value)?;
     let key = index(ctx, i)?;
     create(ctx, object, key, value)
+}
+
+fn append_string(
+    ctx: &mut ExecCtx<'_, '_>,
+    text: &mut TrackedVec<u16>,
+    string: Value,
+) -> JsResult<()> {
+    let ValueKind::String(id) = string.decode() else {
+        unreachable!()
+    };
+    let len = ctx.heap().string(id).len() as usize;
+    if text.capacity() - text.len() < len {
+        ctx.allocate(|runtime| text.try_reserve(&runtime.heap.ledger, len))?;
+    }
+    for unit in ctx.heap().string_units(id) {
+        text.push_reserved(unit);
+    }
+    Ok(())
 }
 
 fn get_length<'s>(ctx: &mut ExecCtx<'_, 's>, object: Handle<'s>) -> JsResult<u64> {

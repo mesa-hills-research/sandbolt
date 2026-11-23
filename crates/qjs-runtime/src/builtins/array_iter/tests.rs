@@ -345,6 +345,37 @@ fn array_iterator_is_live_until_done_and_values_alias_iterator_symbol() {
 }
 
 #[test]
+fn typed_array_iterator_ignores_length_property_and_checks_detachment() {
+    use crate::builtins::typed_atomics::{detach_array_buffer, typed_array_set_index};
+
+    let mut rt = setup(EngineLimits::default());
+    rt.with_scope(rt.default_realm(), |ctx| {
+        let buffer_ctor = ctor(ctx, "ArrayBuffer");
+        let two = value(ctx, 2);
+        let args = ctx.args(&[two]).unwrap();
+        let buffer = construct(ctx, buffer_ctor, args, buffer_ctor).unwrap();
+        let buffer = ctx.root(buffer).unwrap();
+        let view_ctor = ctor(ctx, "Uint8Array");
+        let args = ctx.args(&[buffer]).unwrap();
+        let view = construct(ctx, view_ctor, args, view_ctor).unwrap();
+        let view = ctx.root(view).unwrap();
+        let view_id = ctx.object_id(view).unwrap();
+        let seven = value(ctx, 7);
+        typed_array_set_index(ctx, view_id, Some(0), seven).unwrap();
+        let shadow = value(ctx, 0);
+        create(ctx, view, LENGTH, shadow).unwrap();
+        let values = method_root(ctx, view, "values", &[]);
+        let first = method_root(ctx, values, "next", &[]);
+        assert_eq!(named(ctx, first, "value").unwrap().as_number(), Some(7.0));
+        let keys = method_root(ctx, view, "keys", &[]);
+        let buffer_id = ctx.object_id(buffer).unwrap();
+        detach_array_buffer(ctx, buffer_id).unwrap();
+        assert_eq!(method(ctx, keys, "next", &[]), Err(Abrupt::Thrown));
+        error(ctx, ErrorKind::Type);
+    });
+}
+
+#[test]
 fn iterator_helpers_chain_lazily_and_reduce() {
     let mut rt = setup(EngineLimits::default());
     rt.with_scope(rt.default_realm(), |ctx| {
@@ -427,6 +458,52 @@ fn iterator_zip_longest_keyed_and_concat() {
         let result = method_root(ctx, concat, "toArray", &[]);
         assert_eq!(get_length(ctx, result).unwrap(), 3);
         assert_eq!(get_property(ctx, result, TWO).unwrap(), num(3));
+    });
+}
+
+#[test]
+fn iterator_extensions_keep_windows_independent_and_distinguish_nan() {
+    let mut rt = setup(EngineLimits::default());
+    rt.with_scope(rt.default_realm(), |ctx| {
+        let input = array(ctx, &[num(1), num(2), num(3), num(4)]);
+        let iterator = method_root(ctx, input, "values", &[]);
+        let three = value(ctx, 3);
+        let chunks = method_root(ctx, iterator, "chunks", &[three]);
+        let first = method_root(ctx, chunks, "next", &[]);
+        let second = method_root(ctx, chunks, "next", &[]);
+        let first = named(ctx, first, "value").unwrap();
+        let first = ctx.root(first).unwrap();
+        let second = named(ctx, second, "value").unwrap();
+        let second = ctx.root(second).unwrap();
+        assert_eq!(get_length(ctx, first).unwrap(), 3);
+        assert_eq!(get_length(ctx, second).unwrap(), 1);
+        assert_eq!(get_property(ctx, second, ZERO).unwrap(), num(4));
+        let iterator = method_root(ctx, input, "values", &[]);
+        let windows = method_root(ctx, iterator, "windows", &[three]);
+        let rows = method_root(ctx, windows, "toArray", &[]);
+        assert_eq!(get_length(ctx, rows).unwrap(), 2);
+        let first = get_property(ctx, rows, ZERO).unwrap();
+        let first = ctx.root(first).unwrap();
+        let second = get_property(ctx, rows, ONE).unwrap();
+        let second = ctx.root(second).unwrap();
+        assert_ne!(ctx.get(first), ctx.get(second));
+        assert_eq!(get_property(ctx, first, ZERO).unwrap(), num(1));
+        assert_eq!(get_property(ctx, second, ZERO).unwrap(), num(2));
+        let input = array(ctx, &[num(1), Value::number(f64::NAN)]);
+        let iterator = method_root(ctx, input, "values", &[]);
+        let nan = ctx.root(Value::number(f64::NAN)).unwrap();
+        assert_eq!(
+            method(ctx, iterator, "includes", &[nan]).unwrap(),
+            Value::bool(true)
+        );
+        let input = array(ctx, &[num(1), Value::UNDEFINED, Value::NULL, num(3)]);
+        let iterator = method_root(ctx, input, "values", &[]);
+        let separator = ctx.new_string("/").unwrap();
+        let text = method(ctx, iterator, "join", &[separator]).unwrap();
+        let ValueKind::String(text) = text.decode() else {
+            panic!("expected a string");
+        };
+        assert!(ctx.heap().string_units(text).eq("1///3".encode_utf16()));
     });
 }
 

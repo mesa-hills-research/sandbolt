@@ -62,6 +62,8 @@ pub enum HelperOp {
     FlatMap,
     Drop,
     Take,
+    Chunks { size: usize },
+    Windows { size: usize, allow_partial: bool },
     Concat,
     Zip { keyed: bool, mode: ZipMode },
 }
@@ -99,6 +101,8 @@ pub struct HelperData {
     pub running: bool,
     pub sequence: TrackedVec<IteratorRecordData>,
     pub zip: TrackedVec<ZipInput>,
+    pub buffer: TrackedVec<Value>,
+    pub buffer_start: usize,
 }
 
 impl HelperData {
@@ -113,6 +117,8 @@ impl HelperData {
             running: false,
             sequence: TrackedVec::new(),
             zip: TrackedVec::new(),
+            buffer: TrackedVec::new(),
+            buffer_start: 0,
         }
     }
 }
@@ -124,6 +130,7 @@ impl Trace for HelperData {
         self.callback.trace(tracer);
         self.sequence.trace(tracer);
         self.zip.trace(tracer);
+        self.buffer.trace(tracer);
     }
 }
 
