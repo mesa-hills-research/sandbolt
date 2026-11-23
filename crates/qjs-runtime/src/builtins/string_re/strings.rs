@@ -799,7 +799,7 @@ fn pattern_method<'s>(
         _ => WellKnown::Split,
     };
     let key = sym(ctx, symbol);
-    if !nullish(ctx.get(pattern)) {
+    if ctx.get(pattern).as_object().is_some() {
         if matches!(op, 16 | 22) {
             regexp::check_global(ctx, pattern)?;
         }

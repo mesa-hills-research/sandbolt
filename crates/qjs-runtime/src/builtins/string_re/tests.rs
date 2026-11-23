@@ -509,6 +509,54 @@ fn regexp_replace_and_literal_replace_all() {
 }
 
 #[test]
+fn string_pattern_hooks_apply_to_objects_only() {
+    use crate::api::{EvalOptions, JsEngine};
+
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    engine
+        .eval(
+            r#"
+            "use strict";
+            const input = "a1b1c";
+            const boxed = Object(1);
+            for (const [name, extra, expected] of [
+                ["match", undefined, "1"],
+                ["matchAll", undefined, "1,3"],
+                ["replace", "X", "aXb1c"],
+                ["replaceAll", "X", "aXbXc"],
+                ["search", undefined, 1],
+                ["split", 2, "a,b"],
+            ]) {
+                const key = Symbol[name === "replaceAll" ? "replace" : name];
+                Object.defineProperty(Number.prototype, key, {
+                    configurable: true,
+                    get() {
+                        if (this !== boxed) throw new Error(name + " read a primitive hook");
+                        return function (receiver) {
+                            if (this !== boxed || receiver !== input) {
+                                throw new Error(name + " called the hook with the wrong arguments");
+                            }
+                            return "hook";
+                        };
+                    },
+                });
+                let result = input[name](1, extra);
+                if (name === "match") result = result[0];
+                if (name === "matchAll") result = Array.from(result, match => match.index).join(",");
+                if (name === "split") result = result.join(",");
+                if (result !== expected) throw new Error(name + " used the wrong fallback");
+                if (input[name](boxed, extra) !== "hook") {
+                    throw new Error(name + " skipped the object hook");
+                }
+                delete Number.prototype[key];
+            }
+            "#,
+            EvalOptions::default(),
+        )
+        .unwrap();
+}
+
+#[test]
 fn regexp_match_all_search_and_split_protocols() {
     let mut rt = engine();
     rt.with_scope(rt.default_realm(), |ctx| {
