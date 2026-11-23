@@ -18,7 +18,7 @@ use crate::shape::PropFlags;
 use crate::value::*;
 use crate::vm::{CallFrame, CompiledFunc};
 
-pub(crate) use bindings::close_frame;
+pub(crate) use bindings::{close_frame, read_ref, write_ref};
 pub(crate) use iterators::{async_from_sync_call, for_in_next, iterator_result};
 
 pub(crate) fn resume_generator<'s>(

@@ -123,6 +123,89 @@ fn interrupts_backward_branches_without_running_finally() {
 }
 
 #[test]
+fn dispatches_property_proxy_traps_and_preserves_invariants() {
+    assert_eq!(
+        run(r#"
+        let seen = [];
+        let t = {};
+        let p = new Proxy(t, {
+            get(t,k,r) { seen.push('get'); return Reflect.get(t,k,r) },
+            set(t,k,v,r) { seen.push('set'); return Reflect.set(t,k,v,r) },
+            has(t,k) { seen.push('has'); return Reflect.has(t,k) },
+            deleteProperty(t,k) { seen.push('delete'); return Reflect.deleteProperty(t,k) },
+            getOwnPropertyDescriptor(t,k) { seen.push('descriptor'); return Reflect.getOwnPropertyDescriptor(t,k) },
+            defineProperty(t,k,d) { seen.push('define'); return Reflect.defineProperty(t,k,d) },
+            ownKeys(t) { seen.push('keys'); return ['z', 'x']; },
+            getPrototypeOf(t) { seen.push('getProto'); return Reflect.getPrototypeOf(t) },
+            setPrototypeOf(t,v) { seen.push('setProto'); return Reflect.setPrototypeOf(t,v) },
+            isExtensible(t) { seen.push('extensible'); return Reflect.isExtensible(t) },
+            preventExtensions(t) { seen.push('prevent'); return Reflect.preventExtensions(t) },
+        });
+        p.x = 1; p.x; 'x' in p; Reflect.ownKeys(p); delete p.x;
+        Reflect.getPrototypeOf(p); Reflect.setPrototypeOf(p,null);
+        Reflect.isExtensible(p); Reflect.preventExtensions(p);
+        seen.join(',')
+    "#),
+        "set,descriptor,define,get,has,keys,delete,getProto,setProto,extensible,prevent"
+    );
+    assert_eq!(
+        run(r#"
+        const frozen = Object.freeze({x: 1});
+        const attempts = [
+            () => new Proxy(frozen, {get(){return 2}}).x,
+            () => Reflect.set(new Proxy(frozen, {set(){return true}}), 'x', 2),
+            () => Reflect.has(new Proxy(frozen, {has(){return false}}), 'x'),
+            () => Reflect.deleteProperty(new Proxy(frozen, {deleteProperty(){return true}}), 'x'),
+            () => Reflect.ownKeys(new Proxy(frozen, {ownKeys(){return []}})),
+            () => Reflect.ownKeys(new Proxy({}, {ownKeys(){return ['x','x']}})),
+            () => Reflect.defineProperty(new Proxy(frozen, {defineProperty(){return true}}), 'x', {value:2}),
+            () => Reflect.getOwnPropertyDescriptor(new Proxy(frozen, {getOwnPropertyDescriptor(){}}), 'x'),
+            () => Reflect.isExtensible(new Proxy(frozen, {isExtensible(){return true}})),
+            () => Reflect.preventExtensions(new Proxy({}, {preventExtensions(){return true}})),
+            () => Reflect.getPrototypeOf(new Proxy(frozen, {getPrototypeOf(){return null}})),
+            () => Reflect.setPrototypeOf(new Proxy(frozen, {setPrototypeOf(){return true}}), null),
+        ];
+        attempts.map(f => { try { f(); return 'no'; } catch(e) { return e instanceof TypeError; } }).every(v => v === true)
+    "#),
+        "true"
+    );
+}
+
+#[test]
+fn string_typed_array_and_arguments_exotic_properties() {
+    assert_eq!(
+        run(r#"
+        const s = new String('áb');
+        const d = Object.getOwnPropertyDescriptor(s, '0');
+        [s[0], s.length, Reflect.ownKeys(s).join(','), d.writable, Reflect.deleteProperty(s,'0')].join('|')
+    "#),
+        "á|2|0,1,length|false|false"
+    );
+    assert_eq!(
+        run(r#"
+        const a = new Uint8Array([1,2]);
+        a[0] = 9;
+        Object.setPrototypeOf(a, {NaN: 18});
+        [a[0], a[1], a.NaN, Reflect.ownKeys(a), Reflect.deleteProperty(a,'0')].join('|')
+    "#),
+        "9|2||0,1|false"
+    );
+    assert_eq!(
+        run(r#"
+        function f(a) {
+            a = 4; let x = arguments[0];
+            arguments[0] = 7; let y = a;
+            Object.defineProperty(arguments, '0', {writable:false});
+            a = 12; let z = arguments[0];
+            return [x,y,z].join(',');
+        }
+        f(2)
+    "#),
+        "4,7,7"
+    );
+}
+
+#[test]
 fn host_bridge_and_print_are_opt_in() {
     let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
     let opts = EvalOptions::default();
