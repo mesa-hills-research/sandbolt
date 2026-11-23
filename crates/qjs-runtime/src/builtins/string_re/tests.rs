@@ -380,6 +380,30 @@ fn regexp_construct_flags_escape_source_and_copy() {
 }
 
 #[test]
+fn regexp_literal_uses_the_intrinsic_prototype() {
+    let mut rt = engine();
+    rt.with_scope(rt.default_realm(), |ctx| {
+        let global = ctx.root(Value::object(ctx.realm().global_object)).unwrap();
+        let undef = ctx.root(Value::UNDEFINED).unwrap();
+        let key = ctx.intern_str("RegExp").unwrap();
+        assert!(set_property(ctx, global, key, undef).unwrap());
+        let source = ctx.new_string("a").unwrap();
+        let flags = ctx.new_string("g").unwrap();
+        let literal = regexp_literal(ctx, source, flags).unwrap();
+        let literal = ctx.root(literal).unwrap();
+        assert_eq!(
+            get_prototype_of(ctx, literal).unwrap(),
+            Some(ctx.realm().regexp_proto)
+        );
+        assert_eq!(
+            method(ctx, literal, "test", &[source]).unwrap(),
+            Value::bool(true)
+        );
+        assert_eq!(property(ctx, literal, "lastIndex").as_number(), Some(1.0));
+    });
+}
+
+#[test]
 fn regexp_exec_indices_duplicate_groups_and_unicode_sets() {
     let mut rt = engine();
     rt.with_scope(rt.default_realm(), |ctx| {
