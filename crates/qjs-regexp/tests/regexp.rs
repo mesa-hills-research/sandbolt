@@ -101,6 +101,14 @@ fn lookaround_and_capture_rollback() {
         Some(vec![Some((0, 1)), Some((0, 1))])
     );
     assert_eq!(ascii("(?=(a))b|a", "a"), Some(vec![Some((0, 1)), None]));
+    assert_eq!(
+        ascii("^(?=(a+))a*a$", "aaaa"),
+        Some(vec![Some((0, 4)), Some((0, 4))])
+    );
+    assert_eq!(
+        ascii("^(?!(a+)b)a+c$", "aaac"),
+        Some(vec![Some((0, 4)), None])
+    );
     assert_eq!(ascii("(?!(a)b)a", "a"), Some(vec![Some((0, 1)), None]));
     assert_eq!(
         ascii("(?=(?!(b))(a))a", "a"),
@@ -442,6 +450,21 @@ fn long_character_repeats_use_bounded_backtracking_space() {
     let re = compiled(br"^\P{ASCII}+$", F::UNICODE);
     assert_eq!(exec(&re, input, 0, &mut host), Err(RegExpError::Interrupted));
     assert_eq!(host.bytes, 0);
+}
+
+#[test]
+fn split_runs_rewind_at_code_point_boundaries() {
+    let input = RegExpInput::Utf16(&[0xdc00, 0x3b1, 0xd83d, 0xde00, 0xd800, 0x3b2, 0xde00]);
+    for flags in [F::UNICODE, F::UNICODE_SETS] {
+        assert_eq!(
+            captures(br"^(\P{ASCII}+)(\u{1f600}\uD800\u03B2\uDE00)$", flags, input, 0),
+            Some(vec![Some((0, 7)), Some((0, 2)), Some((2, 7))]),
+        );
+    }
+    assert_eq!(
+        captures(br"^(.+)(\uDE00\uD800\u03B2\uDE00)$", 0, input, 0),
+        Some(vec![Some((0, 7)), Some((0, 3)), Some((3, 7))]),
+    );
 }
 
 #[test]
