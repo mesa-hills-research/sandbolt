@@ -1,0 +1,15 @@
+[package]
+name = "qjs-test262"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+qjs-runtime.workspace = true
+qjs-syntax.workspace = true
+qjs-bytecode.workspace = true
+qjs-compiler.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "qjs-syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+qjs-unicode.workspace = true
+qjs-dtoa.workspace = true
+
+[lints]
+workspace = true

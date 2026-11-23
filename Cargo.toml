@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/qjs-unicode",
+    "crates/qjs-dtoa",
+    "crates/qjs-bigint",
+    "crates/qjs-regexp",
+    "crates/qjs-syntax",
+    "crates/qjs-bytecode",
+    "crates/qjs-compiler",
+    "crates/qjs-runtime",
+    "crates/qjs-test262",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+qjs-unicode = { path = "crates/qjs-unicode" }
+qjs-dtoa = { path = "crates/qjs-dtoa" }
+qjs-bigint = { path = "crates/qjs-bigint" }
+qjs-regexp = { path = "crates/qjs-regexp" }
+qjs-syntax = { path = "crates/qjs-syntax" }
+qjs-bytecode = { path = "crates/qjs-bytecode" }
+qjs-compiler = { path = "crates/qjs-compiler" }
+qjs-runtime = { path = "crates/qjs-runtime" }
