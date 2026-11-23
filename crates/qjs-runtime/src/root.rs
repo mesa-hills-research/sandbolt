@@ -595,6 +595,7 @@ impl<'s> ExecCtx<'_, 's> {
             let function = BytecodeFunc {
                 code: TrackedVec::from_slice(&heap.ledger, ops)?,
                 constants: copy_args(constants)?,
+                compiled: None,
             };
             let code = heap.bytecode.insert(&heap.ledger, function)?;
             let data = TrackedBox::new(

@@ -4,6 +4,14 @@ use crate::gc::{Trace, Tracer};
 use crate::ledger::TrackedVec;
 use crate::value::*;
 
+#[path = "vm_exec/mod.rs"]
+pub(crate) mod exec;
+
+use crate::atom::PropKey;
+use qjs_bytecode::{
+    ClosureVarDef, ExceptionHandler, FunctionFlags, FunctionKind, PcSourceMap, VarDef,
+};
+
 pub const REENTRY_COST: usize = 1024;
 pub const MAX_REENTRY_DEPTH: usize = 64;
 
@@ -38,6 +46,48 @@ impl Trace for MiniOp {
 pub struct BytecodeFunc {
     pub code: TrackedVec<MiniOp>,
     pub constants: TrackedVec<Value>,
+    pub(crate) compiled: Option<CompiledFunc>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CompiledFunc {
+    pub code: TrackedVec<u8>,
+    pub atoms: TrackedVec<PropKey>,
+    pub name: Option<PropKey>,
+    pub flags: FunctionFlags,
+    pub kind: FunctionKind,
+    pub strict: bool,
+    pub arg_count: u16,
+    pub var_count: u16,
+    pub defined_arg_count: u16,
+    pub stack_size: u16,
+    pub vars: TrackedVec<VarDef>,
+    pub closures: TrackedVec<ClosureVarDef>,
+    pub handlers: TrackedVec<ExceptionHandler>,
+    pub filename: TrackedVec<u8>,
+    pub line_starts: TrackedVec<u32>,
+    pub pc_map: TrackedVec<PcSourceMap>,
+    pub source: Option<StrId>,
+    pub source_start: u32,
+    pub regex_flags: TrackedVec<(u32, u16)>,
+}
+
+impl CompiledFunc {
+    pub(crate) fn key(&self, atom: qjs_bytecode::UnitAtom) -> PropKey {
+        if let Some(index) = atom.dynamic_index() {
+            self.atoms[index as usize]
+        } else {
+            PropKey::atom(crate::atom::Atom(atom.raw()))
+        }
+    }
+}
+
+impl Trace for CompiledFunc {
+    fn trace(&self, tracer: &Tracer<'_>) {
+        self.atoms.trace(tracer);
+        self.name.trace(tracer);
+        self.source.trace(tracer);
+    }
 }
 impl ArenaItem for BytecodeFunc {
     type Id = BcId;
@@ -46,6 +96,7 @@ impl Trace for BytecodeFunc {
     fn trace(&self, tracer: &Tracer<'_>) {
         self.code.trace(tracer);
         self.constants.trace(tracer);
+        self.compiled.trace(tracer);
     }
 }
 
@@ -58,6 +109,12 @@ pub struct CallFrame {
     pub pc: u32,
     pub base: u32,
     pub arg_count: u32,
+    pub(crate) arg_slots: u32,
+    pub(crate) capture_base: u32,
+    pub(crate) floor: u32,
+    pub(crate) last_pc: u32,
+    pub(crate) return_call: bool,
+    pub(crate) require_object: bool,
 }
 impl Trace for CallFrame {
     fn trace(&self, tracer: &Tracer<'_>) {
@@ -93,6 +150,8 @@ pub struct ModuleRecord {
     pub namespace: Option<ObjId>,
     pub dependencies: TrackedVec<ModId>,
     pub exports: TrackedVec<Value>,
+    pub(crate) lexical: TrackedVec<(PropKey, (VarRefId, bool))>,
+    pub(crate) global_scope: bool,
 }
 impl ArenaItem for ModuleRecord {
     type Id = ModId;
@@ -103,6 +162,10 @@ impl Trace for ModuleRecord {
         self.namespace.trace(tracer);
         self.dependencies.trace(tracer);
         self.exports.trace(tracer);
+        for (key, (reference, _)) in self.lexical.iter() {
+            key.trace(tracer);
+            reference.trace(tracer);
+        }
     }
 }
 
@@ -153,6 +216,10 @@ pub struct VmState {
     pub(crate) interrupt_handler: Option<Box<dyn FnMut() -> bool>>,
     pub can_block: bool,
     pub limits: EngineLimits,
+    pub(crate) thrown_frames: Vec<crate::Frame>,
+    pub(crate) host_callback: Option<crate::api::HostCallback>,
+    pub(crate) print_callback: Option<crate::api::PrintCallback>,
+    pub(crate) module_loader: Option<Box<dyn crate::api::ModuleLoader>>,
 }
 
 impl VmState {
@@ -166,6 +233,10 @@ impl VmState {
             interrupt_handler: None,
             can_block: true,
             limits,
+            thrown_frames: Vec::new(),
+            host_callback: None,
+            print_callback: None,
+            module_loader: None,
         }
     }
 

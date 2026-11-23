@@ -173,9 +173,12 @@ pub fn get_property_with_receiver<'s>(
     key: PropKey,
     receiver: Handle<'s>,
 ) -> JsResult<Value> {
-    let id = ctx.object_id(object)?;
+    let object = ctx.get(object);
     let receiver = ctx.get(receiver);
     ctx.with_scope(|ctx| {
+        let object = ctx.root(object)?;
+        let object = super::convert::to_object(ctx, object)?;
+        let id = ctx.object_id(object)?;
         let receiver = ctx.root(receiver)?;
         get_from(ctx, id, key, receiver)
     })
@@ -195,16 +198,15 @@ fn get_from<'s>(
                 let target = ctx.root(Value::object(target))?;
                 let handler = ctx.root(Value::object(handler))?;
                 root_key(ctx, key)?;
-                let trap = lookup_proxy_trap(ctx, handler, Atom::get("get"))?;
-                if trap != Value::UNDEFINED && trap != Value::NULL {
-                    let trap = ctx.root(trap)?;
+                if let Some(trap) = lookup_proxy_trap(ctx, handler, Atom::get("get"))? {
                     let key_value = super::convert::key_value(ctx, key)?;
                     let args = ctx.args(&[target, key_value, receiver])?;
                     let value = super::call::call(ctx, trap, handler, args)?;
+                    let value = ctx.root(value)?;
                     if let Some(desc) = get_own_property_descriptor(ctx, target, key)? {
-                        check_proxy_get_set(ctx, desc, value, false)?;
+                        check_proxy_get_set(ctx, desc, ctx.get(value), false)?;
                     }
-                    return Ok(value);
+                    return Ok(ctx.get(value));
                 }
             }
             id = target;
@@ -251,10 +253,21 @@ pub fn set_property<'s>(
     key: PropKey,
     value: Handle<'s>,
 ) -> JsResult<bool> {
+    set_property_with_receiver(ctx, object, key, value, object)
+}
+
+pub fn set_property_with_receiver<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    object: Handle<'s>,
+    key: PropKey,
+    value: Handle<'s>,
+    receiver: Handle<'s>,
+) -> JsResult<bool> {
     let object = ctx.object_id(object)?;
     let value = ctx.get(value);
+    let receiver = ctx.get(receiver);
     ctx.with_scope(|ctx| {
-        let receiver = ctx.root(Value::object(object))?;
+        let receiver = ctx.root(receiver)?;
         let value = ctx.root(value)?;
         set_from(ctx, object, key, receiver, value)
     })
@@ -275,9 +288,7 @@ fn set_from<'s>(
             if let Some(handler) = handler {
                 let handler = ctx.root(Value::object(handler))?;
                 root_key(ctx, key)?;
-                let trap = lookup_proxy_trap(ctx, handler, Atom::get("set"))?;
-                if trap != Value::UNDEFINED && trap != Value::NULL {
-                    let trap = ctx.root(trap)?;
+                if let Some(trap) = lookup_proxy_trap(ctx, handler, Atom::get("set"))? {
                     let key_value = super::convert::key_value(ctx, key)?;
                     let args = ctx.args(&[target_root, key_value, value, receiver])?;
                     let result = super::call::call(ctx, trap, handler, args)?;
@@ -313,10 +324,11 @@ fn set_from<'s>(
         };
         id = proto;
     }
-    let target = ctx.object_id(receiver)?;
-    let target = unwrap_proxy(ctx, target)?;
-    if let Some((_, flags)) = own(ctx.heap(), target, key) {
-        if flags.contains(PropFlags::ACCESSOR) || !flags.contains(PropFlags::WRITABLE) {
+    if ctx.get(receiver).as_object().is_none() {
+        return Ok(false);
+    }
+    if let Some(desc) = get_own_property_descriptor(ctx, receiver, key)? {
+        if desc.is_accessor() || desc.writable == Some(false) {
             return Ok(false);
         }
         define_own_property(
@@ -333,13 +345,23 @@ fn set_from<'s>(
     }
 }
 
-fn lookup_proxy_trap<'s>(
+pub(crate) fn proxy_parts(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> JsResult<(ObjId, ObjId)> {
+    let ObjectData::Proxy(proxy) = &ctx.heap().object(id).data else {
+        unreachable!()
+    };
+    proxy
+        .target
+        .zip(proxy.handler)
+        .ok_or_else(|| ctx.throw_type_error("proxy is revoked"))
+}
+
+pub(crate) fn lookup_proxy_trap<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     handler: Handle<'s>,
     trap: PropKey,
-) -> JsResult<Value> {
+) -> JsResult<Option<Handle<'s>>> {
     let handler = ctx.get(handler);
-    ctx.with_scope(|ctx| {
+    let method = ctx.with_scope(|ctx| {
         ctx.check_interrupt()?;
         if !ctx.runtime.vm.check_budget(0, 0, 1) {
             return Err(ctx.stack_overflow());
@@ -347,7 +369,17 @@ fn lookup_proxy_trap<'s>(
         ctx.runtime.vm.reentry_depth += 1;
         let handler = ctx.root(handler)?;
         get_property(ctx, handler, trap)
-    })
+    })?;
+    if method == Value::UNDEFINED || method == Value::NULL {
+        return Ok(None);
+    }
+    if !method
+        .as_object()
+        .is_some_and(|id| super::call::is_callable(ctx.heap(), id))
+    {
+        return Err(ctx.throw_type_error("proxy trap is not callable"));
+    }
+    ctx.root(method).map(Some)
 }
 
 fn check_proxy_get_set(
@@ -399,7 +431,11 @@ fn define_raw(
     desc: PropertyDescriptor,
 ) -> JsResult<bool> {
     root_key(ctx, key)?;
-    let id = unwrap_proxy(ctx, id)?;
+    let id = if is_private(ctx.heap(), key) {
+        id
+    } else {
+        unwrap_proxy(ctx, id)?
+    };
     if desc.is_data() && desc.is_accessor() {
         return Err(ctx.throw_type_error("invalid property descriptor"));
     }
@@ -952,6 +988,43 @@ fn invalidate_array_prototypes(ctx: &mut ExecCtx<'_, '_>, object: ObjId) {
             }
             ancestor = heap.shape(heap.object(current).shape).proto;
         }
+    }
+}
+
+fn is_private(heap: &Heap, key: PropKey) -> bool {
+    match key.decode() {
+        KeyKind::Symbol(token) => heap
+            .symbol_registry
+            .from_token(token)
+            .and_then(|id| heap.symbols.get(id))
+            .is_some_and(|symbol| symbol.is_private),
+        KeyKind::String(atom) => atom.0 == qjs_bytecode::BuiltinAtom::PrivateBrand as u32,
+        KeyKind::Index(_) => false,
+    }
+}
+
+pub(crate) fn private_own(ctx: &ExecCtx<'_, '_>, object: ObjId, key: PropKey) -> Option<Value> {
+    own(ctx.heap(), object, key).map(|(value, _)| value)
+}
+
+pub(crate) fn private_write(ctx: &mut ExecCtx<'_, '_>, object: ObjId, key: PropKey, value: Value) {
+    let id = ctx.heap().object(object).shape;
+    let (index, _) = ctx.heap().shape(id).find(key).unwrap();
+    ctx.runtime.heap.objects.get_mut(object).unwrap().props[index] = value;
+}
+
+pub(crate) fn private_define(
+    ctx: &mut ExecCtx<'_, '_>,
+    object: ObjId,
+    key: PropKey,
+    value: Value,
+) -> JsResult<()> {
+    let object = ctx.root(Value::object(object))?;
+    let value = ctx.root(value)?;
+    if define_own_property(ctx, object, key, PropertyDescriptor::data(value))? {
+        Ok(())
+    } else {
+        Err(ctx.throw_type_error("cannot define private field"))
     }
 }
 
