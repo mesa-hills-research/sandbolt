@@ -631,7 +631,7 @@ fn module_graph_links_live_bindings_and_waits_for_cycle_roots() {
                     "import {f} from 'a'; globalThis.events.push(f()); await 1; globalThis.events.push('b')"
                 }
                 ("c", None) => "import 'b'; globalThis.events.push('c')",
-                ("data", Some("json")) => {
+                ("data" | "./data", None | Some("json")) => {
                     return Ok(ResolvedModule::Json {
                         name: "data".into(),
                         source: "{\"n\":42}".into(),
@@ -671,7 +671,15 @@ fn module_graph_links_live_bindings_and_waits_for_cycle_roots() {
             r#"
         import 'a'; import 'c';
         import data from 'data' with { type: 'json' };
+        import plain from 'data';
         import text from 'text' with { type: 'text' };
+        if (data === plain) throw new Error('different attributes shared one module');
+        if ((await import('./data', { with: { type: 'json' } })).default !== data) {
+            throw new Error('equal attributes loaded a second module');
+        }
+        if ((await import('./data', { with: {} })).default !== plain) {
+            throw new Error('empty attributes loaded a second module');
+        }
         import bytes from 'bytes' with { type: 'bytes' };
         events.push(data.n, text, bytes[0]);
         (await import('a')).f && events.push(import.meta.url);

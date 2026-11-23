@@ -29,7 +29,8 @@ use crate::vm::{
 
 use super::{compiled, define_flags, load, utf16_lossy, well_known};
 
-const SOURCE: u8 = 0;
+// The only supported attribute is `type`. Omitted and empty sets are equal.
+const NO_ATTRIBUTES: u8 = 0;
 const JSON: u8 = 1;
 const TEXT: u8 = 2;
 const BYTES: u8 = 3;
@@ -40,7 +41,7 @@ pub(super) fn evaluate_image(
     source: Option<&SourceText>,
 ) -> JsResult<Value> {
     let linked = ctx.with_scope(|ctx| {
-        let id = register_image(ctx, image, source)?;
+        let id = register_image(ctx, image, source, NO_ATTRIBUTES)?;
         link(ctx, id)?;
         Ok(id)
     });
@@ -65,10 +66,10 @@ fn record_mut<'a>(ctx: &'a mut ExecCtx<'_, '_>, id: ModId) -> &'a mut ModuleReco
     ctx.runtime.heap.modules.get_mut(id).unwrap()
 }
 
-fn cached(ctx: &ExecCtx<'_, '_>, name: PropKey, module_type: u8) -> Option<ModId> {
+fn cached(ctx: &ExecCtx<'_, '_>, name: PropKey, attributes: u8) -> Option<ModId> {
     ctx.runtime.modules.iter().copied().find(|&id| {
         let m = record(ctx, id);
-        m.name == Some(name) && m.module_type == module_type && m.realm == Some(ctx.realm_id())
+        m.name == Some(name) && m.attributes == attributes && m.realm == Some(ctx.realm_id())
     })
 }
 
@@ -76,19 +77,20 @@ fn register_image(
     ctx: &mut ExecCtx<'_, '_>,
     image: &ProgramImage,
     source: Option<&SourceText>,
+    attributes: u8,
 ) -> JsResult<ModId> {
     let functions = load::load_functions(ctx, image, source)?;
     let mut primary = None;
     for module in &image.modules {
         let code = functions[module.function as usize];
         let name = compiled(ctx, code).key(module.name);
-        let id = if let Some(id) = cached(ctx, name, SOURCE) {
+        let id = if let Some(id) = cached(ctx, name, attributes) {
             id
         } else {
-            let id = register(ctx, name, SOURCE, Some(code), module.has_top_level_await)?;
+            let id = register(ctx, name, attributes, Some(code), module.has_top_level_await)?;
             for request in &module.requested_modules {
                 let name = compiled(ctx, code).key(request.name);
-                let mut module_type = SOURCE;
+                let mut attributes = NO_ATTRIBUTES;
                 let type_key = ctx.intern_str("type")?;
                 for attr in &request.attributes {
                     let key = compiled(ctx, code).key(attr.key);
@@ -99,7 +101,7 @@ fn register_image(
                     }
                     let v = compiled(ctx, code).key(attr.value);
                     let v = atom_text(ctx, v)?;
-                    module_type = parse_type(ctx, &v)?;
+                    attributes = parse_type(ctx, &v)?;
                 }
                 ctx.allocate(|rt| {
                     rt.heap
@@ -107,7 +109,7 @@ fn register_image(
                         .get_mut(id)
                         .unwrap()
                         .requests
-                        .push(&rt.heap.ledger, ModuleRequest { name, module_type })
+                        .push(&rt.heap.ledger, ModuleRequest { name, attributes })
                 })?;
             }
             for &import in &module.imports {
@@ -215,7 +217,7 @@ fn mark_unit(ctx: &mut ExecCtx<'_, '_>, root: BcId, id: ModId) -> JsResult<()> {
 fn register(
     ctx: &mut ExecCtx<'_, '_>,
     name: PropKey,
-    module_type: u8,
+    attributes: u8,
     code: Option<BcId>,
     has_await: bool,
 ) -> JsResult<ModId> {
@@ -227,7 +229,7 @@ fn register(
             ModuleRecord {
                 realm: Some(realm),
                 name: Some(name),
-                module_type,
+                attributes,
                 code,
                 has_await,
                 ..Default::default()
@@ -305,14 +307,14 @@ fn resolve_request(
 ) -> JsResult<ModId> {
     ctx.check_interrupt()?;
     let specifier = atom_text(ctx, request.name)?;
-    let kind = match request.module_type {
+    let kind = match request.attributes {
         JSON => Some("json"),
         TEXT => Some("text"),
         BYTES => Some("bytes"),
         _ => None,
     };
     if ctx.runtime.vm.module_loader.is_none() {
-        if let Some(id) = cached(ctx, request.name, request.module_type) {
+        if let Some(id) = cached(ctx, request.name, request.attributes) {
             return Ok(id);
         }
         return Err(ctx.throw_error(ErrorKind::Reference, "module loader is not installed"));
@@ -325,14 +327,14 @@ fn resolve_request(
         .unwrap()
         .resolve(referrer, &specifier, kind);
     let loaded = loaded.map_err(|error| ctx.throw_error(ErrorKind::Reference, &error))?;
-    let (name, kind) = match &loaded {
-        ResolvedModule::Source { name, .. } => (name, SOURCE),
-        ResolvedModule::Json { name, .. } => (name, JSON),
-        ResolvedModule::Text { name, .. } => (name, TEXT),
-        ResolvedModule::Bytes { name, .. } => (name, BYTES),
+    let name = match &loaded {
+        ResolvedModule::Source { name, .. }
+        | ResolvedModule::Json { name, .. }
+        | ResolvedModule::Text { name, .. }
+        | ResolvedModule::Bytes { name, .. } => name,
     };
     let key = ctx.intern_str(name)?;
-    if let Some(id) = cached(ctx, key, kind) {
+    if let Some(id) = cached(ctx, key, request.attributes) {
         return Ok(id);
     }
     if let ResolvedModule::Source { name, source } = loaded {
@@ -354,7 +356,7 @@ fn resolve_request(
             qjs_compiler::CompileError::StackOverflow => ctx.stack_overflow(),
             other => ctx.throw_error(ErrorKind::Internal, &format!("{other:?}")),
         })?;
-        return register_image(ctx, &image, Some(&source));
+        return register_image(ctx, &image, Some(&source), request.attributes);
     }
     let value = match loaded {
         ResolvedModule::Json { source, .. } => {
@@ -376,7 +378,7 @@ fn resolve_request(
         ResolvedModule::Source { .. } => unreachable!(),
     };
     ctx.root(value)?;
-    let id = register(ctx, key, kind, None, false)?;
+    let id = register(ctx, key, request.attributes, None, false)?;
     let binding = new_cell(ctx, value)?;
     ctx.root(Value::var_ref(binding))?;
     ctx.allocate(|rt| {
@@ -1025,18 +1027,18 @@ pub(super) fn dynamic_import<'s>(
     let capability = new_promise_capability(ctx, constructor)?;
     let result = (|| {
         let specifier = convert::to_string(ctx, specifier)?;
-        let module_type = if ctx.get(options) == Value::UNDEFINED {
-            SOURCE
+        let attributes = if ctx.get(options) == Value::UNDEFINED {
+            NO_ATTRIBUTES
         } else {
             ctx.object_id(options)?;
             let with = ctx.intern_str("with")?;
             let attributes = property::get_property(ctx, options, with)?;
             let attrs = ctx.root(attributes)?;
             if attributes == Value::UNDEFINED {
-                SOURCE
+                NO_ATTRIBUTES
             } else {
                 ctx.object_id(attrs)?;
-                let mut module_type = SOURCE;
+                let mut attributes = NO_ATTRIBUTES;
                 let type_key = ctx.intern_str("type")?;
                 for &key in property::own_property_keys(ctx, attrs)?.iter() {
                     if matches!(key.decode(), KeyKind::Symbol(_))
@@ -1053,14 +1055,14 @@ pub(super) fn dynamic_import<'s>(
                         return Err(ctx.throw_type_error("unsupported import attribute"));
                     }
                     let text = utf16_lossy(ctx.heap(), id);
-                    module_type = parse_type(ctx, &text)?;
+                    attributes = parse_type(ctx, &text)?;
                 }
-                module_type
+                attributes
             }
         };
         let source = String::from_utf8_lossy(&compiled(ctx, code).filename).into_owned();
         let name = ctx.new_string(&source)?;
-        let kind = ctx.root(Value::int32(i32::from(module_type)))?;
+        let kind = ctx.root(Value::int32(i32::from(attributes)))?;
         let args = ctx.args(&[name, specifier, kind, capability.resolve, capability.reject])?;
         let callback = ctx.new_native(DYNAMIC_IMPORT_JOB, false)?;
         let this = ctx.root(Value::UNDEFINED)?;
@@ -1087,13 +1089,13 @@ pub(crate) fn dynamic_job<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>) -> JsRe
         };
         let name = utf16_lossy(ctx.heap(), name);
         let specifier = ctx.intern(args.get(1).unwrap())?;
-        let module_type = ctx.get(args.get(2).unwrap()).as_number().unwrap() as u8;
+        let attributes = ctx.get(args.get(2).unwrap()).as_number().unwrap() as u8;
         let id = resolve_request(
             ctx,
             &name,
             ModuleRequest {
                 name: specifier,
-                module_type,
+                attributes,
             },
         )?;
         link(ctx, id)?;

@@ -251,7 +251,7 @@ pub struct ModuleRecord {
     pub(crate) lexical: TrackedVec<(PropKey, (VarRefId, bool))>,
     pub(crate) global_scope: bool,
     pub(crate) name: Option<PropKey>,
-    pub(crate) module_type: u8,
+    pub(crate) attributes: u8,
     pub(crate) code: Option<BcId>,
     pub(crate) requests: TrackedVec<ModuleRequest>,
     pub(crate) imports: TrackedVec<ModuleImport>,
@@ -286,7 +286,7 @@ pub(crate) enum ModuleStatus {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ModuleRequest {
     pub name: PropKey,
-    pub module_type: u8,
+    pub attributes: u8,
 }
 impl Trace for ModuleRequest {
     fn trace(&self, tracer: &Tracer<'_>) {
