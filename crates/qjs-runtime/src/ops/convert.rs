@@ -215,17 +215,20 @@ pub fn to_int32<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<i3
     Ok(to_uint32(ctx, value)? as i32)
 }
 pub fn to_uint32<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<u32> {
-    let n = to_number(ctx, value)?;
+    Ok(number_to_uint32(to_number(ctx, value)?))
+}
+
+pub(crate) fn number_to_uint32(n: f64) -> u32 {
     if !n.is_finite() {
-        return Ok(0);
+        return 0;
     }
     // Take the positive remainder before applying the sign so a value close to zero cannot round up to 2^32.
     let magnitude = (n.abs().trunc() % 4_294_967_296.0) as u32;
-    Ok(if n.is_sign_negative() {
+    if n.is_sign_negative() {
         magnitude.wrapping_neg()
     } else {
         magnitude
-    })
+    }
 }
 pub fn to_integer_or_infinity<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<f64> {
     let n = to_number(ctx, value)?;

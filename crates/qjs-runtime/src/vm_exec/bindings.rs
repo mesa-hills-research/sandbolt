@@ -283,6 +283,9 @@ fn write_binding<'s>(
         ValueKind::Undefined => ctx.root(Value::object(ctx.realm().global_object))?,
         _ => binding,
     };
+    if strict && !property::has_property(ctx, object, key)? {
+        return Err(ctx.throw_error(ErrorKind::Reference, "binding is not defined"));
+    }
     if !property::set_property(ctx, object, key, value)? && strict {
         return Err(ctx.throw_type_error("cannot assign property"));
     }

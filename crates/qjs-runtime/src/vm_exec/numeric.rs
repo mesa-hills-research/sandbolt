@@ -200,6 +200,25 @@ fn bigint(value: Value) -> bool {
     )
 }
 
+enum Numeric<'s> {
+    Number(f64),
+    BigInt(Handle<'s>),
+}
+
+fn to_numeric<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<Numeric<'s>> {
+    let primitive = convert::to_primitive(ctx, value, PreferredType::Number)?;
+    let primitive = ctx.root(primitive)?;
+    primitive_to_numeric(ctx, primitive)
+}
+
+fn primitive_to_numeric<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<Numeric<'s>> {
+    if bigint(ctx.get(value)) {
+        Ok(Numeric::BigInt(value))
+    } else {
+        convert::to_number(ctx, value).map(Numeric::Number)
+    }
+}
+
 pub(super) fn binary<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     op: Opcode,
@@ -207,54 +226,57 @@ pub(super) fn binary<'s>(
     right: Handle<'s>,
 ) -> JsResult<Value> {
     use Opcode::*;
-    let hint = if op == Add {
-        PreferredType::Default
+    let (left, right) = if op == Add {
+        let a = convert::to_primitive(ctx, left, PreferredType::Default)?;
+        let left = ctx.root(a)?;
+        let b = convert::to_primitive(ctx, right, PreferredType::Default)?;
+        let right = ctx.root(b)?;
+        if matches!(a.decode(), ValueKind::String(_)) || matches!(b.decode(), ValueKind::String(_))
+        {
+            let a = convert::to_string(ctx, left)?;
+            let b = convert::to_string(ctx, right)?;
+            let joined = ctx.concat_strings(a, b)?;
+            return Ok(ctx.get(joined));
+        }
+        (
+            primitive_to_numeric(ctx, left)?,
+            primitive_to_numeric(ctx, right)?,
+        )
     } else {
-        PreferredType::Number
+        (to_numeric(ctx, left)?, to_numeric(ctx, right)?)
     };
-    let a = convert::to_primitive(ctx, left, hint)?;
-    let left = ctx.root(a)?;
-    let b = convert::to_primitive(ctx, right, hint)?;
-    let right = ctx.root(b)?;
-    if op == Add
-        && (matches!(a.decode(), ValueKind::String(_))
-            || matches!(b.decode(), ValueKind::String(_)))
-    {
-        let a = convert::to_string(ctx, left)?;
-        let b = convert::to_string(ctx, right)?;
-        let joined = ctx.concat_strings(a, b)?;
-        return Ok(ctx.get(joined));
-    }
-    if bigint(a) || bigint(b) {
-        if !bigint(a) || !bigint(b) {
-            return Err(ctx.throw_type_error("cannot mix BigInt and Number"));
+    let (a, b) = match (left, right) {
+        (Numeric::Number(a), Numeric::Number(b)) => (a, b),
+        (Numeric::BigInt(a), Numeric::BigInt(b)) => {
+            if op == Shr {
+                return Err(ctx.throw_type_error("BigInt has no unsigned right shift"));
+            }
+            let (a, b) = (ctx.get(a), ctx.get(b));
+            return with_host(ctx, |heap, host| {
+                let a = read(heap, host, a)?;
+                let b = read(heap, host, b)?;
+                let result = match op {
+                    Add => a.add(&b, host)?,
+                    Sub => a.sub(&b, host)?,
+                    Mul => a.mul(&b, host)?,
+                    Div => a.divrem(&b, host)?.0,
+                    Mod => a.divrem(&b, host)?.1,
+                    Pow => a.pow(&b, host)?,
+                    Shl => a.shl(&b, host)?,
+                    Sar => a.sar(&b, host)?,
+                    And => a.bitand(&b, host)?,
+                    Or => a.bitor(&b, host)?,
+                    Xor => a.bitxor(&b, host)?,
+                    _ => unreachable!(),
+                };
+                store(heap, &result)
+            });
         }
-        if op == Shr {
-            return Err(ctx.throw_type_error("BigInt has no unsigned right shift"));
-        }
-        return with_host(ctx, |heap, host| {
-            let a = read(heap, host, a)?;
-            let b = read(heap, host, b)?;
-            let result = match op {
-                Add => a.add(&b, host)?,
-                Sub => a.sub(&b, host)?,
-                Mul => a.mul(&b, host)?,
-                Div => a.divrem(&b, host)?.0,
-                Mod => a.divrem(&b, host)?.1,
-                Pow => a.pow(&b, host)?,
-                Shl => a.shl(&b, host)?,
-                Sar => a.sar(&b, host)?,
-                And => a.bitand(&b, host)?,
-                Or => a.bitor(&b, host)?,
-                Xor => a.bitxor(&b, host)?,
-                _ => unreachable!(),
-            };
-            store(heap, &result)
-        });
-    }
+        _ => return Err(ctx.throw_type_error("cannot mix BigInt and Number")),
+    };
     if matches!(op, Shl | Sar | Shr | And | Or | Xor) {
-        let a = convert::to_uint32(ctx, left)?;
-        let b = convert::to_uint32(ctx, right)?;
+        let a = convert::number_to_uint32(a);
+        let b = convert::number_to_uint32(b);
         return Ok(match op {
             Shl => Value::int32((a << (b & 31)) as i32),
             Sar => Value::int32((a as i32) >> (b & 31)),
@@ -265,8 +287,6 @@ pub(super) fn binary<'s>(
             _ => unreachable!(),
         });
     }
-    let a = convert::to_number(ctx, left)?;
-    let b = convert::to_number(ctx, right)?;
     Ok(Value::number(match op {
         Add => a + b,
         Sub => a - b,

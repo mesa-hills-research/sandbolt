@@ -254,8 +254,11 @@ pub(super) fn object_op(
                 none(2)
             }
             GetArrayEl | GetArrayEl2 => {
+                let receiver = h(2);
+                let object = convert::to_object(ctx, receiver)?;
                 let key = convert::to_property_key(ctx, h(1))?;
-                one(if op == GetArrayEl { 2 } else { 1 }, get(ctx, h(2), key)?)
+                let value = property::get_property_with_receiver(ctx, object, key, receiver)?;
+                one(if op == GetArrayEl { 2 } else { 1 }, value)
             }
             PutArrayEl => {
                 let key = convert::to_property_key(ctx, h(2))?;

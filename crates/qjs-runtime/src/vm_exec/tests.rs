@@ -77,6 +77,68 @@ fn handles_number_and_bigint_conversions() {
 }
 
 #[test]
+fn numeric_binary_operators_coerce_the_left_operand_first() {
+    assert_eq!(
+        run(r#"
+        let log = [];
+        function left() {
+            log.push('left');
+            return { valueOf() { log.push('left numeric'); return Symbol(); } };
+        }
+        function right() {
+            log.push('right');
+            return { valueOf() { log.push('right numeric'); throw new Error(); } };
+        }
+        try { left() & right(); } catch (e) { log.push(e.name); }
+        log.join(',')
+    "#),
+        "left,right,left numeric,TypeError"
+    );
+}
+
+#[test]
+fn computed_references_check_the_base_and_reuse_the_key() {
+    assert_eq!(
+        run(r#"
+        let log = [];
+        let key = { toString() { log.push('key'); return 'p'; } };
+        function property() { log.push('property'); return key; }
+        function rhs() { log.push('rhs'); return 4; }
+        try { null[property()]; } catch (e) { log.push(e.name); }
+        try { null[property()] *= rhs(); } catch (e) { log.push(e.name); }
+        let obj = { p: 2 };
+        obj[property()] *= rhs();
+        log.push(obj[property()]++);
+        log.push(obj.p);
+        log.join(',')
+    "#),
+        "property,TypeError,property,TypeError,property,key,rhs,property,key,8,9"
+    );
+}
+
+#[test]
+fn strict_assignment_rechecks_the_resolved_object_binding() {
+    assert_eq!(
+        run(r#"
+        Object.defineProperty(globalThis, 'x', { value: 1, configurable: true });
+        Object.defineProperty(globalThis, 'y', {
+            configurable: true,
+            get() { delete globalThis.y; return 1; }
+        });
+        (function () {
+            'use strict';
+            let log = [];
+            try { x = (delete globalThis.x, 2); } catch (e) { log.push(e.name); }
+            try { ++y; } catch (e) { log.push(e.name); }
+            log.push('x' in globalThis, 'y' in globalThis);
+            return log.join(',');
+        })()
+    "#),
+        "ReferenceError,ReferenceError,false,false"
+    );
+}
+
+#[test]
 fn applies_and_constructs_proxies() {
     assert_eq!(
         run(
