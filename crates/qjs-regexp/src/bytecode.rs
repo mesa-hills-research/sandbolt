@@ -2,6 +2,191 @@ use crate::alloc::Budget;
 use crate::{RegExpError, RegExpFlags};
 
 pub(crate) const HEADER: usize = 8;
+pub(crate) const FAST_LITERAL_MAX: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FastMatch {
+    None,
+    LiteralLatin1 {
+        bytes: [u8; FAST_LITERAL_MAX],
+        len: u8,
+        sticky: bool,
+    },
+    LiteralUtf16 {
+        units: [u16; FAST_LITERAL_MAX],
+        len: u8,
+        sticky: bool,
+    },
+    PrefixChar {
+        unit: u16,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompiledPlan {
+    pub(crate) fingerprint: u128,
+    pub(crate) flags: RegExpFlags,
+    pub(crate) captures: usize,
+    pub(crate) registers: usize,
+    pub(crate) body_len: usize,
+    pub(crate) fast: FastMatch,
+}
+
+pub(crate) fn fingerprint(bytes: &[u8]) -> u128 {
+    let mut h1: u64 = 0x9e37_79b9_7f4a_7c15 ^ (bytes.len() as u64);
+    let mut h2: u64 = 0xbf58_476d_1ce4_e5b9 ^ (bytes.len() as u64).rotate_left(32);
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+        h1 = (h1 ^ word).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h1 ^= h1 >> 31;
+        h2 = (h2 ^ word.rotate_left(17)).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h2 ^= h2 >> 33;
+    }
+    let mut tail = 0u64;
+    for (i, &b) in chunks.remainder().iter().enumerate() {
+        tail |= u64::from(b) << (i * 8);
+    }
+    h1 = (h1 ^ tail).wrapping_mul(0x94d0_49bb_1331_11eb);
+    h1 ^= h1 >> 31;
+    h2 = (h2 ^ tail.rotate_left(19)).wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h2 ^= h2 >> 33;
+    (u128::from(h1) << 64) | u128::from(h2)
+}
+
+impl CompiledPlan {
+    pub(crate) fn from_validated(bytes: &[u8], h: &Header<'_>) -> Self {
+        Self {
+            fingerprint: fingerprint(bytes),
+            flags: h.flags,
+            captures: h.captures,
+            registers: h.registers,
+            body_len: h.body.len(),
+            fast: analyze_fast_match(h),
+        }
+    }
+
+    pub(crate) fn header<'a>(&self, bytes: &'a [u8]) -> Header<'a> {
+        let end = HEADER + self.body_len;
+        Header {
+            flags: self.flags,
+            captures: self.captures,
+            registers: self.registers,
+            body: &bytes[HEADER..end],
+            names: &bytes[end..],
+        }
+    }
+}
+
+fn is_surrogate_u16(c: u16) -> bool {
+    (0xd800..=0xdfff).contains(&c)
+}
+
+fn analyze_fast_match(h: &Header<'_>) -> FastMatch {
+    use Op::*;
+    let unicode = h
+        .flags
+        .contains(RegExpFlags::UNICODE | RegExpFlags::UNICODE_SETS);
+    let sticky = h.flags.contains(RegExpFlags::STICKY);
+    let body = h.body;
+    let body_start = if sticky {
+        0
+    } else if body.len() >= 11
+        && Op::decode(body[0]) == Some(SplitGoto)
+        && jump(body, 1) == Some(11)
+        && Op::decode(body[5]) == Some(Any)
+        && Op::decode(body[6]) == Some(Goto)
+        && jump(body, 7) == Some(0)
+    {
+        11
+    } else {
+        return FastMatch::None;
+    };
+    if body.len() < body_start + 2
+        || Op::decode(body[body_start]) != Some(SaveStart)
+        || body[body_start + 1] != 0
+    {
+        return FastMatch::None;
+    }
+    let after_save = body_start + 2;
+    if h.captures == 1 && h.registers == 0 {
+        let mut units = [0u16; FAST_LITERAL_MAX];
+        let mut len = 0usize;
+        let mut all_latin1 = true;
+        let mut pc = after_save;
+        while pc < body.len() {
+            match Op::decode(body[pc]) {
+                Some(Char) => {
+                    let c = read16(body, pc + 1);
+                    if (unicode && is_surrogate_u16(c)) || len >= FAST_LITERAL_MAX {
+                        break;
+                    }
+                    units[len] = c;
+                    len += 1;
+                    all_latin1 &= c <= 0xff;
+                    pc += 3;
+                }
+                Some(Char32) => {
+                    let cp = read32(body, pc + 1);
+                    if cp <= 0xffff {
+                        let c = cp as u16;
+                        if (unicode && is_surrogate_u16(c)) || len >= FAST_LITERAL_MAX {
+                            break;
+                        }
+                        units[len] = c;
+                        len += 1;
+                        all_latin1 &= c <= 0xff;
+                    } else if cp <= 0x10ffff {
+                        if len + 2 > FAST_LITERAL_MAX {
+                            break;
+                        }
+                        let v = cp - 0x10000;
+                        units[len] = 0xd800 | (v >> 10) as u16;
+                        units[len + 1] = 0xdc00 | (v & 0x3ff) as u16;
+                        len += 2;
+                        all_latin1 = false;
+                    } else {
+                        break;
+                    }
+                    pc += 5;
+                }
+                Some(SaveEnd)
+                    if body[pc + 1] == 0
+                        && pc + 3 == body.len()
+                        && Op::decode(body[pc + 2]) == Some(Match) =>
+                {
+                    if len > 0 {
+                        if all_latin1 {
+                            let mut bytes = [0u8; FAST_LITERAL_MAX];
+                            for (dst, &src) in bytes.iter_mut().zip(units.iter()).take(len) {
+                                *dst = src as u8;
+                            }
+                            return FastMatch::LiteralLatin1 {
+                                bytes,
+                                len: len as u8,
+                                sticky,
+                            };
+                        }
+                        return FastMatch::LiteralUtf16 {
+                            units,
+                            len: len as u8,
+                            sticky,
+                        };
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+    if !sticky && after_save + 3 <= body.len() && Op::decode(body[after_save]) == Some(Char) {
+        let unit = read16(body, after_save + 1);
+        if !unicode || !is_surrogate_u16(unit) {
+            return FastMatch::PrefixChar { unit };
+        }
+    }
+    FastMatch::None
+}
 
 macro_rules! opcodes {
     ($($op:ident = $size:literal),+ $(,)?) => {

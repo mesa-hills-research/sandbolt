@@ -5,7 +5,7 @@ use qjs_unicode::{
 use crate::ledger::TrackedBox;
 use crate::object::{ObjectData, ObjectFlags, StringIteratorData, StringObjectData};
 use crate::ops::convert::{space, to_integer_or_infinity, to_length, to_number, to_uint32};
-use crate::string::JsString;
+use crate::string::{INLINE_LATIN1_CAPACITY, INLINE_UTF16_CAPACITY, JsString};
 use crate::symbol::SymbolDescription;
 use crate::value::ValueKind;
 
@@ -187,11 +187,18 @@ pub(super) fn dispatch<'s>(
         53 => return next(ctx, this),
         _ => (),
     }
-    require_object_coercible(ctx, ctx.get(this))?;
-    if matches!(op, 15 | 16 | 21 | 22 | 23 | 25) {
-        return pattern_method(op, ctx, this, args);
-    }
-    let s = to_string(ctx, this)?;
+    let s = if as_string(ctx.get(this)).is_some() {
+        if matches!(op, 15 | 16 | 21 | 22 | 23 | 25) {
+            return pattern_method(op, ctx, this, args);
+        }
+        this
+    } else {
+        require_object_coercible(ctx, ctx.get(this))?;
+        if matches!(op, 15 | 16 | 21 | 22 | 23 | 25) {
+            return pattern_method(op, ctx, this, args);
+        }
+        to_string(ctx, this)?
+    };
     if op == 52 {
         return iterator(ctx, s);
     }
@@ -304,19 +311,275 @@ fn raw<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>) -> JsResult<Value> {
     out.value(ctx)
 }
 
+fn append_latin1_bytes(heap: &crate::heap::Heap, id: StrId, out: &mut TrackedVec<u8>) {
+    match heap.string(id) {
+        JsString::InlineLatin1 { len: 1, data, .. } => {
+            out.push_reserved(data[0]);
+        }
+        JsString::InlineLatin1 { len, data, .. } => {
+            let slice = &data[..usize::from(*len)];
+            if slice.len() <= 8 {
+                for &b in slice {
+                    out.push_reserved(b);
+                }
+            } else {
+                out.extend_from_slice(&heap.ledger, slice)
+                    .expect("pre-reserved concat inline latin1");
+            }
+        }
+        JsString::Latin1 { data, .. } => {
+            out.extend_from_slice(&heap.ledger, data)
+                .expect("pre-reserved concat latin1");
+        }
+        JsString::Slice {
+            base, start, len, ..
+        } => {
+            let start = *start as usize;
+            let end = start + *len as usize;
+            let bytes = heap.string(*base).as_latin1().expect("latin1 slice");
+            out.extend_from_slice(&heap.ledger, &bytes[start..end])
+                .expect("pre-reserved concat latin1 slice");
+        }
+        JsString::Rope { .. } => {
+            for unit in heap.string_units(id) {
+                out.push_reserved(unit as u8);
+            }
+        }
+        JsString::Utf16(_) | JsString::InlineUtf16 { .. } => unreachable!("wide string in latin1"),
+    }
+}
+
+fn append_latin1_inline(heap: &crate::heap::Heap, id: StrId, dst: &mut [u8], pos: &mut usize) {
+    match heap.string(id) {
+        JsString::Latin1 { data, .. } => {
+            dst[*pos..*pos + data.len()].copy_from_slice(data);
+            *pos += data.len();
+        }
+        JsString::InlineLatin1 { len, data, .. } => {
+            let len = usize::from(*len);
+            dst[*pos..*pos + len].copy_from_slice(&data[..len]);
+            *pos += len;
+        }
+        JsString::Slice {
+            base, start, len, ..
+        } => {
+            let start = *start as usize;
+            let len = *len as usize;
+            let bytes = heap.string(*base).as_latin1().expect("latin1 slice");
+            dst[*pos..*pos + len].copy_from_slice(&bytes[start..start + len]);
+            *pos += len;
+        }
+        JsString::Rope { .. } => {
+            for unit in heap.string_units(id) {
+                dst[*pos] = unit as u8;
+                *pos += 1;
+            }
+        }
+        JsString::Utf16(_) | JsString::InlineUtf16 { .. } => unreachable!("wide string in latin1"),
+    }
+}
+
+fn append_utf16_units(heap: &crate::heap::Heap, id: StrId, out: &mut TrackedVec<u16>) {
+    match heap.string(id) {
+        JsString::Utf16(data) => {
+            out.extend_from_slice(&heap.ledger, data)
+                .expect("pre-reserved concat utf16");
+        }
+        JsString::InlineUtf16 { len, data } => {
+            out.extend_from_slice(&heap.ledger, &data[..usize::from(*len)])
+                .expect("pre-reserved concat inline utf16");
+        }
+        JsString::Latin1 { data, .. } => {
+            for &b in data.iter() {
+                out.push_reserved(u16::from(b));
+            }
+        }
+        JsString::InlineLatin1 { len, data, .. } => {
+            for &b in &data[..usize::from(*len)] {
+                out.push_reserved(u16::from(b));
+            }
+        }
+        JsString::Slice {
+            base, start, len, ..
+        } => {
+            let start = *start as usize;
+            let end = start + *len as usize;
+            let base = heap.string(*base);
+            if let Some(units) = base.as_utf16() {
+                out.extend_from_slice(&heap.ledger, &units[start..end])
+                    .expect("pre-reserved concat utf16 slice");
+            } else {
+                for &b in &base.as_latin1().unwrap()[start..end] {
+                    out.push_reserved(u16::from(b));
+                }
+            }
+        }
+        JsString::Rope { .. } => {
+            for unit in heap.string_units(id) {
+                out.push_reserved(unit);
+            }
+        }
+    }
+}
+
 fn concat<'s>(ctx: &mut ExecCtx<'_, 's>, s: Handle<'s>, args: Args<'s>) -> JsResult<Value> {
     if args.is_empty() {
         return Ok(ctx.get(s));
+    }
+    if args.len() == 1 {
+        let a0 = args.get(0).unwrap();
+        let a0 = if as_string(ctx.get(a0)).is_some() {
+            a0
+        } else {
+            to_string(ctx, a0)?
+        };
+        let s_len = ctx.heap().string(string_id(ctx.get(s))).len() as usize;
+        let a_len = ctx.heap().string(string_id(ctx.get(a0))).len() as usize;
+        if s_len.saturating_add(a_len) > MAX_STRING_LEN {
+            return Err(string_error(ctx));
+        }
+        let result = ctx.concat_strings(s, a0)?;
+        return Ok(ctx.get(result));
+    }
+    let s_id = string_id(ctx.get(s));
+    let heap = ctx.heap();
+    let s_str = heap.string(s_id);
+    let s_len = s_str.len() as usize;
+    let mut total_len = s_len;
+    let mut any_wide = s_str.is_wide();
+    let mut all_ascii = s_str.is_ascii()
+        || matches!(s_str, JsString::Slice { base, is_wide: false, .. } if heap.string(*base).is_ascii());
+    let mut all_strings = true;
+    for i in 0..args.len() {
+        if let Some(id) = as_string(ctx.get(args.get(i).unwrap())) {
+            let st = heap.string(id);
+            total_len = total_len.saturating_add(st.len() as usize);
+            any_wide |= st.is_wide();
+            if all_ascii && !st.is_ascii() {
+                all_ascii = matches!(
+                    st,
+                    JsString::Slice { base, is_wide: false, .. } if heap.string(*base).is_ascii()
+                );
+            }
+        } else {
+            all_strings = false;
+            break;
+        }
+    }
+    if all_strings {
+        if total_len > MAX_STRING_LEN {
+            return Err(string_error(ctx));
+        }
+        if total_len == 0 {
+            return ctx.new_latin1(&[]).map(|h| ctx.get(h));
+        }
+        if total_len == s_len {
+            return Ok(ctx.get(s));
+        }
+        if args.len() >= 1024 || total_len >= 65536 {
+            ctx.check_interrupt()?;
+        }
+        if !any_wide {
+            if total_len <= INLINE_LATIN1_CAPACITY {
+                let mut buf = [0u8; INLINE_LATIN1_CAPACITY];
+                let mut pos = 0;
+                {
+                    let heap = ctx.heap();
+                    append_latin1_inline(heap, s_id, &mut buf, &mut pos);
+                    for i in 0..args.len() {
+                        let id = string_id(ctx.get(args.get(i).unwrap()));
+                        append_latin1_inline(heap, id, &mut buf, &mut pos);
+                    }
+                }
+                if total_len == 1 {
+                    return ctx.new_latin1(&buf[..1]).map(|h| ctx.get(h));
+                }
+                let is_ascii = all_ascii || buf[..total_len].is_ascii();
+                let id = ctx.allocate(|rt| {
+                    rt.heap.strings.insert(
+                        &rt.heap.ledger,
+                        JsString::InlineLatin1 {
+                            len: total_len as u8,
+                            is_ascii,
+                            data: buf,
+                        },
+                    )
+                })?;
+                return Ok(Value::string(id));
+            }
+            let mut data = TrackedVec::new();
+            ctx.allocate(|rt| data.try_reserve_exact(&rt.heap.ledger, total_len))?;
+            {
+                let heap = ctx.heap();
+                append_latin1_bytes(heap, s_id, &mut data);
+                for i in 0..args.len() {
+                    let id = string_id(ctx.get(args.get(i).unwrap()));
+                    append_latin1_bytes(heap, id, &mut data);
+                }
+            }
+            let is_ascii = all_ascii || data.is_ascii();
+            let mut data = Some(data);
+            let id = ctx.allocate(|rt| {
+                rt.heap.strings.try_reserve_slot(&rt.heap.ledger)?;
+                Ok(rt.heap.strings.insert_reserved(JsString::Latin1 {
+                    data: data.take().unwrap(),
+                    is_ascii,
+                }))
+            })?;
+            return Ok(Value::string(id));
+        }
+        if total_len <= INLINE_UTF16_CAPACITY {
+            let mut buf = [0u16; INLINE_UTF16_CAPACITY];
+            let mut pos = 0;
+            {
+                let heap = ctx.heap();
+                for unit in heap.string_units(s_id) {
+                    buf[pos] = unit;
+                    pos += 1;
+                }
+                for i in 0..args.len() {
+                    let id = string_id(ctx.get(args.get(i).unwrap()));
+                    for unit in heap.string_units(id) {
+                        buf[pos] = unit;
+                        pos += 1;
+                    }
+                }
+            }
+            return ctx.new_utf16(&buf[..total_len]).map(|h| ctx.get(h));
+        }
+        let mut data = TrackedVec::new();
+        ctx.allocate(|rt| data.try_reserve_exact(&rt.heap.ledger, total_len))?;
+        {
+            let heap = ctx.heap();
+            append_utf16_units(heap, s_id, &mut data);
+            for i in 0..args.len() {
+                let id = string_id(ctx.get(args.get(i).unwrap()));
+                append_utf16_units(heap, id, &mut data);
+            }
+        }
+        let mut data = Some(data);
+        let id = ctx.allocate(|rt| {
+            rt.heap.strings.try_reserve_slot(&rt.heap.ledger)?;
+            Ok(rt
+                .heap
+                .strings
+                .insert_reserved(JsString::Utf16(data.take().unwrap())))
+        })?;
+        return Ok(Value::string(id));
     }
     let mut out = Builder::new();
     out.string(ctx, ctx.get(s))?;
     for i in 0..args.len() {
         let arg = ctx.get(args.get(i).unwrap());
-        ctx.with_scope(|ctx| {
-            let arg = ctx.root(arg)?;
-            let arg = to_string(ctx, arg)?;
-            out.string(ctx, ctx.get(arg))
-        })?;
+        if as_string(arg).is_some() {
+            out.string(ctx, arg)?;
+        } else {
+            ctx.with_scope(|ctx| {
+                let arg = ctx.root(arg)?;
+                let arg = to_string(ctx, arg)?;
+                out.string(ctx, ctx.get(arg))
+            })?;
+        }
     }
     out.value(ctx)
 }
@@ -376,24 +639,52 @@ fn slice<'s>(
     b: Option<Handle<'s>>,
 ) -> JsResult<Value> {
     ctx.check_interrupt()?;
-    let start = a.map_or(Ok(0.0), |a| to_integer_or_infinity(ctx, a))?;
     let n = ctx.heap().string(string_id(ctx.get(s))).len() as usize;
-    let end = match b {
-        Some(b) if ctx.get(b) != Value::UNDEFINED => to_integer_or_infinity(ctx, b)?,
-        _ => n as f64,
-    };
-    let (start, end) = match op {
-        24 => {
-            let start = relative(start, n);
-            (start, relative(end, n).max(start))
-        }
-        27 => {
-            let (start, end) = (bounded(start, n), bounded(end, n));
-            (start.min(end), start.max(end))
-        }
-        _ => {
-            let start = relative(start, n);
-            (start, start + bounded(end, n - start))
+    let (start, end) = if op == 24 {
+        let start = match a {
+            None => 0,
+            Some(a) => match ctx.get(a).decode() {
+                ValueKind::Int32(v) => {
+                    if v < 0 {
+                        (n as i64 + i64::from(v)).max(0) as usize
+                    } else {
+                        (v as usize).min(n)
+                    }
+                }
+                ValueKind::Undefined => 0,
+                _ => relative(to_integer_or_infinity(ctx, a)?, n),
+            },
+        };
+        let end = match b {
+            None => n,
+            Some(b) => match ctx.get(b).decode() {
+                ValueKind::Undefined => n,
+                ValueKind::Int32(v) => {
+                    if v < 0 {
+                        (n as i64 + i64::from(v)).max(0) as usize
+                    } else {
+                        (v as usize).min(n)
+                    }
+                }
+                _ => relative(to_integer_or_infinity(ctx, b)?, n),
+            },
+        };
+        (start, end.max(start))
+    } else {
+        let start = a.map_or(Ok(0.0), |a| to_integer_or_infinity(ctx, a))?;
+        let end = match b {
+            Some(b) if ctx.get(b) != Value::UNDEFINED => to_integer_or_infinity(ctx, b)?,
+            _ => n as f64,
+        };
+        match op {
+            27 => {
+                let (start, end) = (bounded(start, n), bounded(end, n));
+                (start.min(end), start.max(end))
+            }
+            _ => {
+                let start = relative(start, n);
+                (start, start + bounded(end, n - start))
+            }
         }
     };
     let result = ctx.string_slice(s, start, end)?;

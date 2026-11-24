@@ -91,6 +91,103 @@ fn own(heap: &Heap, id: ObjId, key: PropKey) -> Option<(Value, PropFlags)> {
     Some((object.props[index], flags))
 }
 
+fn alloc_auto_native_name(
+    heap: &mut Heap,
+    key: PropKey,
+    prefix: Option<&str>,
+) -> crate::ledger::AllocResult<StrId> {
+    let pref = prefix.unwrap_or("");
+    let pref_bytes = pref.as_bytes();
+    let from_prefixed_ascii = |heap: &mut Heap, text: &str| {
+        if pref_bytes.is_empty() {
+            let s = JsString::from_str(&heap.ledger, text)?;
+            return heap.strings.insert(&heap.ledger, s);
+        }
+        let total = pref_bytes.len() + text.len();
+        if total <= 64 {
+            let mut buf = [0u8; 64];
+            buf[..pref_bytes.len()].copy_from_slice(pref_bytes);
+            buf[pref_bytes.len()..total].copy_from_slice(text.as_bytes());
+            let s = JsString::from_latin1(&heap.ledger, &buf[..total])?;
+            heap.strings.insert(&heap.ledger, s)
+        } else {
+            let s = JsString::from_latin1_iter(
+                &heap.ledger,
+                total,
+                pref_bytes.iter().chain(text.as_bytes()).copied(),
+            )?;
+            heap.strings.insert(&heap.ledger, s)
+        }
+    };
+    match key.decode() {
+        KeyKind::String(atom) => {
+            if let Some(id) = heap.atoms.dynamic_string(atom) {
+                if pref_bytes.is_empty() {
+                    return Ok(id);
+                }
+                let wide = heap.string(id).is_wide();
+                let len = heap.string(id).len() as usize;
+                let s = JsString::from_units(
+                    &heap.ledger,
+                    pref_bytes.len() + len,
+                    wide,
+                    pref_bytes
+                        .iter()
+                        .map(|&b| u16::from(b))
+                        .chain(heap.string_units(id)),
+                )?;
+                heap.strings.insert(&heap.ledger, s)
+            } else {
+                let text = AtomTable::builtin(atom).expect("missing builtin atom");
+                from_prefixed_ascii(heap, text)
+            }
+        }
+        KeyKind::Symbol(token) => {
+            let sym_id = heap
+                .symbol_registry
+                .from_token(token)
+                .expect("missing symbol");
+            match heap.symbols.get(sym_id).unwrap().description {
+                SymbolDescription::None => {
+                    let s = JsString::from_latin1(&heap.ledger, pref_bytes)?;
+                    heap.strings.insert(&heap.ledger, s)
+                }
+                SymbolDescription::WellKnown(wk) => {
+                    let desc = wk.description().as_bytes();
+                    let total = pref_bytes.len() + desc.len() + 2;
+                    let mut buf = [0u8; 64];
+                    debug_assert!(total <= buf.len());
+                    buf[..pref_bytes.len()].copy_from_slice(pref_bytes);
+                    buf[pref_bytes.len()] = b'[';
+                    buf[pref_bytes.len() + 1..pref_bytes.len() + 1 + desc.len()]
+                        .copy_from_slice(desc);
+                    buf[total - 1] = b']';
+                    let s = JsString::from_latin1(&heap.ledger, &buf[..total])?;
+                    heap.strings.insert(&heap.ledger, s)
+                }
+                SymbolDescription::String(str_id) => {
+                    let s = JsString::from_units(
+                        &heap.ledger,
+                        pref_bytes.len() + heap.string(str_id).len() as usize + 2,
+                        heap.string(str_id).is_wide(),
+                        pref_bytes
+                            .iter()
+                            .map(|&b| u16::from(b))
+                            .chain(std::iter::once(u16::from(b'[')))
+                            .chain(heap.string_units(str_id))
+                            .chain(std::iter::once(u16::from(b']'))),
+                    )?;
+                    heap.strings.insert(&heap.ledger, s)
+                }
+            }
+        }
+        KeyKind::Index(index) => {
+            let text = index.to_string();
+            from_prefixed_ascii(heap, &text)
+        }
+    }
+}
+
 #[cold]
 fn materialize_auto_native(
     ctx: &mut ExecCtx<'_, '_>,
@@ -111,55 +208,7 @@ fn materialize_auto_native(
             .expect("missing auto-native realm");
         ctx.allocate(|runtime| {
             let heap = &mut runtime.heap;
-            let name_id = match key.decode() {
-                KeyKind::String(atom) => {
-                    if let Some(id) = heap.atoms.dynamic_string(atom) {
-                        id
-                    } else {
-                        let text = AtomTable::builtin(atom).expect("missing builtin atom");
-                        let s = JsString::from_str(&heap.ledger, text)?;
-                        heap.strings.insert(&heap.ledger, s)?
-                    }
-                }
-                KeyKind::Symbol(token) => {
-                    let sym_id = heap
-                        .symbol_registry
-                        .from_token(token)
-                        .expect("missing symbol");
-                    match heap.symbols.get(sym_id).unwrap().description {
-                        SymbolDescription::None => {
-                            let s = JsString::from_str(&heap.ledger, "")?;
-                            heap.strings.insert(&heap.ledger, s)?
-                        }
-                        SymbolDescription::WellKnown(wk) => {
-                            let desc = wk.description().as_bytes();
-                            let mut buf = [0u8; 64];
-                            debug_assert!(desc.len() + 2 <= buf.len());
-                            buf[0] = b'[';
-                            buf[1..1 + desc.len()].copy_from_slice(desc);
-                            buf[1 + desc.len()] = b']';
-                            let s = JsString::from_latin1(&heap.ledger, &buf[..desc.len() + 2])?;
-                            heap.strings.insert(&heap.ledger, s)?
-                        }
-                        SymbolDescription::String(str_id) => {
-                            let s = JsString::from_units(
-                                &heap.ledger,
-                                heap.string(str_id).len() as usize + 2,
-                                heap.string(str_id).is_wide(),
-                                std::iter::once(u16::from(b'['))
-                                    .chain(heap.string_units(str_id))
-                                    .chain(std::iter::once(u16::from(b']'))),
-                            )?;
-                            heap.strings.insert(&heap.ledger, s)?
-                        }
-                    }
-                }
-                KeyKind::Index(index) => {
-                    let text = index.to_string();
-                    let s = JsString::from_str(&heap.ledger, &text)?;
-                    heap.strings.insert(&heap.ledger, s)?
-                }
-            };
+            let name_id = alloc_auto_native_name(heap, key, None)?;
             let shape = heap.realm(realm_id).native_fn_shape;
             let mut props = TrackedVec::new();
             props.try_reserve_exact(&heap.ledger, 2)?;
@@ -190,6 +239,78 @@ fn materialize_auto_native(
     })
 }
 
+#[cold]
+fn materialize_accessor_fn(
+    ctx: &mut ExecCtx<'_, '_>,
+    acc_id: AccId,
+    key: PropKey,
+    is_setter: bool,
+    raw: Value,
+) -> JsResult<Value> {
+    let (fn_id_raw, length, realm_index) =
+        raw.as_auto_native().expect("expected auto-native accessor");
+    let prefix = if is_setter { "set " } else { "get " };
+    ctx.with_scope(|ctx| {
+        ctx.root(Value::accessor(acc_id))?;
+        root_key(ctx, key)?;
+        let realm_id = ctx
+            .runtime
+            .realms
+            .iter()
+            .copied()
+            .find(|id| id.index() == realm_index)
+            .expect("missing auto-native realm");
+        ctx.allocate(|runtime| {
+            let heap = &mut runtime.heap;
+            let name_id = alloc_auto_native_name(heap, key, Some(prefix))?;
+            let shape = heap.realm(realm_id).native_fn_shape;
+            let mut props = TrackedVec::new();
+            props.try_reserve_exact(&heap.ledger, 2)?;
+            props.push_reserved(Value::int32(i32::from(length)));
+            props.push_reserved(Value::string(name_id));
+            let fn_obj = heap.objects.insert(
+                &heap.ledger,
+                JsObject {
+                    shape,
+                    props,
+                    flags: ObjectFlags::EXTENSIBLE,
+                    data: ObjectData::NativeFunction(NativeFunctionData {
+                        function: NativeFnId(fn_id_raw),
+                        realm: realm_id,
+                    }),
+                },
+            )?;
+            let value = Value::object(fn_obj);
+            let acc = heap.accessors.get_mut(acc_id).unwrap();
+            let slot = if is_setter {
+                &mut acc.setter
+            } else {
+                &mut acc.getter
+            };
+            if *slot == raw {
+                *slot = value;
+            }
+            Ok(value)
+        })
+    })
+}
+
+fn materialize_accessor(
+    ctx: &mut ExecCtx<'_, '_>,
+    acc_id: AccId,
+    key: PropKey,
+) -> JsResult<()> {
+    let getter = ctx.heap().accessors.get(acc_id).unwrap().getter;
+    if getter.is_auto_native() {
+        materialize_accessor_fn(ctx, acc_id, key, false, getter)?;
+    }
+    let setter = ctx.heap().accessors.get(acc_id).unwrap().setter;
+    if setter.is_auto_native() {
+        materialize_accessor_fn(ctx, acc_id, key, true, setter)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn define_auto_native(
     ctx: &mut ExecCtx<'_, '_>,
     id: ObjId,
@@ -208,6 +329,35 @@ pub(crate) fn define_auto_native(
     })
 }
 
+pub(crate) fn define_auto_accessor(
+    ctx: &mut ExecCtx<'_, '_>,
+    id: ObjId,
+    key: PropKey,
+    flags: PropFlags,
+    getter: Value,
+    setter: Value,
+) -> JsResult<()> {
+    ctx.with_scope(|ctx| {
+        ctx.root(Value::object(id))?;
+        ctx.root(getter)?;
+        ctx.root(setter)?;
+        root_key(ctx, key)?;
+        let acc_id = ctx.allocate(|runtime| {
+            runtime
+                .heap
+                .accessors
+                .insert(&runtime.heap.ledger, Accessor { getter, setter })
+        })?;
+        let value = Value::accessor(acc_id);
+        ctx.root(value)?;
+        define_slot(ctx, id, ShapeProp { key, flags }, value)?;
+        if !ctx.heap().building_shapes {
+            invalidate_array_prototypes(ctx, id);
+        }
+        Ok(())
+    })
+}
+
 fn describe(heap: &Heap, value: Value, flags: PropFlags) -> PropertyDescriptor {
     let mut desc = PropertyDescriptor {
         enumerable: Some(flags.contains(PropFlags::ENUMERABLE)),
@@ -216,8 +366,10 @@ fn describe(heap: &Heap, value: Value, flags: PropFlags) -> PropertyDescriptor {
     };
     if let ValueKind::Accessor(id) = value.decode() {
         let accessor = heap.accessors.get(id).unwrap();
-        desc.get = Some(accessor.getter.map_or(Value::UNDEFINED, Value::object));
-        desc.set = Some(accessor.setter.map_or(Value::UNDEFINED, Value::object));
+        debug_assert!(!accessor.getter.is_auto_native());
+        debug_assert!(!accessor.setter.is_auto_native());
+        desc.get = Some(accessor.getter);
+        desc.set = Some(accessor.setter);
     } else {
         desc.value = Some(value);
         desc.writable = Some(flags.contains(PropFlags::WRITABLE));
@@ -374,6 +526,8 @@ fn own_descriptor(
     if let Some((mut value, flags)) = own(ctx.heap(), id, key) {
         if value.is_auto_native() {
             value = materialize_auto_native(ctx, id, key, value)?;
+        } else if let ValueKind::Accessor(acc) = value.decode() {
+            materialize_accessor(ctx, acc, key)?;
         }
         let value = mapped_parameter(ctx.heap(), id, key)
             .map_or(value, |id| crate::vm::exec::read_ref(ctx, id));
@@ -666,8 +820,12 @@ fn get_from<'s>(
                 return materialize_auto_native(ctx, id, key, value);
             }
             if let ValueKind::Accessor(acc) = value.decode() {
-                if let Some(getter) = ctx.heap().accessors.get(acc).unwrap().getter {
-                    let callee = ctx.root(Value::object(getter))?;
+                let mut getter = ctx.heap().accessors.get(acc).unwrap().getter;
+                if getter.is_auto_native() {
+                    getter = materialize_accessor_fn(ctx, acc, key, false, getter)?;
+                }
+                if getter != Value::UNDEFINED {
+                    let callee = ctx.root(getter)?;
                     return super::call::call(ctx, callee, receiver, Args::empty());
                 }
                 return Ok(Value::UNDEFINED);
@@ -861,10 +1019,14 @@ fn set_from<'s>(
         }
         if let Some((old, flags)) = own(ctx.heap(), id, key) {
             if let ValueKind::Accessor(acc) = old.decode() {
-                let Some(setter) = ctx.heap().accessors.get(acc).unwrap().setter else {
+                let mut setter = ctx.heap().accessors.get(acc).unwrap().setter;
+                if setter.is_auto_native() {
+                    setter = materialize_accessor_fn(ctx, acc, key, true, setter)?;
+                }
+                if setter == Value::UNDEFINED {
                     return Ok(false);
-                };
-                let callee = ctx.root(Value::object(setter))?;
+                }
+                let callee = ctx.root(setter)?;
                 let args = ctx.args(&[value])?;
                 super::call::call(ctx, callee, receiver, args)?;
                 return Ok(true);
@@ -1313,13 +1475,16 @@ fn define_raw(
     {
         return Ok(false);
     }
-    if let Some((val, flags)) = old
-        && val.is_auto_native()
-        && (!flags.contains(PropFlags::CONFIGURABLE)
-            || (!desc.is_accessor() && desc.value.is_none()))
-    {
-        let materialized = materialize_auto_native(ctx, id, key, val)?;
-        old = Some((materialized, flags));
+    if let Some((val, flags)) = old {
+        if val.is_auto_native()
+            && (!flags.contains(PropFlags::CONFIGURABLE)
+                || (!desc.is_accessor() && desc.value.is_none()))
+        {
+            let materialized = materialize_auto_native(ctx, id, key, val)?;
+            old = Some((materialized, flags));
+        } else if let ValueKind::Accessor(acc) = val.decode() {
+            materialize_accessor(ctx, acc, key)?;
+        }
     }
     let extensible =
         is_private(ctx.heap(), key) || ctx.heap().object(id).flags.contains(ObjectFlags::EXTENSIBLE);
@@ -1351,8 +1516,16 @@ fn define_raw(
         !accessor && desc.writable.or(previous.writable).unwrap_or(false),
     );
     let value = if accessor {
-        let getter = desc.get.or(previous.get).and_then(Value::as_object);
-        let setter = desc.set.or(previous.set).and_then(Value::as_object);
+        let getter = desc
+            .get
+            .or(previous.get)
+            .filter(|v| v.as_object().is_some())
+            .unwrap_or(Value::UNDEFINED);
+        let setter = desc
+            .set
+            .or(previous.set)
+            .filter(|v| v.as_object().is_some())
+            .unwrap_or(Value::UNDEFINED);
         let existing = old.and_then(|(value, _)| {
             let ValueKind::Accessor(id) = value.decode() else {
                 return None;

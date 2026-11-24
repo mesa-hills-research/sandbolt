@@ -91,7 +91,7 @@ impl<'a> RegExpInput<'a> {
 }
 
 /// Compiled RegExp bytecode.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CompiledRegExp {
     pub bytecode: Vec<u8>,
     pub flags: RegExpFlags,
@@ -99,12 +99,58 @@ pub struct CompiledRegExp {
     pub capture_count: u16,
     /// Names indexed by capture number. Capture zero has no name.
     pub group_names: Vec<Option<String>>,
+    pub(crate) plan: bytecode::CompiledPlan,
 }
+
+impl PartialEq for CompiledRegExp {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytecode == other.bytecode
+            && self.flags == other.flags
+            && self.capture_count == other.capture_count
+            && self.group_names == other.group_names
+    }
+}
+
+impl Eq for CompiledRegExp {}
 
 /// Capture spans `(start, end)` in code-unit indices (`None` if unmatched).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchResult {
     pub captures: Vec<Option<(usize, usize)>>,
+}
+
+pub(crate) const INLINE_CAPTURES: usize = 8;
+
+/// Capture spans stored inline for common patterns with at most 8 captures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchSpans {
+    Inline {
+        len: u8,
+        captures: [Option<(usize, usize)>; INLINE_CAPTURES],
+    },
+    Heap(Vec<Option<(usize, usize)>>),
+}
+
+impl MatchSpans {
+    pub(crate) fn single(start: usize, end: usize) -> Self {
+        let mut captures = [None; INLINE_CAPTURES];
+        captures[0] = Some((start, end));
+        Self::Inline { len: 1, captures }
+    }
+
+    pub fn as_slice(&self) -> &[Option<(usize, usize)>] {
+        match self {
+            Self::Inline { len, captures } => &captures[..usize::from(*len)],
+            Self::Heap(v) => v,
+        }
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Inline { .. } => 0,
+            Self::Heap(v) => v.capacity() * std::mem::size_of::<Option<(usize, usize)>>(),
+        }
+    }
 }
 
 /// Compile an ECMAScript regular expression pattern.
@@ -132,6 +178,26 @@ pub fn exec(
     vm::exec(re, input, start_index, host)
 }
 
+/// Execute a compiled RegExp and return capture spans inline when possible.
+pub fn exec_spans(
+    re: &CompiledRegExp,
+    input: RegExpInput<'_>,
+    start_index: usize,
+    host: &mut dyn RegExpHost,
+) -> Result<Option<MatchSpans>, RegExpError> {
+    vm::exec_spans(re, input, start_index, host)
+}
+
+/// Execute a compiled RegExp and return only capture 0 `(start, end)`.
+pub fn exec_single(
+    re: &CompiledRegExp,
+    input: RegExpInput<'_>,
+    start_index: usize,
+    host: &mut dyn RegExpHost,
+) -> Result<Option<(usize, usize)>, RegExpError> {
+    vm::exec_single(re, input, start_index, host)
+}
+
 /// Validate the header, instructions, branch targets and group-name records.
 pub fn check_bytecode(bytecode: &[u8]) -> Result<(), RegExpError> {
     bytecode::validate(bytecode, &mut alloc::Budget::new(&mut UnlimitedRegExpHost)).map(|_| ())
@@ -148,11 +214,13 @@ impl CompiledRegExp {
         let group_names = compiler::collect_names(&header, &mut budget)?;
         let flags = header.flags;
         let capture_count = header.captures as u16;
+        let plan = bytecode::CompiledPlan::from_validated(&bytecode, &header);
         Ok(Self {
             bytecode,
             flags,
             capture_count,
             group_names,
+            plan,
         })
     }
 }

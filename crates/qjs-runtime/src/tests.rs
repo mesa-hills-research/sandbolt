@@ -956,3 +956,105 @@ fn dictionary_shapes_preserve_key_order_across_in_place_deletes_and_reinsertion(
         )
         .unwrap();
 }
+
+#[test]
+fn lazy_auto_native_accessors_materialize_independently_in_owner_realm() {
+    let mut engine = crate::api::JsEngine::new(EngineLimits::default()).unwrap();
+    let count_lazy_accessors = |rt: &Runtime| -> usize {
+        rt.heap
+            .accessors
+            .iter()
+            .map(|(_, acc)| {
+                usize::from(acc.getter.is_auto_native()) + usize::from(acc.setter.is_auto_native())
+            })
+            .sum()
+    };
+    let initial_lazy = count_lazy_accessors(engine.runtime());
+    assert!(
+        initial_lazy >= 40,
+        "expected >=40 lazy builtin accessors, got {initial_lazy}"
+    );
+
+    // Invoking a getter materializes only that getter, keeping its setter and other accessors lazy.
+    engine
+        .eval(
+            "const m = new Map([['a', 1]]);\n\
+             if (m.size !== 1) throw new Error('bad size');\n\
+             const d1 = Object.getOwnPropertyDescriptor(Object.prototype, '__proto__');\n\
+             const d2 = Object.getOwnPropertyDescriptor(Object.prototype, '__proto__');\n\
+             if (!(d1.get === d2.get && d1.set === d2.set\n\
+               && d1.get.name === 'get __proto__' && d1.get.length === 0\n\
+               && d1.set.name === 'set __proto__' && d1.set.length === 1)) {\n\
+               throw new Error('__proto__ accessor metadata mismatch');\n\
+             }\n\
+             const sp = Object.getOwnPropertyDescriptor(RegExp, Symbol.species);\n\
+             if (!(sp.get.name === 'get [Symbol.species]' && sp.get.length === 0 && sp.set === undefined)) {\n\
+               throw new Error('species accessor metadata mismatch');\n\
+             }\n\
+             Object.defineProperty(Map.prototype, 'size', { enumerable: true });\n\
+             const sz = Object.getOwnPropertyDescriptor(Map.prototype, 'size');\n\
+             if (!(sz.enumerable === true && sz.get.name === 'get size' && sz.get.length === 0)) {\n\
+               throw new Error('partial redefine accessor mismatch');\n\
+             }",
+            crate::api::EvalOptions::default(),
+        )
+        .unwrap();
+    assert!(count_lazy_accessors(engine.runtime()) < initial_lazy);
+
+    // Cross-realm accessor materialization uses the owning realm's Function.prototype.
+    let default_realm = engine.default_realm();
+    let other_realm = engine
+        .runtime_mut()
+        .with_scope(default_realm, |ctx| ctx.create_realm_with_builtins())
+        .unwrap();
+    let other_map_proto = engine.runtime().heap().realm(other_realm).map_proto;
+    let other_fn_proto = engine.runtime().heap().realm(other_realm).function_proto;
+    let same_proto = engine.runtime_mut().with_scope(default_realm, |ctx| {
+        let proto = ctx.root(Value::object(other_map_proto)).unwrap();
+        let size_key = ctx.intern_str("size").unwrap();
+        let desc = get_own_property_descriptor(ctx, proto, size_key)
+            .unwrap()
+            .unwrap();
+        let getter_id = desc.get.unwrap().as_object().unwrap();
+        ctx.heap().shape(ctx.heap().object(getter_id).shape).proto == Some(other_fn_proto)
+    });
+    assert!(same_proto);
+}
+
+#[test]
+fn fast_regexp_concat_and_null_proto_object_literals() {
+    let mut engine = crate::api::JsEngine::new(EngineLimits::default()).unwrap();
+    engine
+        .eval(
+            "const o1 = { __proto__: null };\n\
+             const o2 = { __proto__: null, a: 1 };\n\
+             if (!(Object.getPrototypeOf(o1) === null && Object.getPrototypeOf(o2) === null && o2.a === 1)) {\n\
+               throw new Error('null proto mismatch');\n\
+             }\n\
+             const s = 'the quick brown fox jumped over the lazy dog';\n\
+             const m1 = /the quick brown fox/.exec(s);\n\
+             if (!(m1 && m1[0] === 'the quick brown fox' && m1.index === 0 && m1.input === s && m1.groups === undefined)) {\n\
+               throw new Error('ascii regexp mismatch');\n\
+             }\n\
+             const su = 'the quick brown ᶠᵒˣ jumped over the lazy ᵈᵒᵍ';\n\
+             const m2 = /the quick brown ᶠᵒˣ/.exec(su);\n\
+             if (!(m2 && m2[0] === 'the quick brown ᶠᵒˣ' && m2.index === 0 && m2.input === su)) {\n\
+               throw new Error('utf16 regexp mismatch');\n\
+             }\n\
+             const re = /fox/gy;\n\
+             re.lastIndex = 16;\n\
+             const m3 = re.exec(s);\n\
+             if (!(m3 && m3[0] === 'fox' && m3.index === 16 && re.lastIndex === 19)) {\n\
+               throw new Error('sticky regexp mismatch');\n\
+             }\n\
+             if ('a'.concat('b', 'c', 'd') !== 'abcd') throw new Error('inline concat');\n\
+             const long = 'x'.concat(...Array(40).fill('y'));\n\
+             if (!(long.length === 41 && long[0] === 'x' && long[40] === 'y')) throw new Error('long concat');\n\
+             if ('a'.concat('ᶠ', 'z') !== 'aᶠz') throw new Error('wide concat');\n\
+             const order = [];\n\
+             const res = 's'.concat({ toString() { order.push(1); return '1'; } }, '2', { toString() { order.push(2); return '3'; } });\n\
+             if (!(res === 's123' && order.join(',') === '1,2')) throw new Error('concat coercion order');",
+            crate::api::EvalOptions::default(),
+        )
+        .unwrap();
+}

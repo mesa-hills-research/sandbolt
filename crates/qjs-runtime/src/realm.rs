@@ -131,6 +131,9 @@ macro_rules! intrinsics {
             pub(crate) native_fn_shape: ShapeId,
             pub(crate) ctor_proto_shape: Option<ShapeId>,
             pub(crate) ctor_shape: ShapeId,
+            pub(crate) regexp_shape: Option<ShapeId>,
+            pub(crate) regexp_result_shape: Option<ShapeId>,
+            pub(crate) null_proto_shape: Option<ShapeId>,
         }
 
         impl Trace for Realm {
@@ -163,6 +166,9 @@ macro_rules! intrinsics {
                 self.native_fn_shape.trace(tracer);
                 self.ctor_proto_shape.trace(tracer);
                 self.ctor_shape.trace(tracer);
+                self.regexp_shape.trace(tracer);
+                self.regexp_result_shape.trace(tracer);
+                self.null_proto_shape.trace(tracer);
             }
         }
 
@@ -260,6 +266,7 @@ macro_rules! intrinsics {
                 time_origin_epoch_ms,
                 oom_error, stack_error,
                 native_fn_shape, ctor_proto_shape, ctor_shape,
+                regexp_shape: None, regexp_result_shape: None, null_proto_shape: None,
             });
             let prev_building = heap.building_shapes;
             heap.building_shapes = true;
@@ -347,6 +354,88 @@ impl Realm {
             ErrorKind::Suppressed => self.suppressed_error_proto,
         }
     }
+}
+
+pub(crate) fn ensure_regexp_shape(ctx: &mut ExecCtx<'_, '_>) -> JsResult<ShapeId> {
+    let realm = ctx.realm_id();
+    if let Some(shape) = ctx.heap().realm(realm).regexp_shape {
+        return Ok(shape);
+    }
+    let proto = ctx.heap().realm(realm).regexp_proto;
+    let shape = ctx.allocate(|rt| {
+        let heap = &mut rt.heap;
+        let shape = Shape::build(
+            &heap.ledger,
+            Some(proto),
+            1,
+            [ShapeProp {
+                key: PropKey::atom(Atom(qjs_bytecode::BuiltinAtom::LastIndex as u32)),
+                flags: PropFlags::WRITABLE,
+            }]
+            .into_iter(),
+            0,
+            false,
+        )?;
+        heap.shapes.insert(&heap.ledger, shape)
+    })?;
+    ctx.runtime.heap.realms.get_mut(realm).unwrap().regexp_shape = Some(shape);
+    Ok(shape)
+}
+
+pub(crate) fn ensure_regexp_result_shape(ctx: &mut ExecCtx<'_, '_>) -> JsResult<ShapeId> {
+    let realm = ctx.realm_id();
+    if let Some(shape) = ctx.heap().realm(realm).regexp_result_shape {
+        return Ok(shape);
+    }
+    let proto = ctx.heap().realm(realm).array_proto;
+    let shape = ctx.allocate(|rt| {
+        let heap = &mut rt.heap;
+        let shape = Shape::build(
+            &heap.ledger,
+            Some(proto),
+            3,
+            [
+                ShapeProp {
+                    key: PropKey::atom(Atom(qjs_bytecode::BuiltinAtom::Index as u32)),
+                    flags: PropFlags::DEFAULT_DATA,
+                },
+                ShapeProp {
+                    key: PropKey::atom(Atom(qjs_bytecode::BuiltinAtom::Input as u32)),
+                    flags: PropFlags::DEFAULT_DATA,
+                },
+                ShapeProp {
+                    key: PropKey::atom(Atom(qjs_bytecode::BuiltinAtom::Groups as u32)),
+                    flags: PropFlags::DEFAULT_DATA,
+                },
+            ]
+            .into_iter(),
+            0,
+            false,
+        )?;
+        heap.shapes.insert(&heap.ledger, shape)
+    })?;
+    ctx.runtime
+        .heap
+        .realms
+        .get_mut(realm)
+        .unwrap()
+        .regexp_result_shape = Some(shape);
+    Ok(shape)
+}
+
+pub(crate) fn ensure_null_proto_shape(ctx: &mut ExecCtx<'_, '_>) -> JsResult<ShapeId> {
+    let realm = ctx.realm_id();
+    if let Some(shape) = ctx.heap().realm(realm).null_proto_shape {
+        return Ok(shape);
+    }
+    let shape = ctx.allocate(|rt| rt.heap.empty_shape(None))?;
+    ctx.runtime
+        .heap
+        .realms
+        .get_mut(realm)
+        .unwrap()
+        .null_proto_shape = Some(shape);
+    Ok(shape)
 }
 
 fn bootstrap_ctor(

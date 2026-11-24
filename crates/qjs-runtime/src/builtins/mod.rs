@@ -23,7 +23,9 @@ pub mod vm_internal;
 use crate::atom::{Atom, AtomTable, KeyKind, PropKey};
 use crate::ledger::TrackedVec;
 use crate::object::{JsObject, NativeFunctionData, ObjectData, ObjectFlags};
-use crate::ops::property::{PropertyDescriptor, define_auto_native, define_own_property};
+use crate::ops::property::{
+    PropertyDescriptor, define_auto_accessor, define_auto_native, define_own_property,
+};
 use crate::realm::NativeFnId;
 use crate::root::{Args, ExecCtx, Handle};
 use crate::shape::PropFlags;
@@ -351,7 +353,9 @@ pub fn install_method<'s>(
     )
 }
 
-/// Installs an accessor property (getter and optional setter) on `target`.
+/// Installs an accessor property (getter and optional setter) on `target`,
+/// using lazy `AutoNative` storage when `target` is a fresh property on a normal
+/// object and the getter/setter names match `"get "` / `"set "` + `key`.
 pub fn install_accessor<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     target: Handle<'s>,
@@ -360,6 +364,57 @@ pub fn install_accessor<'s>(
     setter: Option<(NativeFnId, &str)>,
     configurable: bool,
 ) -> JsResult<()> {
+    let target_id = ctx.object_id(target)?;
+    let realm_index = ctx.realm_id().index();
+    let (can_auto, get_auto, set_auto) = {
+        let heap = ctx.heap();
+        let object = heap.object(target_id);
+        let can_auto = !matches!(
+            object.data,
+            ObjectData::Proxy(_) | ObjectData::TypedArray(_) | ObjectData::ModuleNamespace(_)
+        ) && key != PropKey::atom(Atom::LENGTH)
+            && heap.array_index(key).is_none()
+            && heap.shape(object.shape).find(key).is_none();
+        if can_auto {
+            let get_auto = getter.and_then(|(id, name)| {
+                name.strip_prefix("get ")
+                    .is_some_and(|rest| name_matches_key(heap, key, rest))
+                    .then(|| Value::auto_native(id.0, 0, realm_index))
+                    .flatten()
+            });
+            let set_auto = setter.and_then(|(id, name)| {
+                name.strip_prefix("set ")
+                    .is_some_and(|rest| name_matches_key(heap, key, rest))
+                    .then(|| Value::auto_native(id.0, 1, realm_index))
+                    .flatten()
+            });
+            (true, get_auto, set_auto)
+        } else {
+            (false, None, None)
+        }
+    };
+    if can_auto && (get_auto.is_some() || set_auto.is_some()) {
+        let get_val = match (getter, get_auto) {
+            (None, _) => Value::UNDEFINED,
+            (_, Some(auto)) => auto,
+            (Some((id, name)), None) => {
+                let func = make_native_fn(ctx, id, name, 0, false)?;
+                ctx.get(func)
+            }
+        };
+        let get_root = ctx.root(get_val)?;
+        let set_val = match (setter, set_auto) {
+            (None, _) => Value::UNDEFINED,
+            (_, Some(auto)) => auto,
+            (Some((id, name)), None) => {
+                let func = make_native_fn(ctx, id, name, 1, false)?;
+                ctx.get(func)
+            }
+        };
+        let mut flags = PropFlags::ACCESSOR;
+        flags.set(PropFlags::CONFIGURABLE, configurable);
+        return define_auto_accessor(ctx, target_id, key, flags, ctx.get(get_root), set_val);
+    }
     let get = match getter {
         Some((id, name)) => Some(make_native_fn(ctx, id, name, 0, false)?),
         None => None,

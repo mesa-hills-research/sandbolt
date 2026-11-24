@@ -1,5 +1,5 @@
 use crate::alloc::Budget;
-use crate::bytecode::{HEADER, Header, Op, atom_effects, read32, register_count};
+use crate::bytecode::{CompiledPlan, HEADER, Header, Op, atom_effects, read32, register_count};
 use crate::class::{Atom, Set};
 use crate::escape::{is_high, is_low, join_surrogates, parse_escape, wtf8};
 use crate::{CompiledRegExp, RegExpError, RegExpFlags, RegExpHost, canonicalize};
@@ -107,11 +107,13 @@ pub(crate) fn compile(
     c.code[..2].copy_from_slice(&c.flags.0.to_ne_bytes());
     let h = Header::parse(&c.code).expect("emitted header");
     let group_names = collect_names(&h, &mut c.budget)?;
+    let plan = CompiledPlan::from_validated(&c.code, &h);
     Ok(CompiledRegExp {
         bytecode: c.code,
         flags: c.flags,
         capture_count: u16::from(c.captures),
         group_names,
+        plan,
     })
 }
 

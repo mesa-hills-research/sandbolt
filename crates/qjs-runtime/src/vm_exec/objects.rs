@@ -1,8 +1,8 @@
 use qjs_bytecode::{BuiltinAtom, Instruction, Opcode, Operands};
 
 use crate::atom::{Atom, KeyKind, PropKey};
-use crate::ledger::TrackedBox;
-use crate::object::{ErrorKind, ObjectData, ObjectFlags, RegExpData, RegExpProgram};
+use crate::ledger::TrackedVec;
+use crate::object::{ErrorKind, JsObject, ObjectData, ObjectFlags, RegExpData, RegExpProgram};
 use crate::ops::{call, convert, property};
 use crate::root::{ExecCtx, Handle};
 use crate::shape::PropFlags;
@@ -55,20 +55,28 @@ fn make_regexp(
     source: Value,
     program: Rc<RegExpProgram>,
 ) -> JsResult<Value> {
-    let proto = ctx.realm().regexp_proto;
-    let value = ctx.make_object(Some(proto), ObjectFlags::EXTENSIBLE, |ledger| {
-        Ok(ObjectData::RegExp(TrackedBox::new(
-            ledger,
-            RegExpData {
-                source,
-                program: Rc::clone(&program),
+    let source = ctx.root(source)?;
+    let shape = crate::realm::ensure_regexp_shape(ctx)?;
+    let source = ctx.get(source);
+    let obj = ctx.allocate(|rt| {
+        let heap = &mut rt.heap;
+        let mut props = TrackedVec::new();
+        props.try_reserve_exact(&heap.ledger, 1)?;
+        props.push_reserved(Value::int32(0));
+        heap.objects.insert(
+            &heap.ledger,
+            JsObject {
+                shape,
+                props,
+                flags: ObjectFlags::EXTENSIBLE,
+                data: ObjectData::RegExp(RegExpData {
+                    source,
+                    program: Rc::clone(&program),
+                }),
             },
-        )?))
+        )
     })?;
-    let last_index = ctx.intern_str("lastIndex")?;
-    let zero = ctx.root(Value::int32(0))?;
-    define_flags(ctx, value, last_index, zero, PropFlags::WRITABLE)?;
-    Ok(ctx.get(value))
+    Ok(Value::object(obj))
 }
 
 struct BytecodeRegExpHost<'a, 'rt, 's>(&'a mut ExecCtx<'rt, 's>);
@@ -404,6 +412,23 @@ pub(super) fn object_op(
             }
             SetProto => {
                 let proto = ctx.get(h(1));
+                if proto == Value::NULL
+                    && let Some(id) = ctx.get(h(2)).as_object()
+                {
+                    let fast = {
+                        let heap = ctx.heap();
+                        let obj = heap.object(id);
+                        matches!(obj.data, ObjectData::Ordinary)
+                            && obj.flags == ObjectFlags::EXTENSIBLE
+                            && obj.props.is_empty()
+                            && heap.shape(obj.shape).props.is_empty()
+                    };
+                    if fast {
+                        let null_shape = crate::realm::ensure_null_proto_shape(ctx)?;
+                        ctx.runtime.heap.objects.get_mut(id).unwrap().shape = null_shape;
+                        return Ok(none(1));
+                    }
+                }
                 if (proto == Value::NULL || proto.as_object().is_some())
                     && !property::set_prototype_of(ctx, h(2), proto.as_object().map(|_| h(1)))?
                 {

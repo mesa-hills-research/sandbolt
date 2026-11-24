@@ -1,17 +1,22 @@
 use std::rc::Rc;
 
-use qjs_regexp::{
-    CompiledRegExp, MatchResult, RegExpError, RegExpFlags as F, RegExpHost, RegExpInput,
-};
+use qjs_regexp::{CompiledRegExp, RegExpError, RegExpFlags as F, RegExpHost, RegExpInput};
 
+use crate::arena::Arena;
 use crate::ledger::{AllocError, TrackedBox};
-use crate::object::{ErrorKind, ObjectFlags, RegExpData, RegExpProgram, RegExpStringIteratorData};
+use crate::object::{
+    ArrayData, ErrorKind, JsObject, ObjectFlags, RegExpData, RegExpProgram,
+    RegExpStringIteratorData,
+};
 use crate::ops::call::construct;
 use crate::ops::compare::same_value;
-use crate::ops::convert::{space, to_boolean, to_integer_or_infinity, to_length, to_uint32};
+use crate::ops::convert::{space, to_integer_or_infinity, to_length, to_uint32, to_boolean};
 use crate::ops::property::set_property;
+use crate::vm::VmState;
 
 use super::*;
+
+const LAST_INDEX: PropKey = PropKey::atom(Atom(qjs_bytecode::BuiltinAtom::LastIndex as u32));
 
 const FLAGS: [(u8, u16, &str); 8] = [
     (b'd', F::INDICES, "hasIndices"),
@@ -256,10 +261,33 @@ pub(crate) fn create<'s>(
     pattern: Handle<'s>,
     flags: Handle<'s>,
 ) -> JsResult<Value> {
-    let proto = ctx.root(Value::object(ctx.realm().regexp_proto))?;
-    let obj = ctx.new_object_with_proto(Some(proto))?;
-    initialize(ctx, obj, pattern, flags, None)?;
-    Ok(ctx.get(obj))
+    let source = if ctx.get(pattern) == Value::UNDEFINED {
+        ctx.new_string("")?
+    } else {
+        to_string(ctx, pattern)?
+    };
+    let program = compile(ctx, source, flags)?;
+    let shape = crate::realm::ensure_regexp_shape(ctx)?;
+    let source = ctx.get(source);
+    let obj = ctx.allocate(|rt| {
+        let heap = &mut rt.heap;
+        let mut props = TrackedVec::new();
+        props.try_reserve_exact(&heap.ledger, 1)?;
+        props.push_reserved(Value::int32(0));
+        heap.objects.insert(
+            &heap.ledger,
+            JsObject {
+                shape,
+                props,
+                flags: ObjectFlags::EXTENSIBLE,
+                data: ObjectData::RegExp(RegExpData {
+                    source,
+                    program: Rc::clone(&program),
+                }),
+            },
+        )
+    })?;
+    Ok(Value::object(obj))
 }
 
 fn initialize<'s>(
@@ -279,19 +307,13 @@ fn initialize<'s>(
         None => compile(ctx, source, flags)?,
     };
     let source = ctx.get(source);
-    let data = ctx.allocate(|rt| {
-        TrackedBox::new(
-            &rt.heap.ledger,
-            RegExpData {
-                source,
-                program: program.clone(),
-            },
-        )
-    })?;
     let id = ctx.object_id(obj)?;
     let object = ctx.runtime.heap.objects.get_mut(id).unwrap();
     let existing = matches!(object.data, ObjectData::RegExp(_));
-    object.data = ObjectData::RegExp(data);
+    object.data = ObjectData::RegExp(RegExpData {
+        source,
+        program: program.clone(),
+    });
     if existing {
         set_last_index(ctx, obj, 0.0)
     } else {
@@ -592,9 +614,78 @@ fn set<'s>(
 }
 
 fn set_last_index<'s>(ctx: &mut ExecCtx<'_, 's>, obj: Handle<'s>, index: f64) -> JsResult<()> {
+    if let Some(id) = ctx.get(obj).as_object()
+        && Some(ctx.heap().object(id).shape) == ctx.realm().regexp_shape
+    {
+        ctx.runtime.heap.objects.get_mut(id).unwrap().props[0] = Value::number(index);
+        return Ok(());
+    }
     let val = ctx.root(Value::number(index))?;
-    let key = ctx.intern_str("lastIndex")?;
-    set(ctx, obj, key, val)
+    set(ctx, obj, LAST_INDEX, val)
+}
+
+struct DirectHost<'a> {
+    vm: &'a mut VmState,
+    ledger: &'a HeapLedger,
+    hit_limit: bool,
+}
+
+impl RegExpHost for DirectHost<'_> {
+    fn poll_interrupt(&mut self) -> bool {
+        if self
+            .vm
+            .interrupt_handler
+            .as_mut()
+            .is_some_and(|handler| handler())
+        {
+            self.vm.exception = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), RegExpError> {
+        match self.ledger.charge_bytes(bytes) {
+            Ok(()) => Ok(()),
+            Err(AllocError::Limit | AllocError::Allocator) => {
+                self.hit_limit = true;
+                Err(RegExpError::OutOfMemory)
+            }
+            Err(_) => Err(RegExpError::OutOfMemory),
+        }
+    }
+
+    fn release(&mut self, bytes: usize) {
+        self.ledger.release_bytes(bytes);
+    }
+
+    fn check_stack(&mut self, bytes: usize) -> bool {
+        self.vm
+            .check_budget(bytes.div_ceil(size_of::<Value>()), 0, 0)
+    }
+}
+
+fn flat_regexp_input<'a>(strings: &'a Arena<JsString>, id: StrId) -> RegExpInput<'a> {
+    match strings.get(id).expect("missing string") {
+        JsString::Latin1 { data, .. } => RegExpInput::Latin1(data),
+        JsString::InlineLatin1 { len, data, .. } => RegExpInput::Latin1(&data[..usize::from(*len)]),
+        JsString::Utf16(data) => RegExpInput::Utf16(data),
+        JsString::InlineUtf16 { len, data } => RegExpInput::Utf16(&data[..usize::from(*len)]),
+        JsString::Slice {
+            base, start, len, ..
+        } => {
+            let start = *start as usize;
+            let end = start + *len as usize;
+            let base = strings.get(*base).expect("missing string slice base");
+            if let Some(bytes) = base.as_latin1() {
+                RegExpInput::Latin1(&bytes[start..end])
+            } else {
+                RegExpInput::Utf16(&base.as_utf16().unwrap()[start..end])
+            }
+        }
+        JsString::Rope { .. } => unreachable!("expected flattened string"),
+    }
 }
 
 fn regexp_exec<'s>(ctx: &mut ExecCtx<'_, 's>, re: Handle<'s>, s: Handle<'s>) -> JsResult<Value> {
@@ -615,40 +706,118 @@ fn builtin_exec<'s>(
     input: Handle<'s>,
 ) -> JsResult<Value> {
     let id = branded(ctx, this)?;
-    let input = to_string(ctx, input)?;
-    let index = named(ctx, this, "lastIndex")?;
-    let index = to_length(ctx, index)?;
+    let input = if as_string(ctx.get(input)).is_some() {
+        input
+    } else {
+        to_string(ctx, input)?
+    };
+    let index = if Some(ctx.heap().object(id).shape) == ctx.realm().regexp_shape {
+        let raw = ctx.heap().object(id).props[0];
+        match raw.decode() {
+            ValueKind::Int32(n) if n >= 0 => n as u64,
+            _ => {
+                let h = ctx.root(raw)?;
+                to_length(ctx, h)?
+            }
+        }
+    } else {
+        let index = get(ctx, this, LAST_INDEX)?;
+        to_length(ctx, index)?
+    };
     let program = regexp_data(ctx, id).program.clone();
     let update = program.compiled.flags.contains(F::GLOBAL | F::STICKY);
     let start = if update { index } else { 0 };
-    if start > u64::from(ctx.heap().string(string_id(ctx.get(input))).len()) {
+    let input_id = string_id(ctx.get(input));
+    if start > u64::from(ctx.heap().string(input_id).len()) {
         set_last_index(ctx, this, 0.0)?;
         return Ok(Value::NULL);
     }
-    let units = units(ctx, ctx.get(input))?;
+    if matches!(ctx.heap().string(input_id), JsString::Rope { .. }) {
+        ctx.flatten_string(input)?;
+    }
     ctx.check_interrupt()?;
-    let result = qjs_regexp::exec(
-        &program.compiled,
-        RegExpInput::Utf16(&units),
-        start as usize,
-        &mut Host(ctx),
-    )
-    .map_err(|e| re_error(ctx, e))?;
+    let flags = program.compiled.flags;
+    if program.compiled.capture_count == 1 && !flags.contains(F::NAMED_GROUPS | F::INDICES) {
+        let (result, hit_limit) = {
+            let rt = &mut *ctx.runtime;
+            let input_slice = flat_regexp_input(&rt.heap.strings, input_id);
+            let mut host = DirectHost {
+                vm: &mut rt.vm,
+                ledger: &rt.heap.ledger,
+                hit_limit: false,
+            };
+            let res =
+                qjs_regexp::exec_single(&program.compiled, input_slice, start as usize, &mut host);
+            (res, host.hit_limit)
+        };
+        let result = match result {
+            Err(RegExpError::OutOfMemory) if hit_limit => {
+                ctx.collect();
+                let copied = units(ctx, ctx.get(input))?;
+                qjs_regexp::exec_single(
+                    &program.compiled,
+                    RegExpInput::Utf16(&copied),
+                    start as usize,
+                    &mut Host(ctx),
+                )
+                .map_err(|e| re_error(ctx, e))?
+            }
+            other => other.map_err(|e| re_error(ctx, e))?,
+        };
+        let Some((m_start, m_end)) = result else {
+            if update {
+                set_last_index(ctx, this, 0.0)?;
+            }
+            return Ok(Value::NULL);
+        };
+        if update {
+            set_last_index(ctx, this, m_end as f64)?;
+        }
+        return build_single_result(ctx, input, input_id, m_start, m_end);
+    }
+    let (result, hit_limit) = {
+        let rt = &mut *ctx.runtime;
+        let input_slice = flat_regexp_input(&rt.heap.strings, input_id);
+        let mut host = DirectHost {
+            vm: &mut rt.vm,
+            ledger: &rt.heap.ledger,
+            hit_limit: false,
+        };
+        let res = qjs_regexp::exec_spans(&program.compiled, input_slice, start as usize, &mut host);
+        (res, host.hit_limit)
+    };
+    let result = match result {
+        Err(RegExpError::OutOfMemory) if hit_limit => {
+            ctx.collect();
+            let copied = units(ctx, ctx.get(input))?;
+            qjs_regexp::exec_spans(
+                &program.compiled,
+                RegExpInput::Utf16(&copied),
+                start as usize,
+                &mut Host(ctx),
+            )
+            .map_err(|e| re_error(ctx, e))?
+        }
+        other => other.map_err(|e| re_error(ctx, e))?,
+    };
     let Some(result) = result else {
         if update {
             set_last_index(ctx, this, 0.0)?;
         }
         return Ok(Value::NULL);
     };
-    let _charge = Charge::new(
-        ctx,
-        result.captures.capacity() * size_of::<Option<(usize, usize)>>(),
-    )?;
-    let (start, end) = result.captures[0].unwrap();
+    let heap_bytes = result.heap_bytes();
+    let _charge = if heap_bytes > 0 {
+        Some(Charge::new(ctx, heap_bytes)?)
+    } else {
+        None
+    };
+    let spans = result.as_slice();
+    let (start, end) = spans[0].unwrap();
     if update {
         set_last_index(ctx, this, end as f64)?;
     }
-    build_result(ctx, &program.compiled, &result, input, &units, start)
+    build_result(ctx, &program.compiled, spans, input, start)
 }
 
 fn groups<'s>(
@@ -666,23 +835,217 @@ fn groups<'s>(
     Ok(groups)
 }
 
+fn alloc_result_array<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    len: usize,
+    first: Option<Value>,
+    start: usize,
+    input: Value,
+    groups_val: Value,
+) -> JsResult<ObjId> {
+    let shape = crate::realm::ensure_regexp_result_shape(ctx)?;
+    let realm = ctx.realm_id();
+    ctx.allocate(|rt| {
+        let heap = &mut rt.heap;
+        let mut elements = TrackedVec::new();
+        elements.try_reserve_exact(&heap.ledger, len)?;
+        if let Some(val) = first {
+            elements.push_reserved(val);
+            for _ in 1..len {
+                elements.push_reserved(Value::UNDEFINED);
+            }
+        } else {
+            for _ in 0..len {
+                elements.push_reserved(Value::UNDEFINED);
+            }
+        }
+        let array = TrackedBox::new(
+            &heap.ledger,
+            ArrayData {
+                elements,
+                length: len as u32,
+                length_writable: true,
+                realm,
+            },
+        )?;
+        let mut props = TrackedVec::new();
+        props.try_reserve_exact(&heap.ledger, 3)?;
+        props.push_reserved(Value::int32(start as i32));
+        props.push_reserved(input);
+        props.push_reserved(groups_val);
+        heap.objects.insert(
+            &heap.ledger,
+            JsObject {
+                shape,
+                props,
+                flags: ObjectFlags::EXTENSIBLE | ObjectFlags::IS_EXOTIC | ObjectFlags::FAST_ARRAY,
+                data: ObjectData::Array(array),
+            },
+        )
+    })
+}
+
+fn build_single_result<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    input: Handle<'s>,
+    input_id: StrId,
+    start: usize,
+    end: usize,
+) -> JsResult<Value> {
+    let input_len = ctx.heap().string(input_id).len() as usize;
+    let slice_len = end - start;
+    if slice_len <= 1 || slice_len == input_len {
+        let cap0 = ctx.string_slice(input, start, end)?;
+        let obj = alloc_result_array(
+            ctx,
+            1,
+            Some(ctx.get(cap0)),
+            start,
+            ctx.get(input),
+            Value::UNDEFINED,
+        )?;
+        return Ok(Value::object(obj));
+    }
+    let shape = crate::realm::ensure_regexp_result_shape(ctx)?;
+    let realm = ctx.realm_id();
+    let input_val = ctx.get(input);
+    let obj = ctx.allocate(|rt| {
+        let heap = &mut rt.heap;
+        let (base, offset) = match heap.string(input_id) {
+            JsString::Slice { base, start, .. } => (*base, *start as usize),
+            _ => (input_id, 0),
+        };
+        let backing = heap.string(base);
+        let matched_string = if slice_len >= 4096
+            && backing.len() as usize <= slice_len.saturating_mul(4)
+        {
+            JsString::Slice {
+                base,
+                start: (offset + start) as u32,
+                len: slice_len as u32,
+                is_wide: backing.is_wide(),
+            }
+        } else {
+            let range = offset + start..offset + end;
+            if let Some(bytes) = backing.as_latin1() {
+                let slice = &bytes[range];
+                let is_ascii = backing.is_ascii() || slice.is_ascii();
+                if slice_len <= crate::string::INLINE_LATIN1_CAPACITY {
+                    let mut data = [0u8; crate::string::INLINE_LATIN1_CAPACITY];
+                    data[..slice_len].copy_from_slice(slice);
+                    JsString::InlineLatin1 {
+                        len: slice_len as u8,
+                        is_ascii,
+                        data,
+                    }
+                } else {
+                    JsString::Latin1 {
+                        data: TrackedVec::from_slice(&heap.ledger, slice)?,
+                        is_ascii,
+                    }
+                }
+            } else {
+                JsString::from_utf16(&heap.ledger, &backing.as_utf16().unwrap()[range])?
+            }
+        };
+        let cap0_id = heap.strings.insert(&heap.ledger, matched_string)?;
+        let mut elements = TrackedVec::new();
+        elements.try_reserve_exact(&heap.ledger, 1)?;
+        elements.push_reserved(Value::string(cap0_id));
+        let array = TrackedBox::new(
+            &heap.ledger,
+            ArrayData {
+                elements,
+                length: 1,
+                length_writable: true,
+                realm,
+            },
+        )?;
+        let mut props = TrackedVec::new();
+        props.try_reserve_exact(&heap.ledger, 3)?;
+        props.push_reserved(Value::int32(start as i32));
+        props.push_reserved(input_val);
+        props.push_reserved(Value::UNDEFINED);
+        heap.objects.insert(
+            &heap.ledger,
+            JsObject {
+                shape,
+                props,
+                flags: ObjectFlags::EXTENSIBLE | ObjectFlags::IS_EXOTIC | ObjectFlags::FAST_ARRAY,
+                data: ObjectData::Array(array),
+            },
+        )
+    })?;
+    Ok(Value::object(obj))
+}
+
 fn build_result<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     program: &CompiledRegExp,
-    m: &MatchResult,
+    captures: &[Option<(usize, usize)>],
     input: Handle<'s>,
-    units: &[u16],
     start: usize,
 ) -> JsResult<Value> {
-    let result = ctx.new_array()?;
-    let index = ctx.root(Value::int32(start as i32))?;
-    let key = ctx.intern_str("index")?;
-    define_data(ctx, result, key, index, PropFlags::DEFAULT_DATA)?;
-    let key = ctx.intern_str("input")?;
-    define_data(ctx, result, key, input, PropFlags::DEFAULT_DATA)?;
-    let has_names = program.group_names.iter().any(Option::is_some);
-    let names = groups(ctx, result, has_names)?;
-    let indices = if program.flags.contains(F::INDICES) {
+    let has_names = program.flags.contains(F::NAMED_GROUPS);
+    let has_indices = program.flags.contains(F::INDICES);
+    if !has_names && !has_indices {
+        if captures.len() == 1 {
+            let cap0 = match captures[0] {
+                Some((s, e)) => ctx.string_slice(input, s, e)?,
+                None => ctx.root(Value::UNDEFINED)?,
+            };
+            let obj = alloc_result_array(
+                ctx,
+                1,
+                Some(ctx.get(cap0)),
+                start,
+                ctx.get(input),
+                Value::UNDEFINED,
+            )?;
+            return Ok(Value::object(obj));
+        }
+        let obj = alloc_result_array(
+            ctx,
+            captures.len(),
+            None,
+            start,
+            ctx.get(input),
+            Value::UNDEFINED,
+        )?;
+        let result = ctx.root(Value::object(obj))?;
+        let input_val = ctx.get(input);
+        for (i, &capture) in captures.iter().enumerate() {
+            if let Some((s, e)) = capture {
+                let value = ctx.with_scope(|ctx| {
+                    let input = ctx.root(input_val)?;
+                    let slice = ctx.string_slice(input, s, e)?;
+                    Ok(ctx.get(slice))
+                })?;
+                let ObjectData::Array(array) =
+                    &mut ctx.runtime.heap.objects.get_mut(obj).unwrap().data
+                else {
+                    unreachable!()
+                };
+                array.elements[i] = value;
+            }
+        }
+        return Ok(ctx.get(result));
+    }
+    let names = if has_names {
+        ctx.new_object_with_proto(None)?
+    } else {
+        ctx.root(Value::UNDEFINED)?
+    };
+    let obj = alloc_result_array(
+        ctx,
+        captures.len(),
+        None,
+        start,
+        ctx.get(input),
+        ctx.get(names),
+    )?;
+    let result = ctx.root(Value::object(obj))?;
+    let indices = if has_indices {
         let indices = ctx.new_array()?;
         let key = ctx.intern_str("indices")?;
         define_data(ctx, result, key, indices, PropFlags::DEFAULT_DATA)?;
@@ -691,30 +1054,38 @@ fn build_result<'s>(
     } else {
         None
     };
-    let (result, names) = (ctx.get(result), ctx.get(names));
+    let (result_val, names_val, input_val) = (ctx.get(result), ctx.get(names), ctx.get(input));
     let indices = indices.map(|(a, b)| (ctx.get(a), ctx.get(b)));
-    for (i, &capture) in m.captures.iter().enumerate() {
+    for (i, &capture) in captures.iter().enumerate() {
         ctx.with_scope(|ctx| {
-            let result = ctx.root(result)?;
-            let value = if let Some((start, end)) = capture {
-                ctx.new_utf16(&units[start..end])?
+            let input = ctx.root(input_val)?;
+            let value = if let Some((s, e)) = capture {
+                ctx.string_slice(input, s, e)?
             } else {
                 ctx.root(Value::UNDEFINED)?
             };
-            put_index(ctx, result, i, value)?;
+            let val = ctx.get(value);
+            {
+                let ObjectData::Array(array) =
+                    &mut ctx.runtime.heap.objects.get_mut(obj).unwrap().data
+                else {
+                    unreachable!()
+                };
+                array.elements[i] = val;
+            }
             let name = program.group_names.get(i).and_then(Option::as_deref);
             if let Some(name) = name {
-                let names = ctx.root(names)?;
+                let names = ctx.root(names_val)?;
                 put_group(ctx, names, name, value)?;
             }
             if let Some((indices, names)) = indices {
                 let indices = ctx.root(indices)?;
-                let value = if let Some((start, end)) = capture {
+                let value = if let Some((s, e)) = capture {
                     let pair = ctx.new_array()?;
-                    let start = ctx.root(Value::int32(start as i32))?;
-                    let end = ctx.root(Value::int32(end as i32))?;
-                    put_index(ctx, pair, 0, start)?;
-                    put_index(ctx, pair, 1, end)?;
+                    let s = ctx.root(Value::int32(s as i32))?;
+                    let e = ctx.root(Value::int32(e as i32))?;
+                    put_index(ctx, pair, 0, s)?;
+                    put_index(ctx, pair, 1, e)?;
                     pair
                 } else {
                     ctx.root(Value::UNDEFINED)?
@@ -728,7 +1099,7 @@ fn build_result<'s>(
             Ok(())
         })?;
     }
-    Ok(result)
+    Ok(result_val)
 }
 
 fn put_group<'s>(

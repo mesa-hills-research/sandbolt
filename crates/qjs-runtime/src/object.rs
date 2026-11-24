@@ -63,10 +63,18 @@ impl Trace for JsObject {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Accessor {
-    pub getter: Option<ObjId>,
-    pub setter: Option<ObjId>,
+    pub getter: Value,
+    pub setter: Value,
+}
+impl Default for Accessor {
+    fn default() -> Self {
+        Self {
+            getter: Value::UNDEFINED,
+            setter: Value::UNDEFINED,
+        }
+    }
 }
 impl ArenaItem for Accessor {
     type Id = AccId;
@@ -84,6 +92,7 @@ macro_rules! object_data {
         pub enum ObjectData {
             Ordinary,
             NativeFunction(NativeFunctionData),
+            RegExp(RegExpData),
             $( $variant(TrackedBox<$payload>), )+
         }
 
@@ -92,6 +101,7 @@ macro_rules! object_data {
                 match self {
                     Self::Ordinary => {},
                     Self::NativeFunction(data) => data.trace(tracer),
+                    Self::RegExp(data) => data.trace(tracer),
                     $( Self::$variant(data) => data.trace(tracer), )+
                 }
             }
@@ -112,7 +122,6 @@ object_data!(
     BigIntObject(BigIntObjectData),
     Error(ErrorData),
     CallSite(ErrorFrame),
-    RegExp(RegExpData),
     Date(DateData),
     ArrayBuffer(ArrayBufferData),
     SharedArrayBuffer(SharedArrayBufferData),
