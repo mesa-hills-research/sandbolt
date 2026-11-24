@@ -202,6 +202,20 @@ pub(super) fn dispatch<'s>(
         }
         _ => {}
     }
+    if matches!(n, POP | PUSH)
+        && let Some(id) = ctx.get(this).as_object()
+        // The generic length lookup uses one temporary root.
+        && ctx.runtime.vm.can_root_without_growing(1)
+    {
+        let result = if n == POP {
+            methods::fast_pop(ctx, id)
+        } else {
+            methods::fast_push(ctx, id, args)?
+        };
+        if let Some(result) = result {
+            return Ok(result);
+        }
+    }
     let object = to_object(ctx, this)?;
     if n == TO_STRING {
         let join = named(ctx, object, "join")?;

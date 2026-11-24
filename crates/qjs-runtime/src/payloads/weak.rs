@@ -62,14 +62,14 @@ impl<T: WeakEntry> WeakEntries<T> {
     }
 
     pub(crate) fn get(&self, key: WeakKey) -> Option<&T> {
-        let hash = self.seed.hash_one(key);
+        let hash = self.seed.hash_one(key.value());
         let row = self.index.find(hash, |row| self.rows[row].key() == key)?;
         Some(&self.rows[row])
     }
 
     pub(crate) fn insert(&mut self, ledger: &HeapLedger, entry: T) -> AllocResult<()> {
         let key = entry.key();
-        let hash = self.seed.hash_one(key);
+        let hash = self.seed.hash_one(key.value());
         if let Some(row) = self.index.find(hash, |row| self.rows[row].key() == key) {
             self.rows[row] = entry;
         } else {
@@ -82,14 +82,17 @@ impl<T: WeakEntry> WeakEntries<T> {
     }
 
     pub(crate) fn remove(&mut self, key: WeakKey) -> bool {
-        let hash = self.seed.hash_one(key);
+        let hash = self.seed.hash_one(key.value());
         let Some(row) = self.index.remove(hash, |row| self.rows[row].key() == key) else {
             return false;
         };
         self.rows.swap_remove(row);
         if let Some(moved) = self.rows.get(row) {
-            self.index
-                .relocate(self.seed.hash_one(moved.key()), self.rows.len(), row);
+            self.index.relocate(
+                self.seed.hash_one(moved.key().value()),
+                self.rows.len(),
+                row,
+            );
         }
         true
     }

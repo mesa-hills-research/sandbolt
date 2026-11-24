@@ -4,7 +4,7 @@ use qjs_bytecode::{Opcode, UnitAtom};
 
 use crate::heap::Heap;
 use crate::ledger::{AllocResult, HeapLedger, TrackedVec};
-use crate::object::ObjectFlags;
+use crate::object::{JsObject, ObjectFlags};
 use crate::shape::PropFlags;
 use crate::value::*;
 use crate::vm::{CompiledFunc, InlineCache};
@@ -54,12 +54,11 @@ pub(super) fn own_slot(
     heap: &Heap,
     function: &CompiledFunc,
     pc: u32,
-    id: ObjId,
+    object: &JsObject,
     writing: bool,
     (epoch, name): (usize, Key),
     (modules, realm): (&[ModId], RealmId),
 ) -> Option<InlineCache> {
-    let object = heap.object(id);
     if object.flags.contains(ObjectFlags::IS_EXOTIC)
         || (writing && object.flags.contains(ObjectFlags::IS_PROTOTYPE))
     {
@@ -70,8 +69,8 @@ pub(super) fn own_slot(
     if let Some(entry) = cell.get()
         && entry.pc == pc
         && entry.epoch == epoch
+        // The live object traces its shape. The ID includes its generation.
         && entry.shape == object.shape
-        && heap.shapes.get_weak(entry.shape).is_some()
         && (!writing || entry.flags.contains(PropFlags::WRITABLE))
         && (writing || !object.props[entry.slot as usize].is_auto_native())
         && match name {
@@ -86,7 +85,7 @@ pub(super) fn own_slot(
         function,
         cell,
         pc,
-        id,
+        object,
         writing,
         (epoch, name),
         (modules, realm),
@@ -100,7 +99,7 @@ fn fill(
     function: &CompiledFunc,
     cell: &Cell<Option<InlineCache>>,
     pc: u32,
-    id: ObjId,
+    object: &JsObject,
     writing: bool,
     (epoch, name): (usize, Key),
     (modules, realm): (&[ModId], RealmId),
@@ -124,8 +123,7 @@ fn fill(
         }
         Key::ResolvedRef(str) => (heap.atoms.find(&heap.strings, str)?, Value::string(str)),
     };
-    let object = heap.object(id);
-    let shape = heap.shapes.get_weak(object.shape)?;
+    let shape = heap.shape(object.shape);
     if shape.is_mutable() {
         return None;
     }
@@ -146,4 +144,32 @@ fn fill(
     };
     cell.set(Some(entry));
     Some(entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::EngineLimits;
+    use crate::api::{EvalOptions, JsEngine};
+
+    #[test]
+    fn property_caches_follow_layout_changes_across_collection() {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        let first = "function read(o) { return o.x; } function write(o, v) { o.x = v; }\
+                     (() => { const a = { x: 1, y: 2 }; write(a, 3); return read(a); })();";
+        assert_eq!(
+            engine
+                .eval_to_string(first, EvalOptions::default())
+                .unwrap(),
+            "3"
+        );
+        engine.collect_garbage();
+        let second = "const b = { y: 4, x: 5 }; const before = read(b);\
+                      write(b, 6); [before, read(b), b.y].join('|');";
+        assert_eq!(
+            engine
+                .eval_to_string(second, EvalOptions::default())
+                .unwrap(),
+            "5|6|4"
+        );
+    }
 }

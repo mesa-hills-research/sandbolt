@@ -12,6 +12,15 @@ use crate::vm::{BytecodeFunc, Job, MiniOp};
 
 type Brand<'s, T> = PhantomData<fn(&'s T) -> &'s T>;
 
+impl crate::vm::VmState {
+    pub(crate) fn can_root_without_growing(&self, count: usize) -> bool {
+        let tail = self.stack.len();
+        self.stack.capacity() - tail > count
+            && tail.saturating_add(count) < u32::MAX as usize
+            && self.check_budget(count, 0, 0)
+    }
+}
+
 /// An index into the operand stack. It cannot leave the scope that made it.
 ///
 /// ```compile_fail
@@ -463,7 +472,15 @@ impl<'s> ExecCtx<'_, 's> {
         self.make_string(|heap| {
             let s = heap.string(base);
             if let Some(bytes) = s.as_latin1() {
-                JsString::from_latin1(&heap.ledger, &bytes[range.clone()])
+                let bytes = &bytes[range.clone()];
+                if bytes.len() > INLINE_LATIN1_CAPACITY && s.is_ascii() {
+                    Ok(JsString::Latin1 {
+                        data: TrackedVec::from_slice(&heap.ledger, bytes)?,
+                        is_ascii: true,
+                    })
+                } else {
+                    JsString::from_latin1(&heap.ledger, bytes)
+                }
             } else {
                 JsString::from_utf16(&heap.ledger, &s.as_utf16().unwrap()[range.clone()])
             }
@@ -476,14 +493,27 @@ impl<'s> ExecCtx<'_, 's> {
         else {
             return Err(self.throw_type_error("expected strings"));
         };
-        let (left_string, right_string) = (self.heap().string(a), self.heap().string(b));
-        if left_string.is_empty() {
-            return Ok(right);
+        let id = self.concat_string_ids(a, b)?;
+        if id == b {
+            Ok(right)
+        } else if id == a {
+            Ok(left)
+        } else {
+            self.root(Value::string(id))
         }
-        if right_string.is_empty() {
-            return Ok(left);
+    }
+
+    // Both operands must be rooted. The caller stores the result before it allocates again.
+    pub(crate) fn concat_string_ids(&mut self, a: StrId, b: StrId) -> JsResult<StrId> {
+        let (left, right) = (self.heap().string(a), self.heap().string(b));
+        if left.is_empty() {
+            return Ok(b);
         }
-        self.make_string(|heap| {
+        if right.is_empty() {
+            return Ok(a);
+        }
+        self.allocate(|runtime| {
+            let heap = &mut runtime.heap;
             let (left, right) = (heap.string(a), heap.string(b));
             let len = left
                 .len()
@@ -493,28 +523,35 @@ impl<'s> ExecCtx<'_, 's> {
             let depth = left.depth().max(right.depth()) + 1;
             if !is_wide
                 && len as usize <= INLINE_LATIN1_CAPACITY
-                && let (Some(left), Some(right)) = (left.as_latin1(), right.as_latin1())
+                && let (Some(head), Some(tail)) = (left.as_latin1(), right.as_latin1())
             {
                 let mut bytes = [0; INLINE_LATIN1_CAPACITY];
-                bytes[..left.len()].copy_from_slice(left);
-                bytes[left.len()..len as usize].copy_from_slice(right);
-                return JsString::from_latin1(&heap.ledger, &bytes[..len as usize]);
+                bytes[..head.len()].copy_from_slice(head);
+                bytes[head.len()..len as usize].copy_from_slice(tail);
+                let string = JsString::InlineLatin1 {
+                    len: len as u8,
+                    is_ascii: left.is_ascii() && right.is_ascii(),
+                    data: bytes,
+                };
+                return heap.strings.insert(&heap.ledger, string);
             }
-            if depth > MAX_ROPE_DEPTH {
-                return JsString::from_units(
+            let string = if depth > MAX_ROPE_DEPTH {
+                JsString::from_units(
                     &heap.ledger,
                     len as usize,
                     is_wide,
                     heap.string_units(a).chain(heap.string_units(b)),
-                );
-            }
-            Ok(JsString::Rope {
-                left: a,
-                right: b,
-                len,
-                is_wide,
-                depth,
-            })
+                )?
+            } else {
+                JsString::Rope {
+                    left: a,
+                    right: b,
+                    len,
+                    is_wide,
+                    depth,
+                }
+            };
+            heap.strings.insert(&heap.ledger, string)
         })
     }
 

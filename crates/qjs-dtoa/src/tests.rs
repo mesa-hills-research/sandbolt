@@ -19,6 +19,33 @@ fn check_atod(input: &str, radix: u32, flags: AtodFlags, expected: f64, consumed
 }
 
 #[test]
+fn simple_decimals_match_the_general_parser() {
+    let plain = AtodFlags::default();
+    let general = AtodFlags {
+        accept_underscores: true,
+        ..plain
+    };
+    let mut bits = 0x24a2_5fa3_ce4a_51b1u64;
+    for i in 0..20_000 {
+        bits = bits.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let digits = (bits % 1_000_000_000_000_000).to_string();
+        let point = i % (digits.len() + 1);
+        let sign = ["", "-", "+"][i % 3];
+        let suffix = ["", "x", ".", "e-2", "e+"][i % 5];
+        let text = format!(
+            "{sign}{}.{part}{suffix}",
+            &digits[..point],
+            part = &digits[point..]
+        );
+        let (normal, n) = atod(&text, 10, plain);
+        let (fallback, f) = atod(&text, 10, general);
+        assert_eq!((normal.to_bits(), n), (fallback.to_bits(), f), "{text:?}");
+    }
+    check_atod("-0.0", 10, plain, -0.0, 4);
+    check_atod("123456789012345.6", 10, plain, 123456789012345.6, 17);
+}
+
+#[test]
 fn shortest_decimal_uses_ecmascript_thresholds() {
     let free = DtoaOptions::default();
     for (value, expected) in [
@@ -32,6 +59,9 @@ fn shortest_decimal_uses_ecmascript_thresholds() {
         (f64::MAX, "1.7976931348623157e+308"),
     ] {
         assert_eq!(dtoa(value, 10, 0, free), expected);
+        let mut buf = [0xff; 128];
+        let len = dtoa_into(&mut buf, value, 10, 0, free);
+        assert_eq!(&buf[..len], expected.as_bytes());
     }
 }
 

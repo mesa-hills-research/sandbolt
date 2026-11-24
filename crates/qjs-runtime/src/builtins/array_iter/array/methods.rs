@@ -415,14 +415,24 @@ pub(super) fn join<'s>(
     Ok(ctx.get(text))
 }
 
-fn plain_index_prototypes(heap: &Heap, object: &JsObject, index: Option<u32>) -> bool {
-    let mut parent = heap.shape(object.shape).proto;
-    if let ObjectData::Array(array) = &object.data {
-        let realm = heap.realm(array.realm);
-        if realm.std_array_prototype_intact && parent == Some(realm.array_proto) {
-            return true;
-        }
+impl Heap {
+    pub(crate) fn has_intact_array_prototype(
+        &self,
+        shape: crate::value::ShapeId,
+        realm: crate::value::RealmId,
+    ) -> bool {
+        let realm = self.realm(realm);
+        realm.std_array_prototype_intact && self.shape(shape).proto == Some(realm.array_proto)
     }
+}
+
+fn plain_index_prototypes(heap: &Heap, object: &JsObject, index: Option<u32>) -> bool {
+    if let ObjectData::Array(array) = &object.data
+        && heap.has_intact_array_prototype(object.shape, array.realm)
+    {
+        return true;
+    }
+    let mut parent = heap.shape(object.shape).proto;
     let key = index.and_then(crate::atom::PropKey::index);
     while let Some(id) = parent {
         let proto = heap.object(id);
@@ -460,9 +470,10 @@ fn plain_index_prototypes(heap: &Heap, object: &JsObject, index: Option<u32>) ->
     true
 }
 
-fn fast_pop(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> Option<Value> {
-    let object = ctx.heap().object(id);
-    let ObjectData::Array(array) = &object.data else {
+pub(super) fn fast_pop(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> Option<Value> {
+    let heap = &mut ctx.runtime.heap;
+    let object = heap.objects.get_mut(id).unwrap();
+    let ObjectData::Array(array) = &mut object.data else {
         return None;
     };
     if !object.flags.contains(ObjectFlags::FAST_ARRAY)
@@ -480,22 +491,27 @@ fn fast_pop(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> Option<Value> {
         .get(last as usize)
         .copied()
         .filter(|&v| v != Value::EMPTY);
-    let result = if let Some(value) = value {
-        value
-    } else if plain_index_prototypes(ctx.heap(), object, Some(last)) {
-        Value::UNDEFINED
-    } else {
+    if let Some(value) = value {
+        array.elements.truncate(last as usize);
+        array.length = last;
+        return Some(value);
+    }
+    if !plain_index_prototypes(heap, heap.object(id), Some(last)) {
         return None;
-    };
-    let ObjectData::Array(array) = &mut ctx.runtime.heap.objects.get_mut(id).unwrap().data else {
+    }
+    let ObjectData::Array(array) = &mut heap.objects.get_mut(id).unwrap().data else {
         unreachable!()
     };
     array.elements.truncate(last as usize);
     array.length = last;
-    Some(result)
+    Some(Value::UNDEFINED)
 }
 
-fn fast_push<'s>(ctx: &mut ExecCtx<'_, 's>, id: ObjId, args: Args<'s>) -> JsResult<Option<Value>> {
+pub(super) fn fast_push<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    id: ObjId,
+    args: Args<'s>,
+) -> JsResult<Option<Value>> {
     let object = ctx.heap().object(id);
     let ObjectData::Array(array) = &object.data else {
         return Ok(None);
@@ -845,6 +861,31 @@ pub(super) fn flat<'s>(
 mod tests {
     use crate::EngineLimits;
     use crate::api::{EvalOptions, JsEngine};
+
+    #[test]
+    fn indexed_append_respects_array_prototype_changes() {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        let result = engine
+            .eval_to_string(
+                r#"
+            function store(array, index, value) { array[index] = value; }
+            const dense = [];
+            store(dense, 0, {value: 42});
+            store(dense, 1, {value: 17});
+            let seen;
+            const other = [];
+            Object.defineProperty(Array.prototype, '0', {
+                set(value) { seen = value; }, configurable: true,
+            });
+            try { store(other, 0, 'setter'); }
+            finally { delete Array.prototype[0]; }
+            [dense.length, dense[0].value, dense[1].value, other.length, seen].join('|');
+        "#,
+                EvalOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(result, "2|42|17|0|setter");
+    }
 
     #[test]
     fn push_and_pop_keep_prototype_and_readonly_length_effects() {
