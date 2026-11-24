@@ -339,10 +339,13 @@ fn field_cache_does_not_keep_shapes_alive_or_skip_accessors() {
         .bytecode
         .iter()
         .filter_map(|(_, code)| code.compiled.as_ref())
-        .flat_map(|code| code.inline_caches.iter().filter_map(|cell| cell.get()))
-        .find(|entry| entry.slot == 1)
-        .unwrap()
-        .shape;
+        .filter_map(|code| code.fast.as_deref())
+        .flat_map(|fast| fast.caches.iter().map(|cell| cell.get()))
+        .find_map(|entry| match entry {
+            crate::vm::InlineCache::Own { shape, slot: 1, .. } => Some(shape),
+            _ => None,
+        })
+        .unwrap();
     assert!(heap.shapes.get_weak(cached_shape).is_some());
     engine.collect_garbage();
     assert!(

@@ -120,12 +120,12 @@ impl FrameLayout {
     fn new(base: usize, count: usize, function: Option<&CompiledFunc>) -> Self {
         let (arg_slots, locals, operands, capture_slots) = function.map_or((count, 0, 0, 0), |f| {
             let slots = count.max(f.arg_count as usize);
-            (
-                slots,
-                f.var_count as usize,
-                f.stack_size as usize,
-                slots + f.var_count as usize,
-            )
+            let captures = if f.needs_captures || f.eval.is_some() {
+                slots + f.var_count as usize
+            } else {
+                0
+            };
+            (slots, f.var_count as usize, f.stack_size as usize, captures)
         });
         let capture_base = base + 2 + arg_slots + locals;
         Self {
@@ -171,6 +171,7 @@ impl FrameLayout {
             capture_base: self.capture_base as u32,
             floor: self.floor as u32,
             last_pc: 0,
+            fast_ip: u32::MAX,
             return_call: false,
             require_object,
             coroutine: None,
@@ -219,11 +220,22 @@ pub(crate) fn prepare_plain(
     count: usize,
     method: bool,
 ) -> Option<PlainCall> {
+    prepare_plain_at(heap, vm, vm.stack.len(), caller, count, method)
+}
+
+#[inline]
+pub(crate) fn prepare_plain_at(
+    heap: &Heap,
+    vm: &VmState,
+    tail: usize,
+    caller: RealmId,
+    count: usize,
+    method: bool,
+) -> Option<PlainCall> {
     if vm.frames.len() == vm.frames.capacity() {
         return None;
     }
     let inserted = usize::from(!method);
-    let tail = vm.stack.len();
     let base = tail - (count + 2 - inserted);
     let callee = vm.stack[base + usize::from(method)].as_object()?;
     let (realm, code, function, builtin) = match &heap.object(callee).data {
@@ -248,7 +260,7 @@ pub(crate) fn prepare_plain(
     // Always preserve the spare root slot required by ExecCtx::root at peak operand height.
     if vm.stack.capacity() - tail < needed + 1
         || (!method && tail + 1 >= u32::MAX as usize)
-        || !vm.check_budget(needed, 1, 0)
+        || !vm.check_budget_at(tail, needed, 1, 0)
     {
         return None;
     }
@@ -439,6 +451,7 @@ fn push_forwarding_frame(
         capture_base: 0,
         floor: 0,
         last_pc: 0,
+        fast_ip: u32::MAX,
         return_call: true,
         require_object: false,
         coroutine: None,

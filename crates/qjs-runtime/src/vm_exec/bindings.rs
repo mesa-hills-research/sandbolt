@@ -82,11 +82,15 @@ pub(crate) fn close_frame(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame) {
     );
 }
 
+#[inline]
 pub(super) fn close_frame_slots(
     var_refs: &mut Arena<VarRef>,
     stack: &mut [Value],
     frame: CallFrame,
 ) {
+    if frame.capture_base == frame.floor {
+        return;
+    }
     for (i, cell) in (frame.capture_base as usize..frame.floor as usize).enumerate() {
         close_slot(var_refs, stack, frame.base as usize + 2 + i, cell);
     }

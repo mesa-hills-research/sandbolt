@@ -1,9 +1,7 @@
-use std::cell::Cell;
-
 use crate::EngineLimits;
 use crate::arena::ArenaItem;
 use crate::gc::{Trace, Tracer};
-use crate::ledger::TrackedVec;
+use crate::ledger::{TrackedBox, TrackedVec};
 use crate::value::*;
 
 #[path = "vm_exec/mod.rs"]
@@ -55,12 +53,13 @@ pub struct BytecodeFunc {
 #[derive(Debug)]
 pub(crate) struct CompiledFunc {
     pub code: TrackedVec<u8>,
-    pub(crate) inline_caches: TrackedVec<Cell<Option<InlineCache>>>,
+    pub(crate) fast: Option<TrackedBox<exec::FastProgram>>,
     pub atoms: TrackedVec<PropKey>,
     pub name: Option<PropKey>,
     pub flags: FunctionFlags,
     pub kind: FunctionKind,
     pub(crate) needs_arguments: bool,
+    pub(crate) needs_captures: bool,
     pub strict: bool,
     pub arg_count: u16,
     pub var_count: u16,
@@ -81,14 +80,51 @@ pub(crate) struct CompiledFunc {
     pub class_field_context: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct InlineCache {
-    pub pc: u32,
-    pub slot: u32,
-    pub shape: ShapeId,
-    pub flags: PropFlags,
-    pub key: Value,
-    pub epoch: usize,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrimCacheTag {
+    String,
+    Number,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum InlineCache {
+    #[default]
+    Empty,
+    Own {
+        shape: ShapeId,
+        slot: u32,
+        flags: PropFlags,
+    },
+    Proto1 {
+        shape: ShapeId,
+        holder: ObjId,
+        holder_shape: ShapeId,
+        slot: u32,
+    },
+    Primitive {
+        tag: PrimCacheTag,
+        realm: RealmId,
+        holder: ObjId,
+        holder_shape: ShapeId,
+        slot: u32,
+    },
+    ArrayLength,
+    StringLength,
+    Global {
+        realm: RealmId,
+        shape: ShapeId,
+        slot: u32,
+        flags: PropFlags,
+        epoch: usize,
+        key: Value,
+    },
+    ResolvedRef {
+        realm: RealmId,
+        shape: ShapeId,
+        slot: u32,
+        flags: PropFlags,
+        key: Value,
+    },
 }
 
 impl CompiledFunc {
@@ -188,6 +224,7 @@ pub struct CallFrame {
     pub(crate) capture_base: u32,
     pub(crate) floor: u32,
     pub(crate) last_pc: u32,
+    pub(crate) fast_ip: u32,
     pub(crate) return_call: bool,
     pub(crate) require_object: bool,
     pub(crate) coroutine: Option<CoroId>,
@@ -463,9 +500,18 @@ impl VmState {
     }
 
     pub(crate) fn check_budget(&self, values: usize, frames: usize, reentries: usize) -> bool {
-        let usage = self
-            .stack
-            .len()
+        self.check_budget_at(self.stack.len(), values, frames, reentries)
+    }
+
+    #[inline]
+    pub(crate) fn check_budget_at(
+        &self,
+        stack_len: usize,
+        values: usize,
+        frames: usize,
+        reentries: usize,
+    ) -> bool {
+        let usage = stack_len
             .saturating_add(values)
             .saturating_mul(size_of::<Value>())
             .saturating_add(

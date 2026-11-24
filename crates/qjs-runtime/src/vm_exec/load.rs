@@ -38,7 +38,7 @@ pub(super) fn load_functions(
     let mut functions = TrackedVec::new();
     ctx.allocate(|rt| functions.try_reserve_exact(&rt.heap.ledger, image.functions.len()))?;
     for function in &image.functions {
-        let (cache_sites, needs_arguments) = execution_metadata(&function.code);
+        let (needs_arguments, needs_captures) = execution_metadata(&function.code);
         let atom = function.name;
         let name = if atom.is_none() {
             None
@@ -94,12 +94,13 @@ pub(super) fn load_functions(
                     constants,
                     compiled: Some(CompiledFunc {
                         code: TrackedVec::from_slice(ledger, &function.code)?,
-                        inline_caches: super::cache::slots(ledger, cache_sites)?,
+                        fast: None,
                         atoms: TrackedVec::from_slice(ledger, &atoms)?,
                         name,
                         flags: function.flags,
                         kind: function.kind.unwrap_or_default(),
                         needs_arguments,
+                        needs_captures,
                         strict: function.strict,
                         arg_count: function.arg_count,
                         var_count: function.var_count,
@@ -145,17 +146,24 @@ pub(super) fn load_functions(
     Ok(functions)
 }
 
-fn execution_metadata(code: &[u8]) -> (usize, bool) {
+fn execution_metadata(code: &[u8]) -> (bool, bool) {
+    use Opcode::*;
     let mut pc = 0;
-    let mut cache_sites = 0;
     let mut needs_arguments = false;
+    let mut needs_captures = false;
     while pc < code.len() {
         let op = Opcode::ALL[code[pc] as usize];
-        cache_sites += usize::from(super::cache::supports(op));
-        needs_arguments |= op == Opcode::SpecialObject && code[pc + 1] <= 1;
+        if op == SpecialObject && code[pc + 1] <= 1 {
+            needs_arguments = true;
+            needs_captures = true;
+        }
+        needs_captures |= matches!(
+            op,
+            Fclosure | Fclosure8 | MakeLocRef | MakeArgRef | Eval | ApplyEval | CloseLoc
+        );
         pc += usize::from(op.info().size);
     }
-    (cache_sites.min(16), needs_arguments)
+    (needs_arguments, needs_captures)
 }
 
 fn clone_items<T: Clone>(
