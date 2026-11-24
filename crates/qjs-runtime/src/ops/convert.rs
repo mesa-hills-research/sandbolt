@@ -154,28 +154,36 @@ pub(crate) fn space(unit: u16) -> bool {
     qjs_unicode::is_space(u32::from(unit))
 }
 
+#[inline]
+pub(crate) fn string_to_number_inline(heap: &crate::heap::Heap, id: StrId) -> Option<f64> {
+    let mut bytes = heap.string(id).as_latin1()?;
+    let is_space = |byte| space(u16::from(byte));
+    while let Some((&byte, rest)) = bytes.split_first() {
+        if !is_space(byte) {
+            break;
+        }
+        bytes = rest;
+    }
+    while let Some((&byte, rest)) = bytes.split_last() {
+        if !is_space(byte) {
+            break;
+        }
+        bytes = rest;
+    }
+    if bytes.len() <= 128 {
+        Some(if bytes.is_empty() {
+            0.0
+        } else {
+            parse_number(bytes)
+        })
+    } else {
+        None
+    }
+}
+
 pub(crate) fn string_to_number(ctx: &mut ExecCtx<'_, '_>, id: StrId) -> JsResult<f64> {
-    if let Some(mut bytes) = ctx.heap().string(id).as_latin1() {
-        let is_space = |byte| space(u16::from(byte));
-        while let Some((&byte, rest)) = bytes.split_first() {
-            if !is_space(byte) {
-                break;
-            }
-            bytes = rest;
-        }
-        while let Some((&byte, rest)) = bytes.split_last() {
-            if !is_space(byte) {
-                break;
-            }
-            bytes = rest;
-        }
-        if bytes.len() <= 128 {
-            return Ok(if bytes.is_empty() {
-                0.0
-            } else {
-                parse_number(bytes)
-            });
-        }
+    if let Some(number) = string_to_number_inline(ctx.heap(), id) {
+        return Ok(number);
     }
     let mut first = None;
     let mut end = 0;
@@ -345,6 +353,37 @@ pub(crate) fn format_f64_fast(
     digits: usize,
     options: qjs_dtoa::DtoaOptions,
 ) -> JsResult<Value> {
+    let bytes = qjs_dtoa::dtoa_max_len(n, radix, digits, options);
+    if bytes <= 128 {
+        let mut buf = [0u8; 128];
+        let len = qjs_dtoa::dtoa_into(&mut buf, n, radix, digits, options);
+        let slice = &buf[..len];
+        if len == 1
+            && let Some(id) = ctx.heap().atoms.ascii_string(usize::from(slice[0]))
+        {
+            ctx.allocate(|rt| {
+                rt.heap.ledger.charge_bytes(bytes)?;
+                rt.heap.ledger.release_bytes(bytes);
+                Ok(())
+            })?;
+            return Ok(Value::string(id));
+        }
+        let id = ctx.allocate(|rt| {
+            let heap = &mut rt.heap;
+            heap.ledger.charge_bytes(bytes)?;
+            let res = JsString::from_latin1(&heap.ledger, slice)
+                .and_then(|s| heap.strings.insert(&heap.ledger, s));
+            heap.ledger.release_bytes(bytes);
+            res
+        })?;
+        if len == 1 {
+            ctx.runtime
+                .heap
+                .atoms
+                .cache_ascii_string(usize::from(slice[0]), id);
+        }
+        return Ok(Value::string(id));
+    }
     format_f64_result(ctx, n, radix, digits, options, number_latin1)
 }
 

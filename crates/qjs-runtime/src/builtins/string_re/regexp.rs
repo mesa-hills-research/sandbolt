@@ -726,9 +726,41 @@ pub(crate) fn fast_regexp_exec(
         ctx.runtime.heap.objects.get_mut(id).unwrap().props[0] = Value::number(0.0);
         return Ok(Some(Value::NULL));
     }
-    let program = Rc::clone(&data.program);
     ctx.check_interrupt()?;
-    let result = exec_single_match(ctx, &program.compiled, input, start)?;
+    let (result, hit_limit) = {
+        let rt = &mut *ctx.runtime;
+        let ObjectData::RegExp(data) = &rt.heap.objects.get(id).unwrap().data else {
+            unreachable!()
+        };
+        let input_slice = flat_regexp_input(&rt.heap.strings, input);
+        let mut host = DirectHost {
+            vm: &mut rt.vm,
+            ledger: &rt.heap.ledger,
+            hit_limit: false,
+        };
+        let result = qjs_regexp::exec_single(&data.program.compiled, input_slice, start, &mut host);
+        (result, host.hit_limit)
+    };
+    let result = match result {
+        Err(RegExpError::OutOfMemory) if hit_limit => {
+            let program = {
+                let ObjectData::RegExp(data) = &ctx.heap().object(id).data else {
+                    unreachable!()
+                };
+                Rc::clone(&data.program)
+            };
+            ctx.collect();
+            let copied = units(ctx, Value::string(input))?;
+            qjs_regexp::exec_single(
+                &program.compiled,
+                RegExpInput::Utf16(&copied),
+                start,
+                &mut Host(ctx),
+            )
+            .map_err(|e| re_error(ctx, e))?
+        }
+        other => other.map_err(|e| re_error(ctx, e))?,
+    };
     if update {
         ctx.runtime.heap.objects.get_mut(id).unwrap().props[0] =
             Value::number(result.map_or(0.0, |(_, end)| end as f64));
@@ -962,7 +994,7 @@ fn build_single_result(
             _ => (input_id, 0),
         };
         let backing = heap.string(base);
-        let matched_string = if slice_len >= 4096
+        let matched_string = if (slice_len >= 4096 || backing.is_wide())
             && backing.len() as usize <= slice_len.saturating_mul(4)
         {
             JsString::Slice {

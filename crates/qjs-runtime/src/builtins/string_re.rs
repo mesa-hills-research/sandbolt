@@ -3,6 +3,7 @@ mod strings;
 mod uri;
 
 pub(crate) use regexp::create as regexp_literal;
+pub(crate) use regexp::fast_regexp_exec;
 
 #[cfg(test)]
 mod tests;
@@ -29,6 +30,7 @@ fn method_flags() -> PropFlags {
 }
 const STRING: NativeFnId = NativeFnId(STRING_RE_BASE);
 const REGEXP: NativeFnId = NativeFnId(STRING_RE_BASE + 0x80);
+pub(crate) const REGEXP_EXEC: NativeFnId = NativeFnId(REGEXP.0 + 3);
 
 pub fn install(ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
     strings::install(ctx)?;

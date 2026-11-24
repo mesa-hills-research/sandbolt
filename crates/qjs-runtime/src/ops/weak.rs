@@ -78,7 +78,6 @@ pub(crate) fn fast_weak_map_get(
     weak_map_lookup_raw(ctx, map, key).map(|value| value.unwrap_or(Value::UNDEFINED))
 }
 
-// Keep this available for dispatch that already has a receiver and argument.
 #[allow(dead_code)]
 pub(crate) fn fast_weak_map_has(
     ctx: &mut ExecCtx<'_, '_>,

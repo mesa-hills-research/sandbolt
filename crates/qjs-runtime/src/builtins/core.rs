@@ -12,6 +12,7 @@ mod function;
 pub(crate) use function::THROW_TYPE_ERROR;
 mod object;
 pub use object::object_to_string;
+pub(crate) const OBJECT_CTOR: NativeFnId = NativeFnId(CORE_BASE);
 mod proxy;
 mod reflect;
 #[cfg(test)]

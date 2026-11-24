@@ -232,6 +232,13 @@ fn fill_get_field(
     Some(value)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PutFieldResult {
+    Done,
+    TransitionGrow { id: ObjId, to_shape: ShapeId },
+    Slow,
+}
+
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn put_field(
@@ -239,21 +246,54 @@ pub(super) fn put_field(
     shapes: &Arena<Shape>,
     symbols: &Arena<SymbolData>,
     symbol_registry: &SymbolRegistry,
+    building_shapes: bool,
     function: &CompiledFunc,
     cell: &Cell<InlineCache>,
     atom: UnitAtom,
     receiver: Value,
     value: Value,
-) -> bool {
+) -> PutFieldResult {
     let Some(id) = receiver.as_object() else {
-        return false;
+        return PutFieldResult::Slow;
     };
     match cell.get() {
         InlineCache::Own { shape, slot, flags } => {
             let object = objects.get_mut(id).unwrap();
             if object.shape == shape && flags.contains(PropFlags::WRITABLE) {
                 object.props[slot as usize] = value;
-                return true;
+                return PutFieldResult::Done;
+            }
+        }
+        InlineCache::Transition {
+            from_shape,
+            to_shape,
+            slot,
+            proto,
+            proto_shape,
+        } => {
+            if !building_shapes && shapes.get_weak(to_shape).is_some() {
+                let shape_ok = {
+                    let object = objects.get(id).unwrap();
+                    object.shape == from_shape
+                        && object.flags.contains(ObjectFlags::EXTENSIBLE)
+                        && !object.flags.contains(ObjectFlags::IS_PROTOTYPE)
+                        && !object.flags.contains(ObjectFlags::IS_EXOTIC)
+                        && !matches!(object.data, ObjectData::MappedArguments(_))
+                        && object.props.len() == slot as usize
+                };
+                if shape_ok
+                    && proto.is_none_or(|p_id| {
+                        objects.get_weak(p_id).is_some_and(|p| p.shape == proto_shape)
+                    })
+                {
+                    let object = objects.get_mut(id).unwrap();
+                    if object.props.len() < object.props.capacity() {
+                        object.props.push_reserved(value);
+                        object.shape = to_shape;
+                        return PutFieldResult::Done;
+                    }
+                    return PutFieldResult::TransitionGrow { id, to_shape };
+                }
             }
         }
         InlineCache::ArrayLength => {
@@ -272,10 +312,10 @@ pub(super) fn put_field(
                         array.elements.truncate(n as usize);
                     }
                     array.length = n;
-                    return true;
+                    return PutFieldResult::Done;
                 }
             }
-            return false;
+            return PutFieldResult::Slow;
         }
         _ => {}
     }
@@ -284,6 +324,7 @@ pub(super) fn put_field(
         shapes,
         symbols,
         symbol_registry,
+        building_shapes,
         function,
         cell,
         atom,
@@ -299,12 +340,13 @@ fn fill_put_field(
     shapes: &Arena<Shape>,
     symbols: &Arena<SymbolData>,
     symbol_registry: &SymbolRegistry,
+    building_shapes: bool,
     function: &CompiledFunc,
     cell: &Cell<InlineCache>,
     atom: UnitAtom,
     id: ObjId,
     value: Value,
-) -> bool {
+) -> PutFieldResult {
     if atom.raw() == BuiltinAtom::Length as u32
         && matches!(objects.get(id).unwrap().data, ObjectData::Array(_))
     {
@@ -324,29 +366,79 @@ fn fill_put_field(
                 }
                 array.length = n;
                 cell.set(InlineCache::ArrayLength);
-                return true;
+                return PutFieldResult::Done;
             }
         }
-        return false;
+        return PutFieldResult::Slow;
     }
     let object = objects.get(id).unwrap();
     if object.flags.contains(ObjectFlags::IS_EXOTIC)
         || object.flags.contains(ObjectFlags::IS_PROTOTYPE)
         || matches!(object.data, ObjectData::MappedArguments(_))
     {
-        return false;
+        return PutFieldResult::Slow;
     }
     let shape_id = object.shape;
     let shape = shapes.get(shape_id).unwrap();
     if shape.is_mutable() {
-        return false;
+        return PutFieldResult::Slow;
     }
     let key = super::compiled_key_parts(symbols, symbol_registry, function, atom);
     let Some((slot, flags)) = shape.find(key) else {
-        return false;
+        if !building_shapes
+            && object.flags.contains(ObjectFlags::EXTENSIBLE)
+            && shape.props.len() < crate::shape::MAX_SHARED_SHAPE_PROPS
+        {
+            let change = crate::shape::ShapeProp {
+                key,
+                flags: PropFlags::DEFAULT_DATA,
+            };
+            if let Some(to_shape) =
+                shape.find_transition(change, |target| shapes.get_weak(target).is_some())
+            {
+                let proto_ok = match shape.proto {
+                    None => Some((None, shape_id)),
+                    Some(p_id) => {
+                        let p = objects.get(p_id).unwrap();
+                        if !p.flags.contains(ObjectFlags::IS_EXOTIC)
+                            && !matches!(p.data, ObjectData::MappedArguments(_))
+                        {
+                            let ps = shapes.get(p.shape).unwrap();
+                            if !ps.is_mutable() && ps.proto.is_none() && ps.find(key).is_none() {
+                                Some((Some(p_id), p.shape))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some((proto, proto_shape)) = proto_ok {
+                    let slot = shape.props.len() as u32;
+                    cell.set(InlineCache::Transition {
+                        from_shape: shape_id,
+                        to_shape,
+                        slot,
+                        proto,
+                        proto_shape,
+                    });
+                    let obj = objects.get_mut(id).unwrap();
+                    if obj.props.len() == slot as usize {
+                        if obj.props.len() < obj.props.capacity() {
+                            obj.props.push_reserved(value);
+                            obj.shape = to_shape;
+                            return PutFieldResult::Done;
+                        }
+                        return PutFieldResult::TransitionGrow { id, to_shape };
+                    }
+                }
+            }
+        }
+        return PutFieldResult::Slow;
     };
     if flags.contains(PropFlags::ACCESSOR) || !flags.contains(PropFlags::WRITABLE) {
-        return false;
+        return PutFieldResult::Slow;
     }
     cell.set(InlineCache::Own {
         shape: shape_id,
@@ -354,7 +446,7 @@ fn fill_put_field(
         flags,
     });
     objects.get_mut(id).unwrap().props[slot] = value;
-    true
+    PutFieldResult::Done
 }
 
 #[inline]

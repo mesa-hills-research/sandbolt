@@ -1581,3 +1581,122 @@ fn host_bridge_and_print_are_opt_in() {
     engine.eval("print(__host('text'), 42)", opts).unwrap();
     assert_eq!(&*lines.borrow(), &["echo text 42"]);
 }
+
+#[test]
+fn transition_ic_invalidates_on_proto_setter_and_survives_gc() {
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let opts = EvalOptions::default();
+    assert_eq!(
+        engine
+            .eval_to_string(
+                r#"
+        function make(a, b, c, d) {
+            let o = new Object();
+            o.a = a; o.b = b; o.c = c; o.d = d;
+            return o;
+        }
+        // Warm transition IC across inline (2) -> heap (4) slots.
+        let last;
+        for (let i = 0; i < 6; i++) last = make(i, i + 1, i + 2, i + 3);
+        [last.a, last.b, last.c, last.d].join(',');
+    "#,
+                opts.clone(),
+            )
+            .unwrap(),
+        "5,6,7,8"
+    );
+    // Collect intermediate transition shapes, then verify warm IC handles sweep + proto setter.
+    engine.collect_garbage();
+    assert_eq!(
+        engine
+            .eval_to_string(
+                r#"
+        let hits = 0;
+        let o1 = make(1, 2, 3, 4);
+        Object.defineProperty(Object.prototype, 'c', {
+            configurable: true,
+            set(v) { hits += v; }
+        });
+        let o2 = make(10, 20, 30, 40);
+        delete Object.prototype.c;
+        [o1.c, 'c' in o2, hits, o2.d].join('|');
+    "#,
+                opts,
+            )
+            .unwrap(),
+        "3|false|30|40"
+    );
+}
+
+#[test]
+fn wave4_fast_paths_preserve_edge_semantics() {
+    assert_eq!(
+        run(r#"
+        let out = [];
+        // Integer Mod negative-zero and signed remainders
+        function rem(a, b) { return a % b; }
+        out.push(Object.is(rem(-4, 2), -0), rem(-5, 3), rem(7, 4), Object.is(rem(0, 2), 0));
+        // Inline string-to-number arithmetic + BigInt mixing TypeError
+        let s1 = "12345", s2 = "12.5", r = 100;
+        out.push((s1 | 0), r - s2);
+        try { let x = "1" - 1n; out.push(x); } catch (e) { out.push(e.name); }
+        // Empty-string concat fast paths
+        out.push(7 + "", "" + 42, (0.5) + "", "" + (-0));
+        // Fused BigInt sum += a * b across 64-bit, 256-bit, and >256-bit overflow
+        function biLoop(a0, n) {
+            let sum = 0n, a = a0;
+            for (let i = 0; i < n; i++) { sum += a * a; a += 1n; }
+            return sum;
+        }
+        out.push(biLoop(1n << 27n, 3).toString());
+        out.push(biLoop(1n << 120n, 2).toString());
+        out.push(biLoop(1n << 200n, 2).toString());
+        // Dictionary PutArrayEl and Delete (strict vs sloppy non-configurable)
+        let d = {};
+        for (let i = 0; i < 32; i++) d[i] = i;
+        Object.defineProperty(d, 5, { value: 99, configurable: false, writable: true });
+        let sloppyDel = delete d[5];
+        let strictDel;
+        try { (function() { 'use strict'; delete d[5]; })(); } catch (e) { strictDel = e.name; }
+        out.push(sloppyDel, strictDel, delete d[6], 6 in d, d[5]);
+        // ForIn + string-index array access (leading zero "01" must not hit index 1)
+        let arr = [10, 20, 30];
+        arr["01"] = 999;
+        let seen = [];
+        for (let k in arr) seen.push(k + ":" + arr[k]);
+        out.push(seen.join(","));
+        // ForOfStart / ForOfNext / IteratorClose respect own & proto overrides
+        let [x1, x2, , x3, ...rest] = [1, 2, 3, 4, 5, 6];
+        out.push([x1, x2, x3, rest.length, rest[1]].join(","));
+        let custom = [1, 2];
+        custom[Symbol.iterator] = function() {
+            let i = 0;
+            return { next() { return i < 1 ? { value: 77, done: false } : { done: true }; } };
+        };
+        let [cv] = custom;
+        out.push(cv);
+        // Subclassed new Object()
+        class SubObj extends Object {}
+        out.push(new SubObj() instanceof SubObj);
+        // Direct Map / Set / WeakMap / RegExp / Number formatting edge checks
+        let m = new Map();
+        for (let i = 0; i < 20; i++) m.set(String(i), i * 2);
+        out.push(m.has("15"), m.get("15"), m.delete("15"), m.has("15"));
+        let wm = new WeakMap(), ko = {};
+        wm.set(ko, 123);
+        out.push(wm.has(ko), wm.get(ko), wm.delete(ko), wm.has(ko));
+        let re = /fox/g;
+        let m1 = re.exec("fox and fox"), m2 = re.exec("fox and fox");
+        out.push(m1.index, m2.index, re.lastIndex);
+        out.push((5).toString(), (255).toString(16), (1.25).toFixed(1), (1.25).toPrecision(2), (12.5).toExponential(1));
+        out.push((NaN).toFixed(2), (Infinity).toPrecision(2), (-Infinity).toExponential(1));
+        let rangeErrs = 0;
+        for (let fn of [() => (1).toFixed(101), () => (1).toPrecision(0), () => (1).toExponential(-1), () => (1).toString(37)]) {
+            try { fn(); } catch (e) { if (e instanceof RangeError) rangeErrs++; }
+        }
+        out.push(rangeErrs);
+        out.join('|');
+    "#),
+        "true|-2|3|true|12345|87.5|TypeError|7|42|0.5|0|54043196333752325|3533694129556768659166595001485837034313423785321069662050826523145928705|5164499756173817179311838344006023748659411585658447025661321926957383762014233473183475388885480707277793909531165589505|false|TypeError|true|false|99|0:10,1:20,2:30,01:999|1,2,4,2,6|77|true|true|30|true|false|true|123|true|false|0|8|11|5|ff|1.3|1.3|1.3e+1|NaN|Infinity|-Infinity|4"
+    );
+}

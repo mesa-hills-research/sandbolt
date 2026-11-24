@@ -669,7 +669,38 @@ fn inline_unary(heap: &Heap, op: Opcode, value: Value) -> Option<(bool, InlineWo
     Some((negative, words))
 }
 
-fn bigint_binary(ctx: &mut ExecCtx<'_, '_>, op: Opcode, a: Value, b: Value) -> JsResult<Value> {
+pub(super) fn bigint_mul_add(
+    ctx: &mut ExecCtx<'_, '_>,
+    dst: Value,
+    a: Value,
+    b: Value,
+) -> JsResult<Value> {
+    if ctx.runtime.vm.interrupt_handler.is_none() {
+        let heap = ctx.heap();
+        let (mut d_short, mut a_short, mut b_short) = ([0; 2], [0; 2], [0; 2]);
+        if let (Some(d_mag), Some(a_mag), Some(b_mag)) = (
+            inline_magnitude(heap, dst, &mut d_short),
+            inline_magnitude(heap, a, &mut a_short),
+            inline_magnitude(heap, b, &mut b_short),
+        ) {
+            let mut prod = [0; INLINE_WORDS];
+            if let Some(p_neg) = inline_mul(&mut prod, a_mag, b_mag) {
+                let prod_slice = trim(&prod);
+                let mut sum = [0; INLINE_WORDS];
+                if let Some(s_neg) = inline_add(&mut sum, d_mag, (p_neg && !prod_slice.is_empty(), prod_slice)) {
+                    return store_inline(ctx, s_neg, sum);
+                }
+            }
+        }
+    }
+    let prod = bigint_binary(ctx, Opcode::Mul, a, b)?;
+    ctx.with_scope(|ctx| {
+        let prod = ctx.root(prod)?;
+        bigint_binary(ctx, Opcode::Add, dst, ctx.get(prod))
+    })
+}
+
+pub(super) fn bigint_binary(ctx: &mut ExecCtx<'_, '_>, op: Opcode, a: Value, b: Value) -> JsResult<Value> {
     use Opcode::*;
     if op == Shr {
         return Err(ctx.throw_type_error("BigInt has no unsigned right shift"));

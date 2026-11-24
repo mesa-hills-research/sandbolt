@@ -35,7 +35,9 @@ pub(super) fn iterator_op(
         let pos = tail - skip as usize - 3;
         let iterator = ctx.runtime.vm.stack[pos];
         let method = ctx.runtime.vm.stack[pos + 1];
-        if let Some((value, done)) = dense_array_next(ctx, iterator, method) {
+        if let Some((value, done)) =
+            dense_array_next(&mut ctx.runtime.heap.objects, iterator, method)
+        {
             if done {
                 ctx.runtime.vm.stack[pos] = Value::UNDEFINED;
             }
@@ -384,8 +386,117 @@ pub(crate) fn iterator_result<'s>(
     Ok(ctx.get(object))
 }
 
-fn dense_array_next(
+pub(super) enum DenseForInStep {
+    Done,
+    Index(u32),
+    Slow,
+}
+
+#[inline]
+pub(super) fn dense_for_in_next(
+    objects: &mut crate::arena::Arena<crate::object::JsObject>,
+    iterator: Value,
+) -> DenseForInStep {
+    let Some(iterator) = iterator.as_object() else {
+        return DenseForInStep::Slow;
+    };
+    let ObjectData::ForInIterator(data) = &objects.get(iterator).unwrap().data else {
+        return DenseForInStep::Slow;
+    };
+    let Some(target) = data.target else {
+        return DenseForInStep::Done;
+    };
+    let index = data.index;
+    let Some(dense) = data.dense.as_ref().filter(|d| d.active) else {
+        return DenseForInStep::Slow;
+    };
+    if index >= dense.length as usize {
+        return DenseForInStep::Slow;
+    }
+    let target_object = objects.get(target).unwrap();
+    if !target_object.flags.contains(ObjectFlags::FAST_ARRAY) {
+        return DenseForInStep::Slow;
+    }
+    let ObjectData::Array(array) = &target_object.data else {
+        unreachable!()
+    };
+    if !array.elements.get(index).is_some_and(|&v| v != Value::EMPTY) {
+        return DenseForInStep::Slow;
+    }
+    let ObjectData::ForInIterator(data) = &mut objects.get_mut(iterator).unwrap().data else {
+        unreachable!()
+    };
+    data.index += 1;
+    DenseForInStep::Index(index as u32)
+}
+
+pub(super) fn fast_for_of_start_array(
     ctx: &mut ExecCtx<'_, '_>,
+    arr_id: ObjId,
+    realm: crate::value::RealmId,
+) -> JsResult<Option<(Value, Value)>> {
+    let next_fn = {
+        let heap = ctx.heap();
+        let object = heap.object(arr_id);
+        let ObjectData::Array(array) = &object.data else {
+            return Ok(None);
+        };
+        if !object.flags.contains(ObjectFlags::FAST_ARRAY)
+            || array.realm != realm
+            || !heap.has_intact_array_prototype(object.shape, realm)
+            || heap.shape(object.shape).live_count() != 0
+        {
+            return Ok(None);
+        }
+        let iter_proto_id = heap.realm(realm).array_iterator_proto;
+        let iter_proto = heap.object(iter_proto_id);
+        if iter_proto.flags.contains(ObjectFlags::IS_EXOTIC) {
+            return Ok(None);
+        }
+        let proto_shape = heap.shape(iter_proto.shape);
+        let Some((slot, flags)) = proto_shape.find(Atom::get("next")) else {
+            return Ok(None);
+        };
+        if flags.contains(PropFlags::ACCESSOR) {
+            return Ok(None);
+        }
+        let next_val = iter_proto.props[slot];
+        let Some(next_id) = next_val.as_object() else {
+            return Ok(None);
+        };
+        let ObjectData::NativeFunction(native) = &heap.object(next_id).data else {
+            return Ok(None);
+        };
+        if native.function != ARRAY_ITERATOR_NEXT {
+            return Ok(None);
+        }
+        next_val
+    };
+    let iter_proto_id = ctx.heap().realm(realm).array_iterator_proto;
+    let iter_id = ctx.allocate(|rt| {
+        let heap = &mut rt.heap;
+        let data = TrackedBox::new(
+            &heap.ledger,
+            IteratorData {
+                kind: IteratorKind::Array {
+                    target: Value::object(arr_id),
+                    kind: ArrayIteratorKind::Value,
+                    index: 0,
+                },
+            },
+        )?;
+        heap.insert_object(
+            Some(iter_proto_id),
+            ObjectFlags::EXTENSIBLE,
+            ObjectData::Iterator(data),
+        )
+    })?;
+    Ok(Some((Value::object(iter_id), next_fn)))
+}
+
+#[inline]
+pub(super) fn dense_array_next(
+    objects: &mut crate::arena::Arena<crate::object::JsObject>,
     iterator: Value,
     method: Value,
 ) -> Option<(Value, bool)> {
@@ -393,8 +504,7 @@ fn dense_array_next(
         return Some((Value::UNDEFINED, true));
     }
     let id = iterator.as_object()?;
-    let heap = ctx.heap();
-    let ObjectData::Iterator(data) = &heap.object(id).data else {
+    let ObjectData::Iterator(data) = &objects.get(id).unwrap().data else {
         return None;
     };
     let IteratorKind::Array {
@@ -405,7 +515,7 @@ fn dense_array_next(
     else {
         return None;
     };
-    let ObjectData::NativeFunction(next) = &heap.object(method.as_object()?).data else {
+    let ObjectData::NativeFunction(next) = &objects.get(method.as_object()?).unwrap().data else {
         return None;
     };
     if next.function != ARRAY_ITERATOR_NEXT {
@@ -414,7 +524,7 @@ fn dense_array_next(
     let (value, done) = if target == Value::UNDEFINED {
         return Some((Value::UNDEFINED, true));
     } else {
-        let object = heap.object(target.as_object().unwrap());
+        let object = objects.get(target.as_object().unwrap()).unwrap();
         let ObjectData::Array(array) = &object.data else {
             return None;
         };
@@ -432,7 +542,7 @@ fn dense_array_next(
             (value, false)
         }
     };
-    let ObjectData::Iterator(data) = &mut ctx.runtime.heap.objects.get_mut(id).unwrap().data else {
+    let ObjectData::Iterator(data) = &mut objects.get_mut(id).unwrap().data else {
         unreachable!()
     };
     let IteratorKind::Array { target, index, .. } = &mut data.kind else {

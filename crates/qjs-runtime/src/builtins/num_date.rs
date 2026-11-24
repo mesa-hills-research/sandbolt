@@ -53,6 +53,11 @@ impl Numeric {
     }
 }
 
+pub(crate) const NUM_TO_EXPONENTIAL: NativeFnId = Numeric::ToExponential.id();
+pub(crate) const NUM_TO_FIXED: NativeFnId = Numeric::ToFixed.id();
+pub(crate) const NUM_TO_PRECISION: NativeFnId = Numeric::ToPrecision.id();
+pub(crate) const NUM_TO_STRING: NativeFnId = Numeric::ToString.id();
+
 type Method = (&'static str, u32, NativeFnId);
 
 fn install_methods<'s>(

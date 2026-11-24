@@ -95,6 +95,13 @@ pub(crate) enum InlineCache {
         slot: u32,
         flags: PropFlags,
     },
+    Transition {
+        from_shape: ShapeId,
+        to_shape: ShapeId,
+        slot: u32,
+        proto: Option<ObjId>,
+        proto_shape: ShapeId,
+    },
     Proto1 {
         shape: ShapeId,
         holder: ObjId,

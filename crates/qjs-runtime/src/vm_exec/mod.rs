@@ -19,7 +19,10 @@ use qjs_bytecode::{ExceptionHandler, FunctionKind, Instruction, Opcode, Operands
 use qjs_syntax::SourceText;
 
 use crate::atom::{Atom, PropKey};
-use crate::builtins::{ARRAY_ITER_BASE, NUM_DATE_BASE, STRING_RE_BASE};
+use crate::builtins::{
+    ARRAY_ITER_BASE, NUM_DATE_BASE, STRING_RE_BASE, coll_weak, core as core_builtins, num_date,
+    string_re,
+};
 use crate::ledger::{TrackedBox, TrackedVec};
 use crate::object::{ErrorKind, JsObject, ObjectData, ObjectFlags};
 use crate::ops::{call, compare, convert, property};
@@ -157,9 +160,26 @@ const FN_ARRAY_PUSH: u16 = ARRAY_ITER_BASE + 37;
 const FN_STRING_CTOR: u16 = STRING_RE_BASE;
 const FN_STRING_CONCAT: u16 = STRING_RE_BASE + 8;
 const FN_STRING_SLICE: u16 = STRING_RE_BASE + 24;
+const FN_REGEXP_EXEC: u16 = string_re::REGEXP_EXEC.0;
 const FN_MATH_MAX: u16 = NUM_DATE_BASE + 0x30 + 24;
 const FN_MATH_MIN: u16 = NUM_DATE_BASE + 0x30 + 25;
 const FN_DATE_NOW: u16 = NUM_DATE_BASE + 0x101;
+const FN_NUM_TO_EXPONENTIAL: u16 = num_date::NUM_TO_EXPONENTIAL.0;
+const FN_NUM_TO_FIXED: u16 = num_date::NUM_TO_FIXED.0;
+const FN_NUM_TO_PRECISION: u16 = num_date::NUM_TO_PRECISION.0;
+const FN_NUM_TO_STRING: u16 = num_date::NUM_TO_STRING.0;
+const FN_MAP_SET: u16 = coll_weak::MAP_SET.0;
+const FN_MAP_GET: u16 = coll_weak::MAP_GET.0;
+const FN_MAP_HAS: u16 = coll_weak::MAP_HAS.0;
+const FN_MAP_DELETE: u16 = coll_weak::MAP_DELETE.0;
+const FN_SET_ADD: u16 = coll_weak::SET_ADD.0;
+const FN_SET_HAS: u16 = coll_weak::SET_HAS.0;
+const FN_SET_DELETE: u16 = coll_weak::SET_DELETE.0;
+const FN_WEAK_MAP_SET: u16 = coll_weak::WEAK_MAP_SET.0;
+const FN_WEAK_MAP_GET: u16 = coll_weak::WEAK_MAP_GET.0;
+const FN_WEAK_MAP_HAS: u16 = coll_weak::WEAK_MAP_HAS.0;
+const FN_WEAK_MAP_DELETE: u16 = coll_weak::WEAK_MAP_DELETE.0;
+const FN_OBJECT_CTOR: u16 = core_builtins::OBJECT_CTOR.0;
 
 enum FastBreak {
     Slow(u32),
@@ -175,21 +195,20 @@ enum FastBreak {
         caller_ip: u32,
     },
     EnterJs {
-        callee_frame: CallFrame,
         callee_code: BcId,
-        callee_limit: usize,
-        base: usize,
-        count: usize,
+        callee_realm: RealmId,
+        callee_limit: u32,
+        base: u32,
+        count: u16,
         method: bool,
-        call_pc: u32,
-        next_pc: u32,
-        next_ip: u32,
+        args_ready: bool,
     },
     TryPlainCall {
         count: usize,
         method: bool,
         call_pc: u32,
         next_pc: u32,
+        next_ip: usize,
     },
     AppendArray {
         id: ObjId,
@@ -197,6 +216,26 @@ enum FastBreak {
         truncate_to: usize,
         at: u32,
         next_pc: u32,
+        next_ip: usize,
+    },
+    DictPut {
+        id: ObjId,
+        shape_id: ShapeId,
+        key: PropKey,
+        value: Value,
+        truncate_to: usize,
+        at: u32,
+        next_pc: u32,
+        next_ip: usize,
+    },
+    PutFieldTransitionGrow {
+        id: ObjId,
+        to_shape: ShapeId,
+        value: Value,
+        truncate_to: usize,
+        at: u32,
+        next_pc: u32,
+        next_ip: usize,
     },
     ConcatStrings {
         a: StrId,
@@ -205,25 +244,113 @@ enum FastBreak {
         truncate_to: usize,
         at: u32,
         next_pc: u32,
+        next_ip: usize,
     },
     NewObject {
+        realm: RealmId,
+        dest: usize,
+        truncate_to: usize,
         at: u32,
         next_pc: u32,
+        next_ip: usize,
     },
     NewNullProtoObject {
         at: u32,
         next_pc: u32,
+        next_ip: usize,
+    },
+    NewArrayEmpty {
+        at: u32,
+        next_pc: u32,
+        next_ip: usize,
+    },
+    ForOfStartArray {
+        arr_id: ObjId,
+        at: u32,
+        next_pc: u32,
+        next_ip: usize,
     },
     CloneRegExp {
         constant: Value,
         at: u32,
         next_pc: u32,
+        next_ip: usize,
     },
-    IntToString {
+    IntToStringDest {
+        value: i32,
+        dest: usize,
+        truncate_to: usize,
+        at: u32,
+        next_pc: u32,
+        next_ip: usize,
+    },
+    FloatToStringDest {
+        value: f64,
+        dest: usize,
+        truncate_to: usize,
+        at: u32,
+        next_pc: u32,
+        next_ip: usize,
+    },
+    FormatNumber {
+        base: u32,
+        value: f64,
+        radix: u8,
+        digits: u8,
+        options: qjs_dtoa::DtoaOptions,
+        at: u32,
+        next_pc: u32,
+        next_ip: u32,
+    },
+    BigIntBinary {
+        op: Opcode,
+        lhs: Value,
+        rhs: Value,
+        dest: usize,
+        truncate_to: usize,
+        at: u32,
+        next_pc: u32,
+        next_ip: usize,
+    },
+    BigIntMulAddLoc {
+        dst_slot: usize,
+        a: Value,
+        b: Value,
+        at: u32,
+        next_pc: u32,
+        next_ip: usize,
+    },
+    MapSet {
         base: usize,
+        id: ObjId,
+        key: Value,
+        value: Value,
+        at: u32,
+        next_pc: u32,
+        next_ip: usize,
+    },
+    WeakMapSet {
+        base: usize,
+        id: ObjId,
+        key: Value,
+        value: Value,
+        at: u32,
+        next_pc: u32,
+        next_ip: usize,
+    },
+    RegExpExec {
+        base: usize,
+        re_id: ObjId,
+        input_id: StrId,
+        at: u32,
+        next_pc: u32,
+        next_ip: usize,
+    },
+    ForInIndex {
         value: i32,
         at: u32,
         next_pc: u32,
+        next_ip: usize,
     },
     StringSlice {
         base: usize,
@@ -231,13 +358,133 @@ enum FastBreak {
         end: usize,
         at: u32,
         next_pc: u32,
+        next_ip: usize,
     },
     StringConcat {
         base: usize,
         argc: usize,
         at: u32,
         next_pc: u32,
+        next_ip: usize,
     },
+}
+
+#[inline]
+fn is_bigint(value: Value) -> bool {
+    matches!(
+        value.decode(),
+        ValueKind::ShortBigInt(_) | ValueKind::BigInt(_)
+    )
+}
+
+#[inline]
+fn parse_ascii_array_index(heap: &crate::heap::Heap, id: StrId) -> Option<usize> {
+    let bytes = heap.string(id).as_latin1()?;
+    if bytes.is_empty() || bytes.len() > 9 {
+        return None;
+    }
+    let first = bytes[0];
+    if first == b'0' {
+        return (bytes.len() == 1).then_some(0);
+    }
+    if !(b'1'..=b'9').contains(&first) {
+        return None;
+    }
+    let mut val = usize::from(first - b'0');
+    for &b in &bytes[1..] {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val * 10 + usize::from(b - b'0');
+    }
+    Some(val)
+}
+
+#[inline]
+fn fast_array_index(heap: &crate::heap::Heap, value: Value) -> Option<usize> {
+    match value.decode() {
+        ValueKind::Int32(n) => usize::try_from(n).ok(),
+        ValueKind::String(id) => parse_ascii_array_index(heap, id),
+        _ => None,
+    }
+}
+
+#[inline]
+fn fast_array_get_value(heap: &crate::heap::Heap, id: ObjId, element: usize) -> Option<Value> {
+    let object = heap.object(id);
+    match &object.data {
+        ObjectData::Array(array) if object.flags.contains(ObjectFlags::FAST_ARRAY) => array
+            .elements
+            .get(element)
+            .copied()
+            .filter(|&v| v != Value::EMPTY),
+        ObjectData::TypedArray(view) => {
+            crate::builtins::typed_atomics::fast_typed_array_get(heap, **view, element)
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+fn fast_int_to_string_id(ctx: &mut ExecCtx<'_, '_>, value: i32) -> JsResult<StrId> {
+    let mut buf = [0u8; 16];
+    let len = qjs_dtoa::i32toa(&mut buf, value);
+    if len == 1 && buf[0].is_ascii() {
+        let slot = usize::from(buf[0]);
+        if let Some(id) = ctx.heap().atoms.ascii_string(slot) {
+            return Ok(id);
+        }
+        let id = ctx.allocate(|rt| {
+            let s = JsString::from_latin1(&rt.heap.ledger, &buf[..1])?;
+            rt.heap.strings.insert(&rt.heap.ledger, s)
+        })?;
+        ctx.runtime.heap.atoms.cache_ascii_string(slot, id);
+        Ok(id)
+    } else {
+        let mut data = [0u8; INLINE_LATIN1_CAPACITY];
+        data[..len].copy_from_slice(&buf[..len]);
+        ctx.allocate(|rt| {
+            rt.heap.strings.insert(
+                &rt.heap.ledger,
+                JsString::InlineLatin1 {
+                    len: len as u8,
+                    is_ascii: true,
+                    data,
+                },
+            )
+        })
+    }
+}
+
+enum EmptyStringAdd {
+    Inline(Value),
+    Int(i32),
+    Float(f64),
+    None,
+}
+
+#[inline]
+fn check_empty_string_add(heap: &crate::heap::Heap, lhs: Value, rhs: Value) -> EmptyStringAdd {
+    let num = match (lhs.decode(), rhs.decode()) {
+        (ValueKind::Int32(n), ValueKind::String(s)) | (ValueKind::String(s), ValueKind::Int32(n))
+            if heap.string(s).is_empty() =>
+        {
+            if (0..=9).contains(&n)
+                && let Some(id) = heap.atoms.ascii_string((b'0' + n as u8) as usize)
+            {
+                return EmptyStringAdd::Inline(Value::string(id));
+            }
+            return EmptyStringAdd::Int(n);
+        }
+        (ValueKind::Float64(f), ValueKind::String(s))
+        | (ValueKind::String(s), ValueKind::Float64(f))
+            if heap.string(s).is_empty() =>
+        {
+            f
+        }
+        _ => return EmptyStringAdd::None,
+    };
+    EmptyStringAdd::Float(num)
 }
 
 #[inline]
@@ -364,19 +611,20 @@ pub(crate) fn run_frame(
             return run_raw_frame(ctx, index, code, entry_index);
         }
 
+        let frame_limit = {
+            let f = ctx
+                .runtime
+                .heap
+                .bytecode
+                .get(code)
+                .unwrap()
+                .compiled
+                .as_ref()
+                .unwrap();
+            frame.floor as usize + usize::from(f.stack_size)
+        };
+
         'resume: loop {
-            let frame_limit = {
-                let f = ctx
-                    .runtime
-                    .heap
-                    .bytecode
-                    .get(code)
-                    .unwrap()
-                    .compiled
-                    .as_ref()
-                    .unwrap();
-                frame.floor as usize + usize::from(f.stack_size)
-            };
             if ctx.runtime.vm.stack.capacity() < frame_limit + 1 {
                 ctx.runtime.vm.stack.truncate(sp);
                 let extra = (frame_limit + 1).saturating_sub(sp);
@@ -501,6 +749,7 @@ pub(crate) fn run_frame(
                                 constant: constants[idx as usize],
                                 at: orig_pcs[cur_ip],
                                 next_pc: orig_pcs[cur_ip + 1],
+                                next_ip: ip,
                             };
                         }
                         FastOp::PushConstRepeat { index: idx, count } => {
@@ -738,33 +987,7 @@ pub(crate) fn run_frame(
                         }
                         FastOp::AddLoc(n) => {
                             let lhs_slot = var_base + usize::from(n);
-                            let rhs = stack[sp - 1];
-                            if let Some(result) = fast_binary(
-                                Opcode::Add,
-                                stack[lhs_slot],
-                                rhs,
-                                vm.interrupt_handler.is_some(),
-                            ) {
-                                stack[lhs_slot] = result;
-                                sp -= 1;
-                            } else if let (ValueKind::String(a), ValueKind::String(b)) =
-                                (stack[lhs_slot].decode(), rhs.decode())
-                                && stack_cap.saturating_sub(sp) >= 3
-                            {
-                                break FastBreak::ConcatStrings {
-                                    a,
-                                    b,
-                                    dest: lhs_slot,
-                                    truncate_to: sp - 1,
-                                    at: orig_pcs[cur_ip],
-                                    next_pc: orig_pcs[cur_ip + 1],
-                                };
-                            } else {
-                                break FastBreak::Slow(orig_pcs[cur_ip]);
-                            }
-                        }
-                        FastOp::AddPutLoc(dst) => {
-                            let lhs = stack[sp - 2];
+                            let lhs = stack[lhs_slot];
                             let rhs = stack[sp - 1];
                             if let Some(result) = fast_binary(
                                 Opcode::Add,
@@ -772,47 +995,224 @@ pub(crate) fn run_frame(
                                 rhs,
                                 vm.interrupt_handler.is_some(),
                             ) {
-                                stack[var_base + usize::from(dst)] = result;
+                                stack[lhs_slot] = result;
+                                sp -= 1;
+                            } else if let (ValueKind::String(a), ValueKind::String(b)) =
+                                (lhs.decode(), rhs.decode())
+                            {
+                                if heap.string(a).is_empty() {
+                                    stack[lhs_slot] = Value::string(b);
+                                    sp -= 1;
+                                } else if heap.string(b).is_empty() {
+                                    sp -= 1;
+                                } else {
+                                    break FastBreak::ConcatStrings {
+                                        a,
+                                        b,
+                                        dest: lhs_slot,
+                                        truncate_to: sp - 1,
+                                        at: orig_pcs[cur_ip],
+                                        next_pc: orig_pcs[cur_ip + 1],
+                                        next_ip: ip,
+                                    };
+                                }
+                            } else if is_bigint(lhs) && is_bigint(rhs) {
+                                break FastBreak::BigIntBinary {
+                                    op: Opcode::Add,
+                                    lhs,
+                                    rhs,
+                                    dest: lhs_slot,
+                                    truncate_to: sp - 1,
+                                    at: orig_pcs[cur_ip],
+                                    next_pc: orig_pcs[cur_ip + 1],
+                                    next_ip: ip,
+                                };
+                            } else {
+                                match check_empty_string_add(heap, lhs, rhs) {
+                                    EmptyStringAdd::Inline(v) => {
+                                        stack[lhs_slot] = v;
+                                        sp -= 1;
+                                    }
+                                    EmptyStringAdd::Int(value) => {
+                                        break FastBreak::IntToStringDest {
+                                            value,
+                                            dest: lhs_slot,
+                                            truncate_to: sp - 1,
+                                            at: orig_pcs[cur_ip],
+                                            next_pc: orig_pcs[cur_ip + 1],
+                                            next_ip: ip,
+                                        };
+                                    }
+                                    EmptyStringAdd::Float(value) => {
+                                        break FastBreak::FloatToStringDest {
+                                            value,
+                                            dest: lhs_slot,
+                                            truncate_to: sp - 1,
+                                            at: orig_pcs[cur_ip],
+                                            next_pc: orig_pcs[cur_ip + 1],
+                                            next_ip: ip,
+                                        };
+                                    }
+                                    EmptyStringAdd::None => {
+                                        break FastBreak::Slow(orig_pcs[cur_ip]);
+                                    }
+                                }
+                            }
+                        }
+                        FastOp::AddPutLoc(dst) => {
+                            let lhs = stack[sp - 2];
+                            let rhs = stack[sp - 1];
+                            let dst_slot = var_base + usize::from(dst);
+                            if let Some(result) = fast_binary(
+                                Opcode::Add,
+                                lhs,
+                                rhs,
+                                vm.interrupt_handler.is_some(),
+                            ) {
+                                stack[dst_slot] = result;
                                 sp -= 2;
                             } else if let (ValueKind::String(a), ValueKind::String(b)) =
                                 (lhs.decode(), rhs.decode())
-                                && stack_cap.saturating_sub(sp) >= 3
                             {
-                                break FastBreak::ConcatStrings {
-                                    a,
-                                    b,
+                                if heap.string(a).is_empty() {
+                                    stack[dst_slot] = Value::string(b);
+                                    sp -= 2;
+                                } else if heap.string(b).is_empty() {
+                                    stack[dst_slot] = Value::string(a);
+                                    sp -= 2;
+                                } else {
+                                    break FastBreak::ConcatStrings {
+                                        a,
+                                        b,
+                                        dest: dst_slot,
+                                        truncate_to: sp - 2,
+                                        at: orig_pcs[cur_ip],
+                                        next_pc: orig_pcs[cur_ip + 1],
+                                        next_ip: ip,
+                                    };
+                                }
+                            } else if is_bigint(lhs) && is_bigint(rhs) {
+                                break FastBreak::BigIntBinary {
+                                    op: Opcode::Add,
+                                    lhs,
+                                    rhs,
+                                    dest: dst_slot,
+                                    truncate_to: sp - 2,
+                                    at: orig_pcs[cur_ip],
+                                    next_pc: orig_pcs[cur_ip + 1],
+                                    next_ip: ip,
+                                };
+                            } else {
+                                match check_empty_string_add(heap, lhs, rhs) {
+                                    EmptyStringAdd::Inline(v) => {
+                                        stack[dst_slot] = v;
+                                        sp -= 2;
+                                    }
+                                    EmptyStringAdd::Int(value) => {
+                                        break FastBreak::IntToStringDest {
+                                            value,
+                                            dest: dst_slot,
+                                            truncate_to: sp - 2,
+                                            at: orig_pcs[cur_ip],
+                                            next_pc: orig_pcs[cur_ip + 1],
+                                            next_ip: ip,
+                                        };
+                                    }
+                                    EmptyStringAdd::Float(value) => {
+                                        break FastBreak::FloatToStringDest {
+                                            value,
+                                            dest: dst_slot,
+                                            truncate_to: sp - 2,
+                                            at: orig_pcs[cur_ip],
+                                            next_pc: orig_pcs[cur_ip + 1],
+                                            next_ip: ip,
+                                        };
+                                    }
+                                    EmptyStringAdd::None => {
+                                        break FastBreak::Slow(orig_pcs[cur_ip]);
+                                    }
+                                }
+                            }
+                        }
+                        FastOp::SubPutLoc(dst) => {
+                            let lhs = stack[sp - 2];
+                            let rhs = stack[sp - 1];
+                            if let Some(result) = fast_binary(
+                                Opcode::Sub,
+                                lhs,
+                                rhs,
+                                vm.interrupt_handler.is_some(),
+                            ) {
+                                stack[var_base + usize::from(dst)] = result;
+                                sp -= 2;
+                            } else if let Some(result) =
+                                fast_binary_with_string(heap, Opcode::Sub, lhs, rhs)
+                            {
+                                stack[var_base + usize::from(dst)] = result;
+                                sp -= 2;
+                            } else if is_bigint(lhs) && is_bigint(rhs) {
+                                break FastBreak::BigIntBinary {
+                                    op: Opcode::Sub,
+                                    lhs,
+                                    rhs,
                                     dest: var_base + usize::from(dst),
                                     truncate_to: sp - 2,
                                     at: orig_pcs[cur_ip],
                                     next_pc: orig_pcs[cur_ip + 1],
+                                    next_ip: ip,
                                 };
                             } else {
                                 break FastBreak::Slow(orig_pcs[cur_ip]);
                             }
                         }
-                        FastOp::SubPutLoc(dst) => {
-                            let Some(result) = fast_binary(
-                                Opcode::Sub,
-                                stack[sp - 2],
-                                stack[sp - 1],
-                                vm.interrupt_handler.is_some(),
-                            ) else {
-                                break FastBreak::Slow(orig_pcs[cur_ip]);
-                            };
-                            stack[var_base + usize::from(dst)] = result;
-                            sp -= 2;
-                        }
                         FastOp::GetLoc2Mul(a, b) => {
-                            let Some(result) = fast_binary(
+                            let lhs = stack[var_base + usize::from(a)];
+                            let rhs = stack[var_base + usize::from(b)];
+                            if let Some(result) = fast_binary(
                                 Opcode::Mul,
-                                stack[var_base + usize::from(a)],
-                                stack[var_base + usize::from(b)],
+                                lhs,
+                                rhs,
                                 vm.interrupt_handler.is_some(),
-                            ) else {
+                            ) {
+                                stack[sp] = result;
+                                sp += 1;
+                            } else if is_bigint(lhs) && is_bigint(rhs) {
+                                break FastBreak::BigIntBinary {
+                                    op: Opcode::Mul,
+                                    lhs,
+                                    rhs,
+                                    dest: sp,
+                                    truncate_to: sp + 1,
+                                    at: orig_pcs[cur_ip],
+                                    next_pc: orig_pcs[cur_ip + 1],
+                                    next_ip: ip,
+                                };
+                            } else {
                                 break FastBreak::Slow(orig_pcs[cur_ip]);
-                            };
-                            stack[sp] = result;
-                            sp += 1;
+                            }
+                        }
+                        FastOp::GetLoc2MulAddLoc { dst, a, b } => {
+                            let d = var_base + usize::from(dst);
+                            let av = stack[var_base + usize::from(a)];
+                            let bv = stack[var_base + usize::from(b)];
+                            let dv = stack[d];
+                            let has_int = vm.interrupt_handler.is_some();
+                            if let Some(prod) = fast_binary(Opcode::Mul, av, bv, has_int)
+                                && let Some(sum) = fast_binary(Opcode::Add, dv, prod, has_int)
+                            {
+                                stack[d] = sum;
+                            } else if is_bigint(dv) && is_bigint(av) && is_bigint(bv) {
+                                break FastBreak::BigIntMulAddLoc {
+                                    dst_slot: d,
+                                    a: av,
+                                    b: bv,
+                                    at: orig_pcs[cur_ip],
+                                    next_pc: orig_pcs[cur_ip + 1],
+                                    next_ip: ip,
+                                };
+                            } else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            }
                         }
                         FastOp::GetLoc2Add(a, b) => {
                             let Some(result) = fast_binary(
@@ -829,27 +1229,69 @@ pub(crate) fn run_frame(
                         FastOp::GetLocAddLoc { dst, src } => {
                             let d = var_base + usize::from(dst);
                             let s = var_base + usize::from(src);
+                            let lhs = stack[d];
+                            let rhs = stack[s];
                             if let Some(result) = fast_binary(
                                 Opcode::Add,
-                                stack[d],
-                                stack[s],
+                                lhs,
+                                rhs,
                                 vm.interrupt_handler.is_some(),
                             ) {
                                 stack[d] = result;
                             } else if let (ValueKind::String(a), ValueKind::String(b)) =
-                                (stack[d].decode(), stack[s].decode())
-                                && stack_cap.saturating_sub(sp) >= 3
+                                (lhs.decode(), rhs.decode())
                             {
-                                break FastBreak::ConcatStrings {
-                                    a,
-                                    b,
+                                if heap.string(a).is_empty() {
+                                    stack[d] = Value::string(b);
+                                } else if !heap.string(b).is_empty() {
+                                    break FastBreak::ConcatStrings {
+                                        a,
+                                        b,
+                                        dest: d,
+                                        truncate_to: sp,
+                                        at: orig_pcs[cur_ip],
+                                        next_pc: orig_pcs[cur_ip + 1],
+                                        next_ip: ip,
+                                    };
+                                }
+                            } else if is_bigint(lhs) && is_bigint(rhs) {
+                                break FastBreak::BigIntBinary {
+                                    op: Opcode::Add,
+                                    lhs,
+                                    rhs,
                                     dest: d,
                                     truncate_to: sp,
                                     at: orig_pcs[cur_ip],
                                     next_pc: orig_pcs[cur_ip + 1],
+                                    next_ip: ip,
                                 };
                             } else {
-                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                                match check_empty_string_add(heap, lhs, rhs) {
+                                    EmptyStringAdd::Inline(v) => stack[d] = v,
+                                    EmptyStringAdd::Int(value) => {
+                                        break FastBreak::IntToStringDest {
+                                            value,
+                                            dest: d,
+                                            truncate_to: sp,
+                                            at: orig_pcs[cur_ip],
+                                            next_pc: orig_pcs[cur_ip + 1],
+                                            next_ip: ip,
+                                        };
+                                    }
+                                    EmptyStringAdd::Float(value) => {
+                                        break FastBreak::FloatToStringDest {
+                                            value,
+                                            dest: d,
+                                            truncate_to: sp,
+                                            at: orig_pcs[cur_ip],
+                                            next_pc: orig_pcs[cur_ip + 1],
+                                            next_ip: ip,
+                                        };
+                                    }
+                                    EmptyStringAdd::None => {
+                                        break FastBreak::Slow(orig_pcs[cur_ip]);
+                                    }
+                                }
                             }
                         }
                         FastOp::Add
@@ -889,16 +1331,70 @@ pub(crate) fn run_frame(
                             } else if binop == Opcode::Add
                                 && let (ValueKind::String(a), ValueKind::String(b)) =
                                     (lhs.decode(), rhs.decode())
-                                && stack_cap.saturating_sub(sp) >= 3
                             {
-                                break FastBreak::ConcatStrings {
-                                    a,
-                                    b,
+                                if heap.string(a).is_empty() {
+                                    stack[sp - 2] = Value::string(b);
+                                    sp -= 1;
+                                } else if heap.string(b).is_empty() {
+                                    sp -= 1;
+                                } else {
+                                    break FastBreak::ConcatStrings {
+                                        a,
+                                        b,
+                                        dest: sp - 2,
+                                        truncate_to: sp - 1,
+                                        at: orig_pcs[cur_ip],
+                                        next_pc: orig_pcs[cur_ip + 1],
+                                        next_ip: ip,
+                                    };
+                                }
+                            } else if binop != Opcode::Add
+                                && let Some(result) =
+                                    fast_binary_with_string(heap, binop, lhs, rhs)
+                            {
+                                stack[sp - 2] = result;
+                                sp -= 1;
+                            } else if is_bigint(lhs) && is_bigint(rhs) {
+                                break FastBreak::BigIntBinary {
+                                    op: binop,
+                                    lhs,
+                                    rhs,
                                     dest: sp - 2,
                                     truncate_to: sp - 1,
                                     at: orig_pcs[cur_ip],
                                     next_pc: orig_pcs[cur_ip + 1],
+                                    next_ip: ip,
                                 };
+                            } else if binop == Opcode::Add {
+                                match check_empty_string_add(heap, lhs, rhs) {
+                                    EmptyStringAdd::Inline(v) => {
+                                        stack[sp - 2] = v;
+                                        sp -= 1;
+                                    }
+                                    EmptyStringAdd::Int(value) => {
+                                        break FastBreak::IntToStringDest {
+                                            value,
+                                            dest: sp - 2,
+                                            truncate_to: sp - 1,
+                                            at: orig_pcs[cur_ip],
+                                            next_pc: orig_pcs[cur_ip + 1],
+                                            next_ip: ip,
+                                        };
+                                    }
+                                    EmptyStringAdd::Float(value) => {
+                                        break FastBreak::FloatToStringDest {
+                                            value,
+                                            dest: sp - 2,
+                                            truncate_to: sp - 1,
+                                            at: orig_pcs[cur_ip],
+                                            next_pc: orig_pcs[cur_ip + 1],
+                                            next_ip: ip,
+                                        };
+                                    }
+                                    EmptyStringAdd::None => {
+                                        break FastBreak::Slow(orig_pcs[cur_ip]);
+                                    }
+                                }
                             } else {
                                 break FastBreak::Slow(orig_pcs[cur_ip]);
                             }
@@ -1316,38 +1812,98 @@ pub(crate) fn run_frame(
                             let idx = usize::from(ic);
                             let receiver = stack[var_base + usize::from(obj)];
                             let value = stack[var_base + usize::from(val)];
-                            if !cache::put_field(
+                            match cache::put_field(
                                 &mut heap.objects,
                                 &heap.shapes,
                                 &heap.symbols,
                                 &heap.symbol_registry,
+                                heap.building_shapes,
                                 function,
                                 &caches[idx],
                                 ic_atoms[idx],
                                 receiver,
                                 value,
                             ) {
-                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                                cache::PutFieldResult::Done => {}
+                                cache::PutFieldResult::TransitionGrow { id, to_shape } => {
+                                    break FastBreak::PutFieldTransitionGrow {
+                                        id,
+                                        to_shape,
+                                        value,
+                                        truncate_to: sp,
+                                        at: orig_pcs[cur_ip],
+                                        next_pc: orig_pcs[cur_ip + 1],
+                                        next_ip: ip,
+                                    };
+                                }
+                                cache::PutFieldResult::Slow => {
+                                    break FastBreak::Slow(orig_pcs[cur_ip]);
+                                }
                             }
                         }
                         FastOp::PutField(ic) => {
                             let idx = usize::from(ic);
                             let receiver = stack[sp - 2];
                             let value = stack[sp - 1];
-                            if !cache::put_field(
+                            match cache::put_field(
                                 &mut heap.objects,
                                 &heap.shapes,
                                 &heap.symbols,
                                 &heap.symbol_registry,
+                                heap.building_shapes,
                                 function,
                                 &caches[idx],
                                 ic_atoms[idx],
                                 receiver,
                                 value,
                             ) {
-                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                                cache::PutFieldResult::Done => {
+                                    sp -= 2;
+                                }
+                                cache::PutFieldResult::TransitionGrow { id, to_shape } => {
+                                    break FastBreak::PutFieldTransitionGrow {
+                                        id,
+                                        to_shape,
+                                        value,
+                                        truncate_to: sp - 2,
+                                        at: orig_pcs[cur_ip],
+                                        next_pc: orig_pcs[cur_ip + 1],
+                                        next_ip: ip,
+                                    };
+                                }
+                                cache::PutFieldResult::Slow => {
+                                    break FastBreak::Slow(orig_pcs[cur_ip]);
+                                }
                             }
-                            sp -= 2;
+                        }
+                        FastOp::GetLocGetVarAddLoc { dst, ic } => {
+                            let idx = usize::from(ic);
+                            let id = heap.realm(frame.realm).global_object;
+                            let object = heap.object(id);
+                            let Some((slot, _)) = cache::global_slot(
+                                heap,
+                                function,
+                                &caches[idx],
+                                ic_atoms[idx],
+                                object,
+                                false,
+                                false,
+                                vm.global_lexical_epoch,
+                                modules,
+                                frame.realm,
+                            ) else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            };
+                            let d = var_base + usize::from(dst);
+                            let Some(sum) = fast_binary(
+                                Opcode::Add,
+                                stack[d],
+                                object.props[slot],
+                                vm.interrupt_handler.is_some(),
+                            ) else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            };
+                            stack[d] = sum;
                         }
                         FastOp::GetVar(ic)
                         | FastOp::GetVarUndef(ic)
@@ -1435,14 +1991,15 @@ pub(crate) fn run_frame(
                             let Some(id) = stack[object_slot].as_object() else {
                                 break FastBreak::Slow(orig_pcs[cur_ip]);
                             };
-                            let ValueKind::Int32(element) = stack[object_slot + 1].decode() else {
-                                break FastBreak::Slow(orig_pcs[cur_ip]);
-                            };
-                            let Ok(element) = usize::try_from(element) else {
-                                break FastBreak::Slow(orig_pcs[cur_ip]);
-                            };
-                            let object = heap.object(id);
                             if writing {
+                                let ValueKind::Int32(element_i32) = stack[object_slot + 1].decode()
+                                else {
+                                    break FastBreak::Slow(orig_pcs[cur_ip]);
+                                };
+                                let Ok(element) = usize::try_from(element_i32) else {
+                                    break FastBreak::Slow(orig_pcs[cur_ip]);
+                                };
+                                let object = heap.object(id);
                                 let value = stack[sp - 1];
                                 match &object.data {
                                     ObjectData::Array(array)
@@ -1490,6 +2047,7 @@ pub(crate) fn run_frame(
                                                 truncate_to: object_slot,
                                                 at: orig_pcs[cur_ip],
                                                 next_pc: orig_pcs[cur_ip + 1],
+                                                next_ip: ip,
                                             };
                                         } else {
                                             break FastBreak::Slow(orig_pcs[cur_ip]);
@@ -1508,28 +2066,71 @@ pub(crate) fn run_frame(
                                             break FastBreak::Slow(orig_pcs[cur_ip]);
                                         }
                                     }
+                                    ObjectData::Ordinary
+                                        if !object.flags.contains(
+                                            ObjectFlags::IS_EXOTIC | ObjectFlags::IS_PROTOTYPE,
+                                        ) && object.flags.contains(ObjectFlags::EXTENSIBLE)
+                                            && heap.shape(object.shape).is_dictionary()
+                                            && let Some(prop_key) =
+                                                PropKey::index(element_i32 as u32) =>
+                                    {
+                                        let shape_id = object.shape;
+                                        let shape = heap.shape(shape_id);
+                                        if let Some((slot, flags)) = shape.find(prop_key) {
+                                            if flags.contains(PropFlags::ACCESSOR)
+                                                || !flags.contains(PropFlags::WRITABLE)
+                                            {
+                                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                                            }
+                                            heap.objects.get_mut(id).unwrap().props[slot] = value;
+                                        } else {
+                                            let proto_ok = shape.proto.is_none_or(|p_id| {
+                                                let p = heap.object(p_id);
+                                                !p.flags.contains(ObjectFlags::IS_EXOTIC) && {
+                                                    let ps = heap.shape(p.shape);
+                                                    !ps.is_mutable()
+                                                        && ps.proto.is_none()
+                                                        && !ps.has_index_key()
+                                                }
+                                            });
+                                            if !proto_ok {
+                                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                                            }
+                                            if shape.dict_has_spare_capacity(&object.props) {
+                                                let shape =
+                                                    heap.shapes.get_mut(shape_id).unwrap();
+                                                let object = heap.objects.get_mut(id).unwrap();
+                                                shape.dict_insert_reserved(
+                                                    &mut object.props,
+                                                    crate::shape::ShapeProp {
+                                                        key: prop_key,
+                                                        flags: PropFlags::DEFAULT_DATA,
+                                                    },
+                                                    value,
+                                                );
+                                            } else {
+                                                break FastBreak::DictPut {
+                                                    id,
+                                                    shape_id,
+                                                    key: prop_key,
+                                                    value,
+                                                    truncate_to: object_slot,
+                                                    at: orig_pcs[cur_ip],
+                                                    next_pc: orig_pcs[cur_ip + 1],
+                                                    next_ip: ip,
+                                                };
+                                            }
+                                        }
+                                    }
                                     _ => break FastBreak::Slow(orig_pcs[cur_ip]),
                                 }
                                 sp = object_slot;
                             } else {
-                                let value = match &object.data {
-                                    ObjectData::Array(array)
-                                        if object.flags.contains(ObjectFlags::FAST_ARRAY) =>
-                                    {
-                                        array
-                                            .elements
-                                            .get(element)
-                                            .copied()
-                                            .filter(|&v| v != Value::EMPTY)
-                                    }
-                                    ObjectData::TypedArray(view) => {
-                                        crate::builtins::typed_atomics::fast_typed_array_get(
-                                            heap, **view, element,
-                                        )
-                                    }
-                                    _ => None,
+                                let Some(element) = fast_array_index(heap, stack[object_slot + 1])
+                                else {
+                                    break FastBreak::Slow(orig_pcs[cur_ip]);
                                 };
-                                let Some(value) = value else {
+                                let Some(value) = fast_array_get_value(heap, id, element) else {
                                     break FastBreak::Slow(orig_pcs[cur_ip]);
                                 };
                                 if matches!(op, FastOp::GetArrayEl2) {
@@ -1544,30 +2145,33 @@ pub(crate) fn run_frame(
                             let Some(id) = stack[var_base + usize::from(arr)].as_object() else {
                                 break FastBreak::Slow(orig_pcs[cur_ip]);
                             };
-                            let element = usize::from(idx);
-                            let object = heap.object(id);
-                            let value = match &object.data {
-                                ObjectData::Array(array)
-                                    if object.flags.contains(ObjectFlags::FAST_ARRAY) =>
-                                {
-                                    array
-                                        .elements
-                                        .get(element)
-                                        .copied()
-                                        .filter(|&v| v != Value::EMPTY)
-                                }
-                                ObjectData::TypedArray(view) => {
-                                    crate::builtins::typed_atomics::fast_typed_array_get(
-                                        heap, **view, element,
-                                    )
-                                }
-                                _ => None,
-                            };
-                            let Some(value) = value else {
+                            let Some(value) =
+                                fast_array_get_value(heap, id, usize::from(idx))
+                            else {
                                 break FastBreak::Slow(orig_pcs[cur_ip]);
                             };
                             stack[sp] = value;
                             sp += 1;
+                        }
+                        FastOp::GetLocImmArrayElAddLoc { dst, arr, idx } => {
+                            let Some(id) = stack[var_base + usize::from(arr)].as_object() else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            };
+                            let Some(elem_val) =
+                                fast_array_get_value(heap, id, usize::from(idx))
+                            else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            };
+                            let d = var_base + usize::from(dst);
+                            let Some(sum) = fast_binary(
+                                Opcode::Add,
+                                stack[d],
+                                elem_val,
+                                vm.interrupt_handler.is_some(),
+                            ) else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            };
+                            stack[d] = sum;
                         }
                         FastOp::PutLocImmArrayEl { arr, idx, val } => {
                             let Some(id) = stack[var_base + usize::from(arr)].as_object() else {
@@ -1613,49 +2217,198 @@ pub(crate) fn run_frame(
                             let Some(id) = stack[var_base + usize::from(arr)].as_object() else {
                                 break FastBreak::Slow(orig_pcs[cur_ip]);
                             };
-                            let ValueKind::Int32(element) =
-                                stack[var_base + usize::from(idx)].decode()
+                            let Some(element) =
+                                fast_array_index(heap, stack[var_base + usize::from(idx)])
                             else {
                                 break FastBreak::Slow(orig_pcs[cur_ip]);
                             };
-                            let Ok(element) = usize::try_from(element) else {
-                                break FastBreak::Slow(orig_pcs[cur_ip]);
-                            };
-                            let object = heap.object(id);
-                            let value = match &object.data {
-                                ObjectData::Array(array)
-                                    if object.flags.contains(ObjectFlags::FAST_ARRAY) =>
-                                {
-                                    array
-                                        .elements
-                                        .get(element)
-                                        .copied()
-                                        .filter(|&v| v != Value::EMPTY)
-                                }
-                                ObjectData::TypedArray(view) => {
-                                    crate::builtins::typed_atomics::fast_typed_array_get(
-                                        heap, **view, element,
-                                    )
-                                }
-                                _ => None,
-                            };
-                            let Some(value) = value else {
+                            let Some(value) = fast_array_get_value(heap, id, element) else {
                                 break FastBreak::Slow(orig_pcs[cur_ip]);
                             };
                             stack[sp] = value;
                             sp += 1;
                         }
+                        FastOp::GetLoc2ArrayElAddLoc { dst, arr, idx } => {
+                            let Some(id) = stack[var_base + usize::from(arr)].as_object() else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            };
+                            let Some(element) =
+                                fast_array_index(heap, stack[var_base + usize::from(idx)])
+                            else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            };
+                            let Some(elem_val) = fast_array_get_value(heap, id, element) else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            };
+                            let d = var_base + usize::from(dst);
+                            let Some(sum) = fast_binary(
+                                Opcode::Add,
+                                stack[d],
+                                elem_val,
+                                vm.interrupt_handler.is_some(),
+                            ) else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            };
+                            stack[d] = sum;
+                        }
+                        FastOp::Delete => {
+                            let Some(id) = stack[sp - 2].as_object() else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            };
+                            let ValueKind::Int32(n) = stack[sp - 1].decode() else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            };
+                            if n < 0 {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            }
+                            let Some(prop_key) = PropKey::index(n as u32) else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            };
+                            let obj = heap.object(id);
+                            if obj
+                                .flags
+                                .contains(ObjectFlags::IS_EXOTIC | ObjectFlags::IS_PROTOTYPE)
+                                || matches!(obj.data, ObjectData::MappedArguments(_))
+                                || !heap.shape(obj.shape).is_dictionary()
+                            {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            }
+                            let shape_id = obj.shape;
+                            let shape = heap.shapes.get_mut(shape_id).unwrap();
+                            let object = heap.objects.get_mut(id).unwrap();
+                            match shape.dict_delete_if_configurable(
+                                &heap.ledger,
+                                &mut object.props,
+                                prop_key,
+                            ) {
+                                Some(true) | None => {
+                                    stack[sp - 2] = Value::bool(true);
+                                    sp -= 1;
+                                }
+                                Some(false) if !function.strict => {
+                                    stack[sp - 2] = Value::bool(false);
+                                    sp -= 1;
+                                }
+                                Some(false) => {
+                                    break FastBreak::Slow(orig_pcs[cur_ip]);
+                                }
+                            }
+                        }
+                        FastOp::ForOfStart => {
+                            if vm.interrupt_handler.is_none()
+                                && let Some(arr_id) = stack[sp - 1].as_object()
+                                && matches!(heap.object(arr_id).data, ObjectData::Array(_))
+                            {
+                                break FastBreak::ForOfStartArray {
+                                    arr_id,
+                                    at: orig_pcs[cur_ip],
+                                    next_pc: orig_pcs[cur_ip + 1],
+                                    next_ip: ip,
+                                };
+                            }
+                            break FastBreak::Slow(orig_pcs[cur_ip]);
+                        }
+                        FastOp::ForOfNext(skip) => {
+                            if vm.interrupt_handler.is_some() {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            }
+                            let pos = sp - usize::from(skip) - 3;
+                            let iterator = stack[pos];
+                            let method = stack[pos + 1];
+                            let Some((val, done)) =
+                                iterators::dense_array_next(&mut heap.objects, iterator, method)
+                            else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            };
+                            if done {
+                                stack[pos] = Value::UNDEFINED;
+                            }
+                            stack[sp] = val;
+                            stack[sp + 1] = Value::bool(done);
+                            sp += 2;
+                        }
+                        FastOp::IteratorClose => {
+                            if stack[sp - 3] == Value::UNDEFINED {
+                                sp -= 3;
+                            } else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            }
+                        }
+                        FastOp::ForInNext => {
+                            match iterators::dense_for_in_next(&mut heap.objects, stack[sp - 1]) {
+                                iterators::DenseForInStep::Done => {
+                                    stack[sp] = Value::UNDEFINED;
+                                    stack[sp + 1] = Value::bool(true);
+                                    sp += 2;
+                                }
+                                iterators::DenseForInStep::Index(n) => {
+                                    if n <= 9
+                                        && let Some(ch) =
+                                            heap.atoms.ascii_string((b'0' + n as u8) as usize)
+                                    {
+                                        stack[sp] = Value::string(ch);
+                                        stack[sp + 1] = Value::bool(false);
+                                        sp += 2;
+                                    } else {
+                                        break FastBreak::ForInIndex {
+                                            value: n as i32,
+                                            at: orig_pcs[cur_ip],
+                                            next_pc: orig_pcs[cur_ip + 1],
+                                            next_ip: ip,
+                                        };
+                                    }
+                                }
+                                iterators::DenseForInStep::Slow => {
+                                    break FastBreak::Slow(orig_pcs[cur_ip]);
+                                }
+                            }
+                        }
                         FastOp::NewObject => {
                             break FastBreak::NewObject {
+                                realm: frame.realm,
+                                dest: sp,
+                                truncate_to: sp + 1,
                                 at: orig_pcs[cur_ip],
                                 next_pc: orig_pcs[cur_ip + 1],
+                                next_ip: ip,
                             };
                         }
                         FastOp::NewNullProtoObject => {
                             break FastBreak::NewNullProtoObject {
                                 at: orig_pcs[cur_ip],
                                 next_pc: orig_pcs[cur_ip + 1],
+                                next_ip: ip,
                             };
+                        }
+                        FastOp::NewArrayEmpty => {
+                            break FastBreak::NewArrayEmpty {
+                                at: orig_pcs[cur_ip],
+                                next_pc: orig_pcs[cur_ip + 1],
+                                next_ip: ip,
+                            };
+                        }
+                        FastOp::CallConstructor(count) => {
+                            if count == 0 && vm.interrupt_handler.is_none() {
+                                let start = sp - 2;
+                                let callee_val = stack[start];
+                                if callee_val == stack[start + 1]
+                                    && let Some(callee_id) = callee_val.as_object()
+                                    && let ObjectData::NativeFunction(native) =
+                                        &heap.object(callee_id).data
+                                    && native.function.0 == FN_OBJECT_CTOR
+                                    && callee_id == heap.realm(native.realm).object_ctor
+                                {
+                                    break FastBreak::NewObject {
+                                        realm: native.realm,
+                                        dest: start,
+                                        truncate_to: start + 1,
+                                        at: orig_pcs[cur_ip],
+                                        next_pc: orig_pcs[cur_ip + 1],
+                                        next_ip: ip,
+                                    };
+                                }
+                            }
+                            break FastBreak::Slow(orig_pcs[cur_ip]);
                         }
                         FastOp::Call(_)
                         | FastOp::CallMethod(_)
@@ -1795,11 +2548,13 @@ pub(crate) fn run_frame(
                                                     sp = base + 1;
                                                     true
                                                 } else {
-                                                    break FastBreak::IntToString {
-                                                        base,
+                                                    break FastBreak::IntToStringDest {
                                                         value: n,
+                                                        dest: base,
+                                                        truncate_to: base + 1,
                                                         at: call_pc,
                                                         next_pc: orig_pcs[cur_ip + 1],
+                                                        next_ip: ip,
                                                     };
                                                 }
                                             } else {
@@ -1852,6 +2607,7 @@ pub(crate) fn run_frame(
                                                                 end,
                                                                 at: call_pc,
                                                                 next_pc: orig_pcs[cur_ip + 1],
+                                                                next_ip: ip,
                                                             };
                                                         }
                                                     } else if end - start == 1
@@ -1874,6 +2630,7 @@ pub(crate) fn run_frame(
                                                             end,
                                                             at: call_pc,
                                                             next_pc: orig_pcs[cur_ip + 1],
+                                                            next_ip: ip,
                                                         };
                                                     }
                                                 } else {
@@ -1895,11 +2652,522 @@ pub(crate) fn run_frame(
                                                         argc: count,
                                                         at: call_pc,
                                                         next_pc: orig_pcs[cur_ip + 1],
+                                                        next_ip: ip,
                                                     };
                                                 }
                                             } else {
                                                 false
                                             }
+                                        }
+                                        FN_REGEXP_EXEC if method && count == 1 => {
+                                            if let Some(re_id) = stack[base].as_object()
+                                                && matches!(
+                                                    heap.object(re_id).data,
+                                                    ObjectData::RegExp(_)
+                                                )
+                                                && let ValueKind::String(input_id) =
+                                                    stack[base + 2].decode()
+                                            {
+                                                break FastBreak::RegExpExec {
+                                                    base,
+                                                    re_id,
+                                                    input_id,
+                                                    at: call_pc,
+                                                    next_pc: orig_pcs[cur_ip + 1],
+                                                    next_ip: ip,
+                                                };
+                                            }
+                                            false
+                                        }
+                                        FN_MAP_HAS | FN_SET_HAS if method && count <= 1 => {
+                                            if let Some(id) = stack[base].as_object() {
+                                                let entries = match (&heap.object(id).data, fn_id) {
+                                                    (ObjectData::Map(d), FN_MAP_HAS) => {
+                                                        Some(&d.entries)
+                                                    }
+                                                    (ObjectData::Set(d), FN_SET_HAS) => {
+                                                        Some(&d.entries)
+                                                    }
+                                                    _ => None,
+                                                };
+                                                if let Some(entries) = entries {
+                                                    let key = if count == 1 {
+                                                        stack[base + 2]
+                                                    } else {
+                                                        Value::UNDEFINED
+                                                    };
+                                                    let found = entries.len() > 0 && {
+                                                        let h = entries.hash(heap, key);
+                                                        entries
+                                                            .locate_bucket(heap, key, h)
+                                                            .is_some()
+                                                    };
+                                                    stack[base] = Value::bool(found);
+                                                    sp = base + 1;
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        FN_MAP_GET if method && count <= 1 => {
+                                            if let Some(id) = stack[base].as_object()
+                                                && let ObjectData::Map(d) = &heap.object(id).data
+                                            {
+                                                let key = if count == 1 {
+                                                    stack[base + 2]
+                                                } else {
+                                                    Value::UNDEFINED
+                                                };
+                                                let val = if d.entries.len() == 0 {
+                                                    Value::UNDEFINED
+                                                } else {
+                                                    let h = d.entries.hash(heap, key);
+                                                    d.entries
+                                                        .locate(heap, key, h)
+                                                        .map_or(Value::UNDEFINED, |row| {
+                                                            d.entries.value(row)
+                                                        })
+                                                };
+                                                stack[base] = val;
+                                                sp = base + 1;
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        FN_MAP_DELETE | FN_SET_DELETE if method && count <= 1 => {
+                                            if let Some(id) = stack[base].as_object() {
+                                                let key = if count == 1 {
+                                                    stack[base + 2]
+                                                } else {
+                                                    Value::UNDEFINED
+                                                };
+                                                let lookup = match (&heap.object(id).data, fn_id) {
+                                                    (ObjectData::Map(d), FN_MAP_DELETE) => {
+                                                        Some(if d.entries.len() == 0 {
+                                                            None
+                                                        } else {
+                                                            let h = d.entries.hash(heap, key);
+                                                            d.entries.locate_bucket(heap, key, h)
+                                                        })
+                                                    }
+                                                    (ObjectData::Set(d), FN_SET_DELETE) => {
+                                                        Some(if d.entries.len() == 0 {
+                                                            None
+                                                        } else {
+                                                            let h = d.entries.hash(heap, key);
+                                                            d.entries.locate_bucket(heap, key, h)
+                                                        })
+                                                    }
+                                                    _ => None,
+                                                };
+                                                if let Some(bucket_opt) = lookup {
+                                                    let removed = if let Some(bucket) = bucket_opt {
+                                                        match &mut heap
+                                                            .objects
+                                                            .get_mut(id)
+                                                            .unwrap()
+                                                            .data
+                                                        {
+                                                            ObjectData::Map(d) => {
+                                                                d.entries.remove_bucket(bucket)
+                                                            }
+                                                            ObjectData::Set(d) => {
+                                                                d.entries.remove_bucket(bucket)
+                                                            }
+                                                            _ => unreachable!(),
+                                                        }
+                                                        true
+                                                    } else {
+                                                        false
+                                                    };
+                                                    stack[base] = Value::bool(removed);
+                                                    sp = base + 1;
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        FN_MAP_SET | FN_SET_ADD if method && count <= 2 => {
+                                            let is_set = fn_id == FN_SET_ADD;
+                                            if let Some(id) = stack[base].as_object() {
+                                                let key = if count >= 1 {
+                                                    stack[base + 2]
+                                                } else {
+                                                    Value::UNDEFINED
+                                                };
+                                                let val = if is_set || count < 2 {
+                                                    Value::UNDEFINED
+                                                } else {
+                                                    stack[base + 3]
+                                                };
+                                                let probe = match (&heap.object(id).data, is_set) {
+                                                    (ObjectData::Map(d), false) => {
+                                                        let h = d.entries.hash(heap, key);
+                                                        Some((
+                                                            h,
+                                                            d.entries.locate(heap, key, h),
+                                                            d.entries.has_spare_capacity(),
+                                                        ))
+                                                    }
+                                                    (ObjectData::Set(d), true) => {
+                                                        let h = d.entries.hash(heap, key);
+                                                        Some((
+                                                            h,
+                                                            d.entries.locate(heap, key, h),
+                                                            d.entries.has_spare_capacity(),
+                                                        ))
+                                                    }
+                                                    _ => None,
+                                                };
+                                                if let Some((hash, existing, spare)) = probe {
+                                                    if let Some(row) = existing {
+                                                        if !is_set {
+                                                            let ObjectData::Map(d) = &mut heap
+                                                                .objects
+                                                                .get_mut(id)
+                                                                .unwrap()
+                                                                .data
+                                                            else {
+                                                                unreachable!()
+                                                            };
+                                                            d.entries.update(row, val);
+                                                        }
+                                                        sp = base + 1;
+                                                        true
+                                                    } else if spare {
+                                                        let ok = match &mut heap
+                                                            .objects
+                                                            .get_mut(id)
+                                                            .unwrap()
+                                                            .data
+                                                        {
+                                                            ObjectData::Map(d) => d
+                                                                .entries
+                                                                .insert_reserved(hash, key, val)
+                                                                .is_ok(),
+                                                            ObjectData::Set(d) => d
+                                                                .entries
+                                                                .insert_reserved(hash, key, val)
+                                                                .is_ok(),
+                                                            _ => unreachable!(),
+                                                        };
+                                                        if ok {
+                                                            sp = base + 1;
+                                                            true
+                                                        } else {
+                                                            false
+                                                        }
+                                                    } else {
+                                                        break FastBreak::MapSet {
+                                                            base,
+                                                            id,
+                                                            key,
+                                                            value: val,
+                                                            at: call_pc,
+                                                            next_pc: orig_pcs[cur_ip + 1],
+                                                            next_ip: ip,
+                                                        };
+                                                    }
+                                                } else {
+                                                    false
+                                                }
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        FN_WEAK_MAP_GET | FN_WEAK_MAP_HAS
+                                            if method && count <= 1 =>
+                                        {
+                                            if let Some(id) = stack[base].as_object()
+                                                && let ObjectData::WeakMap(d) =
+                                                    &heap.object(id).data
+                                            {
+                                                let key = if count == 1 {
+                                                    stack[base + 2]
+                                                } else {
+                                                    Value::UNDEFINED
+                                                };
+                                                let found = heap
+                                                    .weak_key(key)
+                                                    .and_then(|k| d.entries.get(k))
+                                                    .map(|entry| entry.1);
+                                                stack[base] = if fn_id == FN_WEAK_MAP_HAS {
+                                                    Value::bool(found.is_some())
+                                                } else {
+                                                    found.unwrap_or(Value::UNDEFINED)
+                                                };
+                                                sp = base + 1;
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        FN_WEAK_MAP_DELETE if method && count <= 1 => {
+                                            if let Some(id) = stack[base].as_object()
+                                                && matches!(
+                                                    heap.object(id).data,
+                                                    ObjectData::WeakMap(_)
+                                                )
+                                            {
+                                                let key = if count == 1 {
+                                                    stack[base + 2]
+                                                } else {
+                                                    Value::UNDEFINED
+                                                };
+                                                let wk = heap.weak_key(key);
+                                                let removed = if let Some(wk) = wk {
+                                                    let ObjectData::WeakMap(d) = &mut heap
+                                                        .objects
+                                                        .get_mut(id)
+                                                        .unwrap()
+                                                        .data
+                                                    else {
+                                                        unreachable!()
+                                                    };
+                                                    d.entries.remove(wk)
+                                                } else {
+                                                    false
+                                                };
+                                                stack[base] = Value::bool(removed);
+                                                sp = base + 1;
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        FN_WEAK_MAP_SET if method && count <= 2 => {
+                                            if let Some(id) = stack[base].as_object()
+                                                && matches!(
+                                                    heap.object(id).data,
+                                                    ObjectData::WeakMap(_)
+                                                )
+                                            {
+                                                let key = if count >= 1 {
+                                                    stack[base + 2]
+                                                } else {
+                                                    Value::UNDEFINED
+                                                };
+                                                let val = if count >= 2 {
+                                                    stack[base + 3]
+                                                } else {
+                                                    Value::UNDEFINED
+                                                };
+                                                if let Some(wk) = heap.weak_key(key) {
+                                                    let ObjectData::WeakMap(d) = &mut heap
+                                                        .objects
+                                                        .get_mut(id)
+                                                        .unwrap()
+                                                        .data
+                                                    else {
+                                                        unreachable!()
+                                                    };
+                                                    if d.entries
+                                                        .try_insert_reserved((wk, val))
+                                                        .is_ok()
+                                                    {
+                                                        sp = base + 1;
+                                                        true
+                                                    } else {
+                                                        break FastBreak::WeakMapSet {
+                                                            base,
+                                                            id,
+                                                            key,
+                                                            value: val,
+                                                            at: call_pc,
+                                                            next_pc: orig_pcs[cur_ip + 1],
+                                                            next_ip: ip,
+                                                        };
+                                                    }
+                                                } else {
+                                                    false
+                                                }
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        FN_NUM_TO_STRING if method && count <= 1 => {
+                                            let recv = stack[base];
+                                            let radix_opt = if count == 0
+                                                || stack[base + 2] == Value::UNDEFINED
+                                            {
+                                                Some(10u32)
+                                            } else if let ValueKind::Int32(r) =
+                                                stack[base + 2].decode()
+                                                && (2..=36).contains(&r)
+                                            {
+                                                Some(r as u32)
+                                            } else {
+                                                None
+                                            };
+                                            if let Some(radix) = radix_opt {
+                                                match recv.decode() {
+                                                    ValueKind::Int32(n) if radix == 10 => {
+                                                        if (0..=9).contains(&n)
+                                                            && let Some(str_id) = heap
+                                                                .atoms
+                                                                .ascii_string((b'0' + n as u8) as usize)
+                                                        {
+                                                            stack[base] = Value::string(str_id);
+                                                            sp = base + 1;
+                                                            true
+                                                        } else {
+                                                            break FastBreak::IntToStringDest {
+                                                                value: n,
+                                                                dest: base,
+                                                                truncate_to: base + 1,
+                                                                at: call_pc,
+                                                                next_pc: orig_pcs[cur_ip + 1],
+                                                                next_ip: ip,
+                                                            };
+                                                        }
+                                                    }
+                                                    ValueKind::Int32(_) | ValueKind::Float64(_) => {
+                                                        let n = recv.as_number().unwrap();
+                                                        let exp = if radix == 10 {
+                                                            qjs_dtoa::DtoaExp::Auto
+                                                        } else {
+                                                            qjs_dtoa::DtoaExp::Disabled
+                                                        };
+                                                        break FastBreak::FormatNumber {
+                                                            base: base as u32,
+                                                            value: n,
+                                                            radix: radix as u8,
+                                                            digits: 0,
+                                                            options: qjs_dtoa::DtoaOptions {
+                                                                exp,
+                                                                ..qjs_dtoa::DtoaOptions::default()
+                                                            },
+                                                            at: call_pc,
+                                                            next_pc: orig_pcs[cur_ip + 1],
+                                                            next_ip: ip as u32,
+                                                        };
+                                                    }
+                                                    _ => false,
+                                                }
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        FN_NUM_TO_FIXED
+                                        | FN_NUM_TO_PRECISION
+                                        | FN_NUM_TO_EXPONENTIAL
+                                            if method && count <= 1 =>
+                                        {
+                                            if let Some(n) = stack[base].as_number() {
+                                                let undefined = count == 0
+                                                    || stack[base + 2] == Value::UNDEFINED;
+                                                let spec = if fn_id == FN_NUM_TO_PRECISION
+                                                    && undefined
+                                                {
+                                                    Some((0usize, qjs_dtoa::DtoaOptions::default()))
+                                                } else if undefined {
+                                                    if fn_id == FN_NUM_TO_EXPONENTIAL {
+                                                        let exp = if n.is_finite() {
+                                                            qjs_dtoa::DtoaExp::Enabled
+                                                        } else {
+                                                            qjs_dtoa::DtoaExp::Auto
+                                                        };
+                                                        Some((
+                                                            0,
+                                                            qjs_dtoa::DtoaOptions {
+                                                                format: qjs_dtoa::DtoaFormat::Free,
+                                                                exp,
+                                                                ..qjs_dtoa::DtoaOptions::default()
+                                                            },
+                                                        ))
+                                                    } else if n.abs() >= 1e21 {
+                                                        Some((0, qjs_dtoa::DtoaOptions::default()))
+                                                    } else {
+                                                        Some((
+                                                            0,
+                                                            qjs_dtoa::DtoaOptions {
+                                                                format: qjs_dtoa::DtoaFormat::Frac,
+                                                                exp: qjs_dtoa::DtoaExp::Auto,
+                                                                ..qjs_dtoa::DtoaOptions::default()
+                                                            },
+                                                        ))
+                                                    }
+                                                } else if let ValueKind::Int32(d) =
+                                                    stack[base + 2].decode()
+                                                {
+                                                    let min = i32::from(
+                                                        fn_id == FN_NUM_TO_PRECISION,
+                                                    );
+                                                    if (min..=100).contains(&d) {
+                                                        let d = d as usize;
+                                                        if fn_id != FN_NUM_TO_FIXED
+                                                            && !n.is_finite()
+                                                        {
+                                                            Some((
+                                                                0,
+                                                                qjs_dtoa::DtoaOptions::default(),
+                                                            ))
+                                                        } else if fn_id == FN_NUM_TO_EXPONENTIAL {
+                                                            Some((
+                                                                d + 1,
+                                                                qjs_dtoa::DtoaOptions {
+                                                                    format:
+                                                                        qjs_dtoa::DtoaFormat::Fixed,
+                                                                    exp: qjs_dtoa::DtoaExp::Enabled,
+                                                                    ..qjs_dtoa::DtoaOptions::default(
+                                                                    )
+                                                                },
+                                                            ))
+                                                        } else if fn_id == FN_NUM_TO_PRECISION {
+                                                            Some((
+                                                                d,
+                                                                qjs_dtoa::DtoaOptions {
+                                                                    format:
+                                                                        qjs_dtoa::DtoaFormat::Fixed,
+                                                                    exp: qjs_dtoa::DtoaExp::Auto,
+                                                                    ..qjs_dtoa::DtoaOptions::default(
+                                                                    )
+                                                                },
+                                                            ))
+                                                        } else if n.abs() >= 1e21 {
+                                                            Some((
+                                                                0,
+                                                                qjs_dtoa::DtoaOptions::default(),
+                                                            ))
+                                                        } else {
+                                                            Some((
+                                                                d,
+                                                                qjs_dtoa::DtoaOptions {
+                                                                    format:
+                                                                        qjs_dtoa::DtoaFormat::Frac,
+                                                                    exp: qjs_dtoa::DtoaExp::Auto,
+                                                                    ..qjs_dtoa::DtoaOptions::default(
+                                                                    )
+                                                                },
+                                                            ))
+                                                        }
+                                                    } else {
+                                                        None
+                                                    }
+                                                } else {
+                                                    None
+                                                };
+                                                if let Some((digits, options)) = spec {
+                                                    break FastBreak::FormatNumber {
+                                                        base: base as u32,
+                                                        value: n,
+                                                        radix: 10,
+                                                        digits: digits as u8,
+                                                        options,
+                                                        at: call_pc,
+                                                        next_pc: orig_pcs[cur_ip + 1],
+                                                        next_ip: ip as u32,
+                                                    };
+                                                }
+                                            }
+                                            false
                                         }
                                         _ => false,
                                     };
@@ -1911,6 +3179,7 @@ pub(crate) fn run_frame(
                                         method,
                                         call_pc,
                                         next_pc: orig_pcs[cur_ip + 1],
+                                        next_ip: ip,
                                     };
                                 }
                                 ObjectData::BytecodeFunction(data) if !data.is_class_constructor => {
@@ -1966,7 +3235,37 @@ pub(crate) fn run_frame(
                                         break FastBreak::Interrupted(call_pc);
                                     }
                                     sp = floor;
-                                    let callee_frame = CallFrame {
+                                    vm.frames[index].last_pc = call_pc;
+                                    vm.frames[index].pc = orig_pcs[cur_ip + 1];
+                                    vm.frames[index].fast_ip = (cur_ip + 1) as u32;
+                                    let args_ready = stack.len() >= callee_limit;
+                                    if args_ready {
+                                        if method {
+                                            stack.swap(base, base + 1);
+                                        } else {
+                                            match count {
+                                                0 => stack[base + 1] = Value::UNDEFINED,
+                                                1 => {
+                                                    stack[base + 2] = stack[base + 1];
+                                                    stack[base + 1] = Value::UNDEFINED;
+                                                }
+                                                2 => {
+                                                    stack[base + 3] = stack[base + 2];
+                                                    stack[base + 2] = stack[base + 1];
+                                                    stack[base + 1] = Value::UNDEFINED;
+                                                }
+                                                _ => {
+                                                    stack.copy_within(
+                                                        base + 1..base + 1 + count,
+                                                        base + 2,
+                                                    );
+                                                    stack[base + 1] = Value::UNDEFINED;
+                                                }
+                                            }
+                                        }
+                                        stack[base + 2 + count..floor].fill(Value::UNDEFINED);
+                                    }
+                                    vm.frames.push_reserved(CallFrame {
                                         callee: callee_id,
                                         realm: callee_realm,
                                         caller_realm: frame.realm,
@@ -1983,17 +3282,15 @@ pub(crate) fn run_frame(
                                         return_call: false,
                                         require_object: false,
                                         coroutine: None,
-                                    };
+                                    });
                                     break FastBreak::EnterJs {
-                                        callee_frame,
                                         callee_code,
-                                        callee_limit,
-                                        base,
-                                        count,
+                                        callee_realm,
+                                        callee_limit: callee_limit as u32,
+                                        base: base as u32,
+                                        count: count as u16,
                                         method,
-                                        call_pc,
-                                        next_pc: orig_pcs[cur_ip + 1],
-                                        next_ip: (cur_ip + 1) as u32,
+                                        args_ready,
                                     };
                                 }
                                 _ => {
@@ -2002,6 +3299,7 @@ pub(crate) fn run_frame(
                                         method,
                                         call_pc,
                                         next_pc: orig_pcs[cur_ip + 1],
+                                        next_ip: ip,
                                     };
                                 }
                             }
@@ -2039,48 +3337,47 @@ pub(crate) fn run_frame(
 
             match brk {
                 FastBreak::EnterJs {
-                    callee_frame,
                     callee_code,
+                    callee_realm,
                     callee_limit,
                     base,
                     count,
                     method,
-                    call_pc,
-                    next_pc,
-                    next_ip,
+                    args_ready,
                 } => {
-                    let vm = &mut ctx.runtime.vm;
-                    vm.frames[index].last_pc = call_pc;
-                    vm.frames[index].pc = next_pc;
-                    vm.frames[index].fast_ip = next_ip;
-                    while vm.stack.len() < callee_limit {
-                        vm.stack.push_reserved(Value::UNDEFINED);
-                    }
-                    let stack = &mut vm.stack[..];
-                    if method {
-                        stack.swap(base, base + 1);
-                    } else {
-                        match count {
-                            0 => stack[base + 1] = Value::UNDEFINED,
-                            1 => {
-                                stack[base + 2] = stack[base + 1];
-                                stack[base + 1] = Value::UNDEFINED;
-                            }
-                            2 => {
-                                stack[base + 3] = stack[base + 2];
-                                stack[base + 2] = stack[base + 1];
-                                stack[base + 1] = Value::UNDEFINED;
-                            }
-                            _ => {
-                                stack.copy_within(base + 1..base + 1 + count, base + 2);
-                                stack[base + 1] = Value::UNDEFINED;
+                    if !args_ready {
+                        let vm = &mut ctx.runtime.vm;
+                        let callee_limit = callee_limit as usize;
+                        while vm.stack.len() < callee_limit {
+                            vm.stack.push_reserved(Value::UNDEFINED);
+                        }
+                        let base = base as usize;
+                        let count = usize::from(count);
+                        let floor = vm.frames[index + 1].floor as usize;
+                        let stack = &mut vm.stack[..];
+                        if method {
+                            stack.swap(base, base + 1);
+                        } else {
+                            match count {
+                                0 => stack[base + 1] = Value::UNDEFINED,
+                                1 => {
+                                    stack[base + 2] = stack[base + 1];
+                                    stack[base + 1] = Value::UNDEFINED;
+                                }
+                                2 => {
+                                    stack[base + 3] = stack[base + 2];
+                                    stack[base + 2] = stack[base + 1];
+                                    stack[base + 1] = Value::UNDEFINED;
+                                }
+                                _ => {
+                                    stack.copy_within(base + 1..base + 1 + count, base + 2);
+                                    stack[base + 1] = Value::UNDEFINED;
+                                }
                             }
                         }
+                        stack[base + 2 + count..floor].fill(Value::UNDEFINED);
                     }
-                    let floor = callee_frame.floor as usize;
-                    stack[base + 2 + count..floor].fill(Value::UNDEFINED);
-                    vm.frames.push_reserved(callee_frame);
-                    ctx.realm = callee_frame.realm;
+                    ctx.realm = callee_realm;
                     code = callee_code;
                     index += 1;
                     cached_ip = Some(0);
@@ -2110,225 +3407,638 @@ pub(crate) fn run_frame(
                     ctx.take_exception();
                     return Err(Abrupt::Interrupted);
                 }
-                FastBreak::TryPlainCall {
-                    count,
-                    method,
-                    call_pc,
-                    next_pc,
-                } => {
-                    ctx.runtime.vm.stack.truncate(sp);
-                    if let Some(plain) = call::prepare_plain(
-                        &ctx.runtime.heap,
-                        &ctx.runtime.vm,
-                        frame.realm,
-                        count,
-                        method,
-                    ) {
-                        ctx.runtime.vm.frames[index].last_pc = call_pc;
-                        ctx.runtime.vm.frames[index].pc = next_pc;
-                        if let Some(next_code) = plain.enter(ctx)? {
-                            code = next_code;
-                            index += 1;
-                            sp = ctx.runtime.vm.stack.len();
-                            continue 'frames;
-                        }
+                other => match handle_fast_break(ctx, frame, index, code, &mut sp, other)? {
+                    BreakOutcome::Resume {
+                        next_pc,
+                        next_ip,
+                    } => {
                         pc = next_pc;
-                        sp = ctx.runtime.vm.stack.len();
+                        cached_ip = next_ip;
                         continue 'resume;
                     }
-                    let result = run_raw_step(ctx, index, code, call_pc)?;
-                    if result.is_some() || ctx.runtime.vm.frames.len() != index + 1 {
-                        return Ok(result);
+                    BreakOutcome::EnterFrame(next_code) => {
+                        code = next_code;
+                        index += 1;
+                        continue 'frames;
                     }
-                    pc = ctx.runtime.vm.frames[index].pc;
-                    sp = ctx.runtime.vm.stack.len();
-                    continue 'resume;
-                }
-                FastBreak::AppendArray {
-                    id,
-                    value,
-                    truncate_to,
-                    at,
-                    next_pc,
-                } => {
-                    ctx.runtime.vm.stack.truncate(sp);
-                    ctx.runtime.vm.frames[index].last_pc = at;
-                    ctx.runtime.vm.frames[index].pc = next_pc;
-                    append_array_slot(ctx, id, value)?;
-                    ctx.runtime.vm.stack.truncate(truncate_to);
-                    sp = truncate_to;
-                    pc = next_pc;
-                    continue 'resume;
-                }
-                FastBreak::ConcatStrings {
-                    a,
-                    b,
-                    dest,
-                    truncate_to,
-                    at,
-                    next_pc,
-                } => {
-                    ctx.runtime.vm.stack.truncate(sp);
-                    ctx.runtime.vm.frames[index].last_pc = at;
-                    ctx.runtime.vm.frames[index].pc = next_pc;
-                    let joined = ctx.concat_string_ids(a, b)?;
-                    ctx.runtime.vm.stack[dest] = Value::string(joined);
-                    ctx.runtime.vm.stack.truncate(truncate_to);
-                    sp = truncate_to;
-                    pc = next_pc;
-                    continue 'resume;
-                }
-                FastBreak::NewObject { at, next_pc } => {
-                    ctx.runtime.vm.stack.truncate(sp);
-                    ctx.runtime.vm.frames[index].last_pc = at;
-                    ctx.runtime.vm.frames[index].pc = next_pc;
-                    let proto = ctx.realm().object_proto;
-                    let id = ctx.allocate(|rt| {
-                        rt.heap
-                            .insert_object(Some(proto), ObjectFlags::EXTENSIBLE, ObjectData::Ordinary)
-                    })?;
-                    ctx.runtime.vm.stack.push_reserved(Value::object(id));
-                    sp += 1;
-                    pc = next_pc;
-                    continue 'resume;
-                }
-                FastBreak::NewNullProtoObject { at, next_pc } => {
-                    ctx.runtime.vm.stack.truncate(sp);
-                    ctx.runtime.vm.frames[index].last_pc = at;
-                    ctx.runtime.vm.frames[index].pc = next_pc;
-                    let shape = crate::realm::ensure_null_proto_shape(ctx)?;
-                    let id = ctx.allocate(|rt| {
-                        rt.heap.objects.insert(
-                            &rt.heap.ledger,
-                            JsObject {
-                                shape,
-                                props: TrackedVec::new(),
-                                flags: ObjectFlags::EXTENSIBLE,
-                                data: ObjectData::Ordinary,
-                            },
-                        )
-                    })?;
-                    ctx.runtime.vm.stack.push_reserved(Value::object(id));
-                    sp += 1;
-                    pc = next_pc;
-                    continue 'resume;
-                }
-                FastBreak::CloneRegExp {
-                    constant,
-                    at,
-                    next_pc,
-                } => {
-                    ctx.runtime.vm.stack.truncate(sp);
-                    ctx.runtime.vm.frames[index].last_pc = at;
-                    ctx.runtime.vm.frames[index].pc = next_pc;
-                    let result = ctx.with_scope(|ctx| objects::clone_regexp(ctx, constant))?;
-                    ctx.runtime.vm.stack.push_reserved(result);
-                    sp += 1;
-                    pc = next_pc;
-                    continue 'resume;
-                }
-                FastBreak::IntToString {
-                    base,
-                    value,
-                    at,
-                    next_pc,
-                } => {
-                    ctx.runtime.vm.stack.truncate(sp);
-                    ctx.runtime.vm.frames[index].last_pc = at;
-                    ctx.runtime.vm.frames[index].pc = next_pc;
-                    let mut buf = [0u8; 16];
-                    let len = qjs_dtoa::i32toa(&mut buf, value);
-                    let id = if len == 1 && buf[0].is_ascii() {
-                        let slot = usize::from(buf[0]);
-                        if let Some(id) = ctx.heap().atoms.ascii_string(slot) {
-                            id
-                        } else {
-                            let id = ctx.allocate(|rt| {
-                                let s = JsString::from_latin1(&rt.heap.ledger, &buf[..1])?;
-                                rt.heap.strings.insert(&rt.heap.ledger, s)
-                            })?;
-                            ctx.runtime.heap.atoms.cache_ascii_string(slot, id);
-                            id
-                        }
-                    } else {
-                        let mut data = [0u8; INLINE_LATIN1_CAPACITY];
-                        data[..len].copy_from_slice(&buf[..len]);
-                        ctx.allocate(|rt| {
-                            rt.heap.strings.insert(
-                                &rt.heap.ledger,
-                                JsString::InlineLatin1 {
-                                    len: len as u8,
-                                    is_ascii: true,
-                                    data,
-                                },
-                            )
-                        })?
-                    };
-                    ctx.runtime.vm.stack[base] = Value::string(id);
-                    ctx.runtime.vm.stack.truncate(base + 1);
-                    sp = base + 1;
-                    pc = next_pc;
-                    continue 'resume;
-                }
-                FastBreak::StringSlice {
-                    base,
-                    start,
-                    end,
-                    at,
-                    next_pc,
-                } => {
-                    ctx.runtime.vm.stack.truncate(sp);
-                    ctx.runtime.vm.frames[index].last_pc = at;
-                    ctx.runtime.vm.frames[index].pc = next_pc;
-                    let sliced = ctx.with_scope(|ctx| {
-                        let h = ctx.string_slice(Handle::at(base), start, end)?;
-                        Ok(ctx.get(h))
-                    })?;
-                    ctx.runtime.vm.stack[base] = sliced;
-                    ctx.runtime.vm.stack.truncate(base + 1);
-                    sp = base + 1;
-                    pc = next_pc;
-                    continue 'resume;
-                }
-                FastBreak::StringConcat {
-                    base,
-                    argc,
-                    at,
-                    next_pc,
-                } => {
-                    ctx.runtime.vm.stack.truncate(sp);
-                    ctx.runtime.vm.frames[index].last_pc = at;
-                    ctx.runtime.vm.frames[index].pc = next_pc;
-                    if let Some(joined) = fast_string_concat(ctx, base, argc)? {
-                        ctx.runtime.vm.stack[base] = joined;
-                        ctx.runtime.vm.stack.truncate(base + 1);
-                        sp = base + 1;
-                        pc = next_pc;
-                        continue 'resume;
-                    }
-                    let result = run_raw_step(ctx, index, code, at)?;
-                    if result.is_some() || ctx.runtime.vm.frames.len() != index + 1 {
-                        return Ok(result);
-                    }
-                    pc = ctx.runtime.vm.frames[index].pc;
-                    sp = ctx.runtime.vm.stack.len();
-                    continue 'resume;
-                }
-                FastBreak::Slow(at) => {
-                    ctx.runtime.vm.stack.truncate(sp);
-                    let result = run_raw_step(ctx, index, code, at)?;
-                    if result.is_some() || ctx.runtime.vm.frames.len() != index + 1 {
-                        return Ok(result);
-                    }
-                    pc = ctx.runtime.vm.frames[index].pc;
-                    sp = ctx.runtime.vm.stack.len();
-                    continue 'resume;
-                }
+                    BreakOutcome::Return(result) => return Ok(result),
+                },
             }
         }
     }
 }
 
+enum BreakOutcome {
+    Resume {
+        next_pc: u32,
+        next_ip: Option<usize>,
+    },
+    EnterFrame(BcId),
+    Return(Option<Value>),
+}
+
+#[inline(always)]
+fn handle_fast_break(
+    ctx: &mut ExecCtx<'_, '_>,
+    frame: CallFrame,
+    index: usize,
+    code: BcId,
+    sp: &mut usize,
+    brk: FastBreak,
+) -> JsResult<BreakOutcome> {
+    match brk {
+        FastBreak::TryPlainCall {
+            count,
+            method,
+            call_pc,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            if let Some(plain) = call::prepare_plain(
+                &ctx.runtime.heap,
+                &ctx.runtime.vm,
+                frame.realm,
+                count,
+                method,
+            ) {
+                ctx.runtime.vm.frames[index].last_pc = call_pc;
+                ctx.runtime.vm.frames[index].pc = next_pc;
+                if let Some(next_code) = plain.enter(ctx)? {
+                    *sp = ctx.runtime.vm.stack.len();
+                    return Ok(BreakOutcome::EnterFrame(next_code));
+                }
+                *sp = ctx.runtime.vm.stack.len();
+                return Ok(BreakOutcome::Resume {
+                    next_pc,
+                    next_ip: Some(next_ip),
+                });
+            }
+            let result = run_raw_step(ctx, index, code, call_pc)?;
+            if result.is_some() || ctx.runtime.vm.frames.len() != index + 1 {
+                return Ok(BreakOutcome::Return(result));
+            }
+            *sp = ctx.runtime.vm.stack.len();
+            Ok(BreakOutcome::Resume {
+                next_pc: ctx.runtime.vm.frames[index].pc,
+                next_ip: None,
+            })
+        }
+        FastBreak::AppendArray {
+            id,
+            value,
+            truncate_to,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            append_array_slot(ctx, id, value)?;
+            ctx.runtime.vm.stack.truncate(truncate_to);
+            *sp = truncate_to;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip),
+            })
+        }
+        FastBreak::DictPut {
+            id,
+            shape_id,
+            key,
+            value,
+            truncate_to,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            ctx.allocate(|rt| {
+                let heap = &mut rt.heap;
+                let shape = heap.shapes.get_mut(shape_id).unwrap();
+                let object = heap.objects.get_mut(id).unwrap();
+                shape.dict_insert(
+                    &heap.ledger,
+                    &mut object.props,
+                    crate::shape::ShapeProp {
+                        key,
+                        flags: PropFlags::DEFAULT_DATA,
+                    },
+                    value,
+                )
+            })?;
+            ctx.runtime.vm.stack.truncate(truncate_to);
+            *sp = truncate_to;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip),
+            })
+        }
+        FastBreak::PutFieldTransitionGrow {
+            id,
+            to_shape,
+            value,
+            truncate_to,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            let mut shape_alive = true;
+            ctx.allocate(|rt| {
+                let heap = &mut rt.heap;
+                if heap.shapes.get_weak(to_shape).is_none() {
+                    shape_alive = false;
+                    return Ok(());
+                }
+                let obj = heap.objects.get_mut(id).unwrap();
+                obj.props.push(&heap.ledger, value)?;
+                obj.shape = to_shape;
+                Ok(())
+            })?;
+            if shape_alive {
+                ctx.runtime.vm.stack.truncate(truncate_to);
+                *sp = truncate_to;
+                return Ok(BreakOutcome::Resume {
+                    next_pc,
+                    next_ip: Some(next_ip),
+                });
+            }
+            let result = run_raw_step(ctx, index, code, at)?;
+            if result.is_some() || ctx.runtime.vm.frames.len() != index + 1 {
+                return Ok(BreakOutcome::Return(result));
+            }
+            *sp = ctx.runtime.vm.stack.len();
+            Ok(BreakOutcome::Resume {
+                next_pc: ctx.runtime.vm.frames[index].pc,
+                next_ip: None,
+            })
+        }
+        FastBreak::ConcatStrings {
+            a,
+            b,
+            dest,
+            truncate_to,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            let joined = ctx.concat_string_ids(a, b)?;
+            ctx.runtime.vm.stack[dest] = Value::string(joined);
+            ctx.runtime.vm.stack.truncate(truncate_to);
+            *sp = truncate_to;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip),
+            })
+        }
+        FastBreak::NewObject {
+            realm,
+            dest,
+            truncate_to,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            let proto = ctx.heap().realm(realm).object_proto;
+            let id = ctx.allocate(|rt| {
+                rt.heap
+                    .insert_object(Some(proto), ObjectFlags::EXTENSIBLE, ObjectData::Ordinary)
+            })?;
+            if dest == *sp {
+                ctx.runtime.vm.stack.push_reserved(Value::object(id));
+            } else {
+                ctx.runtime.vm.stack[dest] = Value::object(id);
+                ctx.runtime.vm.stack.truncate(truncate_to);
+            }
+            *sp = truncate_to;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip),
+            })
+        }
+        FastBreak::NewNullProtoObject {
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            let shape = crate::realm::ensure_null_proto_shape(ctx)?;
+            let id = ctx.allocate(|rt| {
+                rt.heap.objects.insert(
+                    &rt.heap.ledger,
+                    JsObject {
+                        shape,
+                        props: crate::object::PropSlots::new(),
+                        flags: ObjectFlags::EXTENSIBLE,
+                        data: ObjectData::Ordinary,
+                    },
+                )
+            })?;
+            ctx.runtime.vm.stack.push_reserved(Value::object(id));
+            *sp += 1;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip),
+            })
+        }
+        FastBreak::NewArrayEmpty {
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            let realm = frame.realm;
+            let id = ctx.allocate(|rt| {
+                let heap = &mut rt.heap;
+                let proto = heap.realm(realm).array_proto;
+                let array = TrackedBox::new(
+                    &heap.ledger,
+                    crate::object::ArrayData {
+                        elements: TrackedVec::new(),
+                        length: 0,
+                        length_writable: true,
+                        realm,
+                    },
+                )?;
+                heap.insert_object(
+                    Some(proto),
+                    ObjectFlags::EXTENSIBLE | ObjectFlags::IS_EXOTIC | ObjectFlags::FAST_ARRAY,
+                    ObjectData::Array(array),
+                )
+            })?;
+            ctx.runtime.vm.stack.push_reserved(Value::object(id));
+            *sp += 1;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip),
+            })
+        }
+        FastBreak::ForOfStartArray {
+            arr_id,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            if let Some((iter, next_fn)) =
+                iterators::fast_for_of_start_array(ctx, arr_id, frame.realm)?
+            {
+                let top = *sp - 1;
+                ctx.runtime.vm.stack[top] = iter;
+                ctx.runtime.vm.stack.push_reserved(next_fn);
+                ctx.runtime.vm.stack.push_reserved(Value::catch_offset(0));
+                *sp += 2;
+                return Ok(BreakOutcome::Resume {
+                    next_pc,
+                    next_ip: Some(next_ip),
+                });
+            }
+            let result = run_raw_step(ctx, index, code, at)?;
+            if result.is_some() || ctx.runtime.vm.frames.len() != index + 1 {
+                return Ok(BreakOutcome::Return(result));
+            }
+            *sp = ctx.runtime.vm.stack.len();
+            Ok(BreakOutcome::Resume {
+                next_pc: ctx.runtime.vm.frames[index].pc,
+                next_ip: None,
+            })
+        }
+        FastBreak::CloneRegExp {
+            constant,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            let result = if let Some(shape) = ctx.realm().regexp_shape {
+                let template_id = constant.as_object().unwrap();
+                let (source, program) = {
+                    let ObjectData::RegExp(data) = &ctx.heap().object(template_id).data else {
+                        unreachable!()
+                    };
+                    (data.source, std::rc::Rc::clone(&data.program))
+                };
+                let obj = ctx.allocate(|rt| {
+                    let heap = &mut rt.heap;
+                    heap.objects.insert(
+                        &heap.ledger,
+                        JsObject {
+                            shape,
+                            props: crate::object::PropSlots::one(Value::int32(0)),
+                            flags: ObjectFlags::EXTENSIBLE,
+                            data: ObjectData::RegExp(crate::object::RegExpData {
+                                source,
+                                program: std::rc::Rc::clone(&program),
+                            }),
+                        },
+                    )
+                })?;
+                Value::object(obj)
+            } else {
+                ctx.with_scope(|ctx| objects::clone_regexp(ctx, constant))?
+            };
+            ctx.runtime.vm.stack.push_reserved(result);
+            *sp += 1;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip),
+            })
+        }
+        FastBreak::IntToStringDest {
+            value,
+            dest,
+            truncate_to,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            let id = fast_int_to_string_id(ctx, value)?;
+            ctx.runtime.vm.stack[dest] = Value::string(id);
+            ctx.runtime.vm.stack.truncate(truncate_to);
+            *sp = truncate_to;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip),
+            })
+        }
+        FastBreak::FloatToStringDest {
+            value,
+            dest,
+            truncate_to,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            let result =
+                convert::format_f64_fast(ctx, value, 10, 0, qjs_dtoa::DtoaOptions::default())?;
+            ctx.runtime.vm.stack[dest] = result;
+            ctx.runtime.vm.stack.truncate(truncate_to);
+            *sp = truncate_to;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip),
+            })
+        }
+        FastBreak::FormatNumber {
+            base,
+            value,
+            radix,
+            digits,
+            options,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            let base = base as usize;
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            let result = convert::format_f64_fast(
+                ctx,
+                value,
+                u32::from(radix),
+                usize::from(digits),
+                options,
+            )?;
+            ctx.runtime.vm.stack[base] = result;
+            ctx.runtime.vm.stack.truncate(base + 1);
+            *sp = base + 1;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip as usize),
+            })
+        }
+        FastBreak::BigIntBinary {
+            op,
+            lhs,
+            rhs,
+            dest,
+            truncate_to,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            let result = numeric::bigint_binary(ctx, op, lhs, rhs)?;
+            if dest == *sp {
+                ctx.runtime.vm.stack.push_reserved(result);
+            } else {
+                ctx.runtime.vm.stack[dest] = result;
+                ctx.runtime.vm.stack.truncate(truncate_to);
+            }
+            *sp = truncate_to;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip),
+            })
+        }
+        FastBreak::BigIntMulAddLoc {
+            dst_slot,
+            a,
+            b,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            let dst_val = ctx.runtime.vm.stack[dst_slot];
+            let result = numeric::bigint_mul_add(ctx, dst_val, a, b)?;
+            ctx.runtime.vm.stack[dst_slot] = result;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip),
+            })
+        }
+        FastBreak::MapSet {
+            base,
+            id,
+            key,
+            value,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            coll_weak::fast_map_set(ctx, id, key, value)?;
+            ctx.runtime.vm.stack.truncate(base + 1);
+            *sp = base + 1;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip),
+            })
+        }
+        FastBreak::WeakMapSet {
+            base,
+            id,
+            key,
+            value,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            crate::ops::weak::fast_weak_map_set(ctx, id, key, value)?;
+            ctx.runtime.vm.stack.truncate(base + 1);
+            *sp = base + 1;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip),
+            })
+        }
+        FastBreak::RegExpExec {
+            base,
+            re_id,
+            input_id,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            if let Some(matched) = string_re::fast_regexp_exec(ctx, re_id, input_id)? {
+                ctx.runtime.vm.stack[base] = matched;
+                ctx.runtime.vm.stack.truncate(base + 1);
+                *sp = base + 1;
+                return Ok(BreakOutcome::Resume {
+                    next_pc,
+                    next_ip: Some(next_ip),
+                });
+            }
+            let result = run_raw_step(ctx, index, code, at)?;
+            if result.is_some() || ctx.runtime.vm.frames.len() != index + 1 {
+                return Ok(BreakOutcome::Return(result));
+            }
+            *sp = ctx.runtime.vm.stack.len();
+            Ok(BreakOutcome::Resume {
+                next_pc: ctx.runtime.vm.frames[index].pc,
+                next_ip: None,
+            })
+        }
+        FastBreak::ForInIndex {
+            value,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            let id = fast_int_to_string_id(ctx, value)?;
+            ctx.runtime.vm.stack.push_reserved(Value::string(id));
+            ctx.runtime.vm.stack.push_reserved(Value::bool(false));
+            *sp += 2;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip),
+            })
+        }
+        FastBreak::StringSlice {
+            base,
+            start,
+            end,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            let sliced = ctx.with_scope(|ctx| {
+                let h = ctx.string_slice(Handle::at(base), start, end)?;
+                Ok(ctx.get(h))
+            })?;
+            ctx.runtime.vm.stack[base] = sliced;
+            ctx.runtime.vm.stack.truncate(base + 1);
+            *sp = base + 1;
+            Ok(BreakOutcome::Resume {
+                next_pc,
+                next_ip: Some(next_ip),
+            })
+        }
+        FastBreak::StringConcat {
+            base,
+            argc,
+            at,
+            next_pc,
+            next_ip,
+        } => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            ctx.runtime.vm.frames[index].last_pc = at;
+            ctx.runtime.vm.frames[index].pc = next_pc;
+            if let Some(joined) = fast_string_concat(ctx, base, argc)? {
+                ctx.runtime.vm.stack[base] = joined;
+                ctx.runtime.vm.stack.truncate(base + 1);
+                *sp = base + 1;
+                return Ok(BreakOutcome::Resume {
+                    next_pc,
+                    next_ip: Some(next_ip),
+                });
+            }
+            let result = run_raw_step(ctx, index, code, at)?;
+            if result.is_some() || ctx.runtime.vm.frames.len() != index + 1 {
+                return Ok(BreakOutcome::Return(result));
+            }
+            *sp = ctx.runtime.vm.stack.len();
+            Ok(BreakOutcome::Resume {
+                next_pc: ctx.runtime.vm.frames[index].pc,
+                next_ip: None,
+            })
+        }
+        FastBreak::Slow(at) => {
+            ctx.runtime.vm.stack.truncate(*sp);
+            let result = run_raw_step(ctx, index, code, at)?;
+            if result.is_some() || ctx.runtime.vm.frames.len() != index + 1 {
+                return Ok(BreakOutcome::Return(result));
+            }
+            *sp = ctx.runtime.vm.stack.len();
+            Ok(BreakOutcome::Resume {
+                next_pc: ctx.runtime.vm.frames[index].pc,
+                next_ip: None,
+            })
+        }
+        FastBreak::EnterJs { .. }
+        | FastBreak::ReturnToCaller { .. }
+        | FastBreak::ReturnTop { .. }
+        | FastBreak::Interrupted(_) => unreachable!(),
+    }
+}
+
+#[inline(never)]
 fn fast_string_concat(
     ctx: &mut ExecCtx<'_, '_>,
     base: usize,
@@ -2610,6 +4320,24 @@ fn append_array_slot(ctx: &mut ExecCtx<'_, '_>, id: ObjId, value: Value) -> JsRe
 }
 
 #[inline]
+fn fast_binary_with_string(
+    heap: &crate::heap::Heap,
+    op: Opcode,
+    lhs: Value,
+    rhs: Value,
+) -> Option<Value> {
+    let to_num = |v: Value| match v.decode() {
+        ValueKind::Int32(n) => Some(f64::from(n)),
+        ValueKind::Float64(n) => Some(n),
+        ValueKind::String(id) => convert::string_to_number_inline(heap, id),
+        _ => None,
+    };
+    let a = to_num(lhs)?;
+    let b = to_num(rhs)?;
+    Some(numeric::number_binary(op, a, b))
+}
+
+#[inline]
 fn fast_binary(op: Opcode, lhs: Value, rhs: Value, has_interrupt: bool) -> Option<Value> {
     use Opcode::*;
     match (lhs.decode(), rhs.decode()) {
@@ -2618,6 +4346,10 @@ fn fast_binary(op: Opcode, lhs: Value, rhs: Value, has_interrupt: bool) -> Optio
                 Add => a.checked_add(b),
                 Sub => a.checked_sub(b),
                 Mul if !(a == 0 && b < 0) && !(b == 0 && a < 0) => a.checked_mul(b),
+                Mod if b > 0 => {
+                    let r = a % b;
+                    (r != 0 || a >= 0).then_some(r)
+                }
                 And => Some(a & b),
                 Or => Some(a | b),
                 Xor => Some(a ^ b),

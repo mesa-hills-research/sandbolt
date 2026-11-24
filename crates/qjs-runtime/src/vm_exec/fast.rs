@@ -56,6 +56,7 @@ pub(crate) enum FastOp {
     AddPutLoc(u16),
     SubPutLoc(u16),
     GetLoc2Mul(u16, u16),
+    GetLoc2MulAddLoc { dst: u8, a: u8, b: u8 },
     GetLoc2Add(u16, u16),
     GetLocAddLoc { dst: u16, src: u16 },
     Add,
@@ -124,6 +125,7 @@ pub(crate) enum FastOp {
     GetLocGetField { loc: u16, ic: u16 },
     GetLocGetFieldAddLoc { dst: u8, obj: u8, ic: u16 },
     PutLocField { obj: u8, val: u8, ic: u16 },
+    GetLocGetVarAddLoc { dst: u8, ic: u16 },
     GetVar(u16),
     GetVarUndef(u16),
     PutVar(u16),
@@ -135,12 +137,21 @@ pub(crate) enum FastOp {
     GetArrayEl2,
     PutArrayEl,
     GetLoc2ArrayEl { arr: u16, idx: u16 },
+    GetLoc2ArrayElAddLoc { dst: u8, arr: u8, idx: u8 },
     GetLocImmArrayEl { arr: u8, idx: u16 },
+    GetLocImmArrayElAddLoc { dst: u8, arr: u8, idx: u16 },
     PutLocImmArrayEl { arr: u8, idx: u16, val: u8 },
+    Delete,
+    ForOfStart,
+    ForOfNext(u16),
+    IteratorClose,
+    ForInNext,
     NewObject,
     NewNullProtoObject,
+    NewArrayEmpty,
     Call(u16),
     CallMethod(u16),
+    CallConstructor(u16),
     GetField2CallMethod0(u16),
     Return,
     ReturnUndef,
@@ -537,6 +548,27 @@ impl FastProgram {
                             ..
                         },
                     ) => Some(MidOp::Inst(put)),
+                    (
+                        Dup,
+                        Instruction {
+                            opcode: PutLoc | PutLoc8 | PutLoc0 | PutLoc1 | PutLoc2 | PutLoc3,
+                            operands: Operands::Local(n),
+                        },
+                    ) => Some(MidOp::PutLoc(n)),
+                    (
+                        Dup,
+                        Instruction {
+                            opcode: PutArg | PutArg0 | PutArg1 | PutArg2 | PutArg3,
+                            operands: Operands::Argument(n),
+                        },
+                    ) => Some(MidOp::PutArg(n)),
+                    (
+                        Dup,
+                        Instruction {
+                            opcode: PutVarRef | PutVarRef0 | PutVarRef1 | PutVarRef2 | PutVarRef3,
+                            operands: Operands::VarRef(n),
+                        },
+                    ) => Some(MidOp::PutVarRef(n)),
                     _ => None,
                 };
                 if let Some(op) = collapsed {
@@ -658,6 +690,59 @@ impl FastProgram {
                 continue;
             }
 
+            // 2b. 6-op compound-add fusions:
+            //     GetLoc(dst), GetLoc(arr), PushI32(imm), GetArrayEl, Add, PutLoc(dst)
+            //     GetLoc(dst), GetLoc(arr), GetLoc(idx), GetArrayEl, Add, PutLoc(dst)
+            //     GetLoc(dst), GetLoc(a), GetLoc(b), Mul, Add, PutLoc(dst)
+            if can_fuse_mid(m, 6)
+                && let (Some(dst1), Some(a), Some(dst2)) = (
+                    as_get_loc(cur.op),
+                    as_get_loc(mid[m + 1].op),
+                    as_put_loc(mid[m + 5].op),
+                )
+                && dst1 == dst2
+                && as_plain_opcode(mid[m + 4].op) == Some(Add)
+                && let (Ok(dst_u8), Ok(a_u8)) = (u8::try_from(dst1), u8::try_from(a))
+            {
+                let fused = match as_plain_opcode(mid[m + 3].op) {
+                    Some(GetArrayEl) => {
+                        if let Some(imm) = as_push_i32(mid[m + 2].op)
+                            && let Ok(idx_u16) = u16::try_from(imm)
+                        {
+                            Some(FastOp::GetLocImmArrayElAddLoc {
+                                dst: dst_u8,
+                                arr: a_u8,
+                                idx: idx_u16,
+                            })
+                        } else if let Some(idx) = as_get_loc(mid[m + 2].op)
+                            && let Ok(idx_u8) = u8::try_from(idx)
+                        {
+                            Some(FastOp::GetLoc2ArrayElAddLoc {
+                                dst: dst_u8,
+                                arr: a_u8,
+                                idx: idx_u8,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    Some(Mul) => as_get_loc(mid[m + 2].op)
+                        .and_then(|b| u8::try_from(b).ok())
+                        .map(|b_u8| FastOp::GetLoc2MulAddLoc {
+                            dst: dst_u8,
+                            a: a_u8,
+                            b: b_u8,
+                        }),
+                    _ => None,
+                };
+                if let Some(op) = fused {
+                    orig_pcs.push(emit_pc);
+                    ops.push(op);
+                    m += 6;
+                    continue;
+                }
+            }
+
             // 3. GetLoc(dst), GetLoc(obj), GetField(atom), Add, PutLoc(dst) -> GetLocGetFieldAddLoc
             if can_fuse_mid(m, 5)
                 && let (Some(dst1), Some(obj), Some(dst2)) = (
@@ -754,19 +839,31 @@ impl FastProgram {
             }
 
             // 5. GetLoc(dst), GetLoc(src), Add, PutLoc(dst) -> GetLocAddLoc
+            //    GetLoc(dst), GetVar(atom), Add, PutLoc(dst) -> GetLocGetVarAddLoc
             if can_fuse_mid(m, 4)
-                && let (Some(dst1), Some(src), Some(dst2)) = (
-                    as_get_loc(cur.op),
-                    as_get_loc(mid[m + 1].op),
-                    as_put_loc(mid[m + 3].op),
-                )
+                && let (Some(dst1), Some(dst2)) = (as_get_loc(cur.op), as_put_loc(mid[m + 3].op))
                 && dst1 == dst2
                 && as_plain_opcode(mid[m + 2].op) == Some(Add)
             {
-                orig_pcs.push(emit_pc);
-                ops.push(FastOp::GetLocAddLoc { dst: dst1, src });
-                m += 4;
-                continue;
+                if let Some(src) = as_get_loc(mid[m + 1].op) {
+                    orig_pcs.push(emit_pc);
+                    ops.push(FastOp::GetLocAddLoc { dst: dst1, src });
+                    m += 4;
+                    continue;
+                }
+                if function.eval.is_none()
+                    && let Ok(dst_u8) = u8::try_from(dst1)
+                    && let MidOp::Inst(Instruction {
+                        opcode: GetVar,
+                        operands: Operands::Atom(atom),
+                    }) = mid[m + 1].op
+                    && let Some(ic) = alloc_ic(&mut ic_atoms, atom)
+                {
+                    orig_pcs.push(emit_pc);
+                    ops.push(FastOp::GetLocGetVarAddLoc { dst: dst_u8, ic });
+                    m += 4;
+                    continue;
+                }
             }
 
             // 5b. GetLoc(arr), PushI32(imm), GetLoc(val), PutArrayEl -> PutLocImmArrayEl
@@ -1152,9 +1249,16 @@ impl FastProgram {
                     (GetArrayEl, _) => FastOp::GetArrayEl,
                     (GetArrayEl2, _) => FastOp::GetArrayEl2,
                     (PutArrayEl, _) => FastOp::PutArrayEl,
+                    (Delete, _) => FastOp::Delete,
+                    (ForOfStart, _) => FastOp::ForOfStart,
+                    (ForOfNext, Operands::Unsigned(skip)) => FastOp::ForOfNext(skip as u16),
+                    (IteratorClose, _) => FastOp::IteratorClose,
+                    (ForInNext, _) => FastOp::ForInNext,
                     (Object, _) => FastOp::NewObject,
+                    (ArrayFrom, Operands::Call(0)) => FastOp::NewArrayEmpty,
                     (Call | Call0 | Call1 | Call2 | Call3, Operands::Call(n)) => FastOp::Call(n),
                     (CallMethod, Operands::Call(n)) => FastOp::CallMethod(n),
+                    (CallConstructor, Operands::Call(n)) => FastOp::CallConstructor(n),
                     (Return, _) => FastOp::Return,
                     (ReturnUndef, _) => FastOp::ReturnUndef,
                     (ReturnAsync, _) => FastOp::ReturnAsync,

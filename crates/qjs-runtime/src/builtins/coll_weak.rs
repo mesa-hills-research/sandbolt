@@ -13,12 +13,14 @@ mod set_methods;
 mod symbols;
 mod weak;
 
+pub(crate) use ordered::fast_map_set;
+
 #[cfg(test)]
 mod tests;
 
 macro_rules! ids {
     ($($name:ident = $offset:expr),+ $(,)?) => {
-        $(const $name: NativeFnId = NativeFnId(COLL_WEAK_BASE + $offset);)+
+        $(pub(crate) const $name: NativeFnId = NativeFnId(COLL_WEAK_BASE + $offset);)+
     };
 }
 
