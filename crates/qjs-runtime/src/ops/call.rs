@@ -3,6 +3,7 @@ use qjs_bytecode::FunctionKind;
 use crate::atom::Atom;
 use crate::heap::Heap;
 use crate::object::{ObjectData, ObjectFlags};
+use crate::realm::NativeFnId;
 use crate::root::{Args, ExecCtx, Handle, RootScope};
 use crate::value::*;
 use crate::vm::{CallFrame, CompiledFunc, MiniOp, VmState, exec};
@@ -179,12 +180,13 @@ impl FrameLayout {
 
 pub(crate) struct PlainCall {
     frame: CallFrame,
+    builtin: Option<NativeFnId>,
     method: bool,
 }
 
 impl PlainCall {
     #[inline]
-    pub(crate) fn enter(self, ctx: &mut ExecCtx<'_, '_>) -> JsResult<(BcId, RealmId)> {
+    pub(crate) fn enter(self, ctx: &mut ExecCtx<'_, '_>) -> JsResult<Option<BcId>> {
         let vm = &mut ctx.runtime.vm;
         let base = self.frame.base as usize;
         if self.method {
@@ -201,7 +203,11 @@ impl PlainCall {
             vm.stack.push_reserved(Value::UNDEFINED);
         }
         vm.frames.push_reserved(self.frame);
-        Ok((self.frame.code.unwrap(), self.frame.realm))
+        ctx.realm = self.frame.realm;
+        if let Some(id) = self.builtin {
+            finish_builtin(ctx, id, self.frame)?;
+        }
+        Ok(self.frame.code)
     }
 }
 
@@ -220,18 +226,24 @@ pub(crate) fn prepare_plain(
     let tail = vm.stack.len();
     let base = tail - (count + 2 - inserted);
     let callee = vm.stack[base + usize::from(method)].as_object()?;
-    let ObjectData::BytecodeFunction(data) = &heap.object(callee).data else {
-        return None;
+    let (realm, code, function, builtin) = match &heap.object(callee).data {
+        ObjectData::BytecodeFunction(data) if !data.is_class_constructor => {
+            let code = data.code;
+            let function = heap.bytecode.get(code).unwrap().compiled.as_ref()?;
+            if function.kind != FunctionKind::Normal || function.needs_arguments {
+                return None;
+            }
+            (data.realm, Some(code), Some(function), None)
+        }
+        ObjectData::NativeFunction(data)
+            if (0x1000..=0x1fff).contains(&data.function.0)
+                && exec::NativeForward::from_id(data.function.0).is_none() =>
+        {
+            (data.realm, None, None, Some(data.function))
+        }
+        _ => return None,
     };
-    if data.is_class_constructor {
-        return None;
-    }
-    let code = data.code;
-    let function = heap.bytecode.get(code).unwrap().compiled.as_ref()?;
-    if function.kind != FunctionKind::Normal || function.needs_arguments {
-        return None;
-    }
-    let layout = FrameLayout::new(base, count, Some(function));
+    let layout = FrameLayout::new(base, count, function);
     let needed = layout.needed() + inserted;
     // Always preserve the spare root slot required by ExecCtx::root at peak operand height.
     if vm.stack.capacity() - tail < needed + 1
@@ -241,7 +253,8 @@ pub(crate) fn prepare_plain(
         return None;
     }
     Some(PlainCall {
-        frame: layout.frame(callee, data.realm, caller, Some(code), None, false),
+        frame: layout.frame(callee, realm, caller, code, None, false),
+        builtin,
         method,
     })
 }
@@ -568,18 +581,10 @@ fn native(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame) -> JsResult<Value> {
         unreachable!()
     };
     let id = data.function;
-    let base = frame.base as usize;
     if (0x1000..=0x1fff).contains(&id.0) {
-        return RootScope::new(ctx.runtime, frame.realm).run(|ctx| {
-            crate::builtins::dispatch(
-                id,
-                ctx,
-                Handle::at(base + 1),
-                Args::new(base + 2, frame.arg_count as usize),
-            )
-            .unwrap()
-        });
+        return builtin(ctx, id, frame);
     }
+    let base = frame.base as usize;
     let function = super::convert::builtin_native(id).or_else(|| {
         (id.0 < 0xfff0)
             .then(|| ctx.runtime.native_dispatch.get(id.0 as usize).copied())
@@ -595,6 +600,31 @@ fn native(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame) -> JsResult<Value> {
             Args::new(base + 2, frame.arg_count as usize),
         )
     })
+}
+
+fn builtin(ctx: &mut ExecCtx<'_, '_>, id: NativeFnId, frame: CallFrame) -> JsResult<Value> {
+    let base = frame.base as usize;
+    RootScope::new(ctx.runtime, frame.realm).run(|ctx| {
+        crate::builtins::dispatch(
+            id,
+            ctx,
+            Handle::at(base + 1),
+            Args::new(base + 2, frame.arg_count as usize),
+        )
+        .unwrap()
+    })
+}
+
+#[inline(never)]
+fn finish_builtin(ctx: &mut ExecCtx<'_, '_>, id: NativeFnId, frame: CallFrame) -> JsResult<()> {
+    let value = builtin(ctx, id, frame)?;
+    let value = exec::native_stack(ctx, value)?;
+    ctx.realm = frame.caller_realm;
+    let vm = &mut ctx.runtime.vm;
+    vm.frames.pop();
+    vm.stack.truncate(frame.base as usize);
+    vm.stack.push_reserved(value);
+    Ok(())
 }
 
 fn execute_mini(
@@ -740,4 +770,29 @@ pub(crate) fn unwind(ctx: &mut ExecCtx<'_, '_>, depth: usize) -> JsResult<bool> 
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::EngineLimits;
+    use crate::api::{EvalOptions, JsEngine};
+
+    #[test]
+    fn builtin_calls_resume_the_caller_after_reentry_and_throw() {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        let js = r#"
+            function run() {
+                const value = { valueOf() { return Math.max(1, 4); } };
+                const error = { valueOf() { throw 'coercion'; } };
+                let log = '';
+                try { Math.min(value, error); } catch (e) { log += e; }
+                return log + ':' + Math.min(value, 9);
+            }
+            run();
+        "#;
+        assert_eq!(
+            engine.eval_to_string(js, EvalOptions::default()).unwrap(),
+            "coercion:4"
+        );
+    }
 }
