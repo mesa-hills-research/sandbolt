@@ -2,6 +2,15 @@ use crate::radix_index;
 
 pub(crate) const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 const BILLION: u64 = 1_000_000_000;
+const PAIRS: [[u8; 2]; 100] = {
+    let mut pairs = [[0; 2]; 100];
+    let mut n = 0;
+    while n < pairs.len() {
+        pairs[n] = [b'0' + (n / 10) as u8, b'0' + (n % 10) as u8];
+        n += 1;
+    }
+    pairs
+};
 
 fn write_unsigned<const SHIFT: u32>(buf: &mut [u8], mut n: u64, radix: u64) -> usize {
     let mut digits = [0; 64];
@@ -44,24 +53,46 @@ pub(crate) fn write_limb(buf: &mut [u8], mut n: u32, radix: u32, bits: i32) {
 }
 
 fn write_decimal_limb(buf: &mut [u8], mut n: u32) {
-    for byte in buf.iter_mut().rev() {
-        *byte = b'0' + (n % 10) as u8;
-        n /= 10;
+    let mut pairs = buf.rchunks_exact_mut(2);
+    for pair in &mut pairs {
+        write_pair(pair, n % 100);
+        n /= 100;
     }
+    if let [first] = pairs.into_remainder() {
+        *first = b'0' + (n % 10) as u8;
+    }
+}
+
+#[inline]
+fn write_pair(buf: &mut [u8], n: u32) {
+    buf[..2].copy_from_slice(&PAIRS[n as usize]);
 }
 
 /// Writes the decimal digits of `n` and returns their count. No NUL is written.
 /// The buffer must have room for the result.
+#[inline]
 pub fn u32toa(buf: &mut [u8], mut n: u32) -> usize {
+    if n < 10 {
+        buf[0] = b'0' + n as u8;
+        return 1;
+    }
+    if n < 100 {
+        write_pair(buf, n);
+        return 2;
+    }
     let mut digits = [0; 10];
     let mut start = digits.len();
-    loop {
+    while n >= 100 {
+        start -= 2;
+        write_pair(&mut digits[start..], n % 100);
+        n /= 100;
+    }
+    if n >= 10 {
+        start -= 2;
+        write_pair(&mut digits[start..], n);
+    } else {
         start -= 1;
-        digits[start] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
+        digits[start] = b'0' + n as u8;
     }
     let digits = &digits[start..];
     buf[..digits.len()].copy_from_slice(digits);
@@ -69,6 +100,7 @@ pub fn u32toa(buf: &mut [u8], mut n: u32) -> usize {
 }
 
 /// Like [`u32toa`], with a leading minus sign for negative numbers.
+#[inline]
 pub fn i32toa(buf: &mut [u8], n: i32) -> usize {
     let sign = write_sign(buf, n < 0);
     sign + u32toa(&mut buf[sign..], n.unsigned_abs())
@@ -91,6 +123,19 @@ pub fn u64toa(buf: &mut [u8], n: u64) -> usize {
     };
     write_decimal_limb(&mut buf[len..len + 9], lo as u32);
     len + 9
+}
+
+pub(crate) fn u128toa(buf: &mut [u8], n: u128) -> usize {
+    if let Ok(n) = u64::try_from(n) {
+        return u64toa(buf, n);
+    }
+    const GROUP: u128 = BILLION as u128 * BILLION as u128;
+    let high = n / GROUP;
+    let low = (n % GROUP) as u64;
+    let len = u128toa(buf, high);
+    write_decimal_limb(&mut buf[len..len + 9], (low / BILLION) as u32);
+    write_decimal_limb(&mut buf[len + 9..len + 18], (low % BILLION) as u32);
+    len + 18
 }
 
 /// Like [`u64toa`], with a leading minus sign for negative numbers.
