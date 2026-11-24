@@ -1,5 +1,6 @@
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
+use std::num::NonZeroUsize;
 
 use crate::gc::{Trace, Tracer};
 use crate::heap::Heap;
@@ -19,7 +20,17 @@ payloads!(
 #[derive(Clone, Copy, Debug)]
 struct Bucket {
     hash: u64,
-    row: usize,
+    row_plus_one: NonZeroUsize,
+}
+
+impl Bucket {
+    fn row(self) -> usize {
+        self.row_plus_one.get() - 1
+    }
+}
+
+fn encode_row(row: usize) -> NonZeroUsize {
+    NonZeroUsize::new(row + 1).unwrap()
 }
 
 #[derive(Debug, Default)]
@@ -35,7 +46,7 @@ impl HashIndex {
 
     pub(crate) fn find(&self, hash: u64, matches: impl FnMut(usize) -> bool) -> Option<usize> {
         self.locate(hash, matches)
-            .map(|bucket| self.buckets[bucket].unwrap().row)
+            .map(|bucket| self.buckets[bucket].unwrap().row())
     }
 
     fn locate(&self, hash: u64, mut matches: impl FnMut(usize) -> bool) -> Option<usize> {
@@ -45,7 +56,7 @@ impl HashIndex {
         let mask = self.buckets.len() - 1;
         let mut offset = hash as usize & mask;
         while let Some(bucket) = self.buckets[offset] {
-            if bucket.hash == hash && matches(bucket.row) {
+            if bucket.hash == hash && matches(bucket.row()) {
                 return Some(offset);
             }
             offset = (offset + 1) & mask;
@@ -76,7 +87,13 @@ impl HashIndex {
     }
 
     pub(crate) fn insert(&mut self, hash: u64, row: usize) {
-        Self::place(&mut self.buckets, Bucket { hash, row });
+        Self::place(
+            &mut self.buckets,
+            Bucket {
+                hash,
+                row_plus_one: encode_row(row),
+            },
+        );
         self.len += 1;
     }
 
@@ -91,7 +108,7 @@ impl HashIndex {
 
     pub(crate) fn relocate(&mut self, hash: u64, from: usize, to: usize) {
         let offset = self.locate(hash, |row| row == from).unwrap();
-        self.buckets[offset].as_mut().unwrap().row = to;
+        self.buckets[offset].as_mut().unwrap().row_plus_one = encode_row(to);
     }
 
     pub(crate) fn remove(
@@ -118,7 +135,7 @@ impl HashIndex {
         }
         self.buckets[hole] = None;
         self.len -= 1;
-        removed.row
+        removed.row()
     }
 }
 
@@ -208,13 +225,14 @@ impl OrderedCollection {
 
     pub(crate) fn locate(&self, heap: &Heap, key: Value, hash: u64) -> Option<usize> {
         self.locate_bucket(heap, key, hash)
-            .map(|bucket| self.index.buckets[bucket].unwrap().row)
+            .map(|bucket| self.index.buckets[bucket].unwrap().row())
     }
 
     pub(crate) fn locate_bucket(&self, heap: &Heap, key: Value, hash: u64) -> Option<usize> {
         let key = canonical_key(key);
         self.index.locate(hash, |row| {
-            same_value_raw(heap, key, self.entries[row].pair.unwrap().0)
+            let stored = self.entries[row].pair.unwrap().0;
+            key == stored || same_value_raw(heap, key, stored)
         })
     }
 
@@ -296,7 +314,7 @@ impl OrderedCollection {
 }
 
 pub(crate) fn canonical_key(key: Value) -> Value {
-    if key.as_number() == Some(0.0) {
+    if key == Value::number(0.0) || key == Value::number(-0.0) {
         Value::int32(0)
     } else {
         key
@@ -337,6 +355,11 @@ impl Trace for CollectionIteratorData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hash_bucket_uses_the_empty_row_as_its_option_tag() {
+        assert_eq!(size_of::<Option<Bucket>>(), size_of::<Bucket>());
+    }
 
     #[test]
     fn hash_index_removes_wrapped_collisions_and_keeps_entries_if_growth_fails() {
