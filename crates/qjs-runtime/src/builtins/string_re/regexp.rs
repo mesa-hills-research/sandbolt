@@ -5,7 +5,7 @@ use qjs_regexp::{CompiledRegExp, RegExpError, RegExpFlags as F, RegExpHost, RegE
 use crate::arena::Arena;
 use crate::ledger::{AllocError, TrackedBox};
 use crate::object::{
-    ArrayData, ErrorKind, JsObject, ObjectFlags, RegExpData, RegExpProgram,
+    ArrayData, ErrorKind, JsObject, ObjectFlags, PropSlots, RegExpData, RegExpProgram,
     RegExpStringIteratorData,
 };
 use crate::ops::call::construct;
@@ -271,9 +271,7 @@ pub(crate) fn create<'s>(
     let source = ctx.get(source);
     let obj = ctx.allocate(|rt| {
         let heap = &mut rt.heap;
-        let mut props = TrackedVec::new();
-        props.try_reserve_exact(&heap.ledger, 1)?;
-        props.push_reserved(Value::int32(0));
+        let props = PropSlots::one(Value::int32(0));
         heap.objects.insert(
             &heap.ledger,
             JsObject {
@@ -700,6 +698,75 @@ fn regexp_exec<'s>(ctx: &mut ExecCtx<'_, 's>, re: Handle<'s>, s: Handle<'s>) -> 
     builtin_exec(ctx, re, s)
 }
 
+// The caller keeps both ids rooted. None asks the caller to use the general builtin.
+pub(crate) fn fast_regexp_exec(
+    ctx: &mut ExecCtx<'_, '_>,
+    id: ObjId,
+    input: StrId,
+) -> JsResult<Option<Value>> {
+    let heap = ctx.heap();
+    let object = heap.object(id);
+    let ObjectData::RegExp(data) = &object.data else {
+        return Ok(None);
+    };
+    if Some(object.shape) != ctx.realm().regexp_shape
+        || data.program.compiled.capture_count != 1
+        || data.program.compiled.flags.contains(F::NAMED_GROUPS | F::INDICES)
+        || matches!(heap.string(input), JsString::Rope { .. })
+    {
+        return Ok(None);
+    }
+    let index = match object.props[0].decode() {
+        ValueKind::Int32(index) if index >= 0 => index as usize,
+        _ => return Ok(None),
+    };
+    let update = data.program.compiled.flags.contains(F::GLOBAL | F::STICKY);
+    let start = if update { index } else { 0 };
+    if start > heap.string(input).len() as usize {
+        ctx.runtime.heap.objects.get_mut(id).unwrap().props[0] = Value::number(0.0);
+        return Ok(Some(Value::NULL));
+    }
+    let program = Rc::clone(&data.program);
+    ctx.check_interrupt()?;
+    let result = exec_single_match(ctx, &program.compiled, input, start)?;
+    if update {
+        ctx.runtime.heap.objects.get_mut(id).unwrap().props[0] =
+            Value::number(result.map_or(0.0, |(_, end)| end as f64));
+    }
+    match result {
+        Some((start, end)) => build_single_result(ctx, input, start, end).map(Some),
+        None => Ok(Some(Value::NULL)),
+    }
+}
+
+fn exec_single_match(
+    ctx: &mut ExecCtx<'_, '_>,
+    program: &CompiledRegExp,
+    input_id: StrId,
+    start: usize,
+) -> JsResult<Option<(usize, usize)>> {
+    let (result, hit_limit) = {
+        let rt = &mut *ctx.runtime;
+        let input_slice = flat_regexp_input(&rt.heap.strings, input_id);
+        let mut host = DirectHost {
+            vm: &mut rt.vm,
+            ledger: &rt.heap.ledger,
+            hit_limit: false,
+        };
+        let result = qjs_regexp::exec_single(program, input_slice, start, &mut host);
+        (result, host.hit_limit)
+    };
+    match result {
+        Err(RegExpError::OutOfMemory) if hit_limit => {
+            ctx.collect();
+            let copied = units(ctx, Value::string(input_id))?;
+            qjs_regexp::exec_single(program, RegExpInput::Utf16(&copied), start, &mut Host(ctx))
+                .map_err(|e| re_error(ctx, e))
+        }
+        other => other.map_err(|e| re_error(ctx, e)),
+    }
+}
+
 fn builtin_exec<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     this: Handle<'s>,
@@ -711,6 +778,10 @@ fn builtin_exec<'s>(
     } else {
         to_string(ctx, input)?
     };
+    let input_id = string_id(ctx.get(input));
+    if let Some(result) = fast_regexp_exec(ctx, id, input_id)? {
+        return Ok(result);
+    }
     let index = if Some(ctx.heap().object(id).shape) == ctx.realm().regexp_shape {
         let raw = ctx.heap().object(id).props[0];
         match raw.decode() {
@@ -727,7 +798,6 @@ fn builtin_exec<'s>(
     let program = regexp_data(ctx, id).program.clone();
     let update = program.compiled.flags.contains(F::GLOBAL | F::STICKY);
     let start = if update { index } else { 0 };
-    let input_id = string_id(ctx.get(input));
     if start > u64::from(ctx.heap().string(input_id).len()) {
         set_last_index(ctx, this, 0.0)?;
         return Ok(Value::NULL);
@@ -738,32 +808,7 @@ fn builtin_exec<'s>(
     ctx.check_interrupt()?;
     let flags = program.compiled.flags;
     if program.compiled.capture_count == 1 && !flags.contains(F::NAMED_GROUPS | F::INDICES) {
-        let (result, hit_limit) = {
-            let rt = &mut *ctx.runtime;
-            let input_slice = flat_regexp_input(&rt.heap.strings, input_id);
-            let mut host = DirectHost {
-                vm: &mut rt.vm,
-                ledger: &rt.heap.ledger,
-                hit_limit: false,
-            };
-            let res =
-                qjs_regexp::exec_single(&program.compiled, input_slice, start as usize, &mut host);
-            (res, host.hit_limit)
-        };
-        let result = match result {
-            Err(RegExpError::OutOfMemory) if hit_limit => {
-                ctx.collect();
-                let copied = units(ctx, ctx.get(input))?;
-                qjs_regexp::exec_single(
-                    &program.compiled,
-                    RegExpInput::Utf16(&copied),
-                    start as usize,
-                    &mut Host(ctx),
-                )
-                .map_err(|e| re_error(ctx, e))?
-            }
-            other => other.map_err(|e| re_error(ctx, e))?,
-        };
+        let result = exec_single_match(ctx, &program.compiled, input_id, start as usize)?;
         let Some((m_start, m_end)) = result else {
             if update {
                 set_last_index(ctx, this, 0.0)?;
@@ -773,7 +818,7 @@ fn builtin_exec<'s>(
         if update {
             set_last_index(ctx, this, m_end as f64)?;
         }
-        return build_single_result(ctx, input, input_id, m_start, m_end);
+        return build_single_result(ctx, input_id, m_start, m_end);
     }
     let (result, hit_limit) = {
         let rt = &mut *ctx.runtime;
@@ -868,7 +913,7 @@ fn alloc_result_array<'s>(
                 realm,
             },
         )?;
-        let mut props = TrackedVec::new();
+        let mut props = PropSlots::new();
         props.try_reserve_exact(&heap.ledger, 3)?;
         props.push_reserved(Value::int32(start as i32));
         props.push_reserved(input);
@@ -885,30 +930,31 @@ fn alloc_result_array<'s>(
     })
 }
 
-fn build_single_result<'s>(
-    ctx: &mut ExecCtx<'_, 's>,
-    input: Handle<'s>,
+fn build_single_result(
+    ctx: &mut ExecCtx<'_, '_>,
     input_id: StrId,
     start: usize,
     end: usize,
 ) -> JsResult<Value> {
     let input_len = ctx.heap().string(input_id).len() as usize;
     let slice_len = end - start;
+    let input_val = Value::string(input_id);
     if slice_len <= 1 || slice_len == input_len {
-        let cap0 = ctx.string_slice(input, start, end)?;
-        let obj = alloc_result_array(
-            ctx,
-            1,
-            Some(ctx.get(cap0)),
-            start,
-            ctx.get(input),
-            Value::UNDEFINED,
-        )?;
+        let cap0 = if slice_len == input_len {
+            input_val
+        } else if slice_len == 0 {
+            let empty = ctx.new_latin1(&[])?;
+            ctx.get(empty)
+        } else {
+            let unit = JsString::unit_at(&ctx.heap().strings, input_id, start as u32).unwrap();
+            let unit = ctx.new_utf16(&[unit])?;
+            ctx.get(unit)
+        };
+        let obj = alloc_result_array(ctx, 1, Some(cap0), start, input_val, Value::UNDEFINED)?;
         return Ok(Value::object(obj));
     }
     let shape = crate::realm::ensure_regexp_result_shape(ctx)?;
     let realm = ctx.realm_id();
-    let input_val = ctx.get(input);
     let obj = ctx.allocate(|rt| {
         let heap = &mut rt.heap;
         let (base, offset) = match heap.string(input_id) {
@@ -961,7 +1007,7 @@ fn build_single_result<'s>(
                 realm,
             },
         )?;
-        let mut props = TrackedVec::new();
+        let mut props = PropSlots::new();
         props.try_reserve_exact(&heap.ledger, 3)?;
         props.push_reserved(Value::int32(start as i32));
         props.push_reserved(input_val);

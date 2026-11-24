@@ -470,7 +470,15 @@ fn plain_index_prototypes(heap: &Heap, object: &JsObject, index: Option<u32>) ->
     true
 }
 
-pub(super) fn fast_pop(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> Option<Value> {
+pub(crate) fn fast_array_pop(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> Option<Value> {
+    // Leave a root for the generic length lookup if the VM is near its stack limit.
+    if !ctx.runtime.vm.can_root_without_growing(1) {
+        return None;
+    }
+    fast_pop(ctx, id)
+}
+
+fn fast_pop(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> Option<Value> {
     let heap = &mut ctx.runtime.heap;
     let object = heap.objects.get_mut(id).unwrap();
     let ObjectData::Array(array) = &mut object.data else {
@@ -507,6 +515,57 @@ pub(super) fn fast_pop(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> Option<Value> {
     Some(Value::UNDEFINED)
 }
 
+// The caller keeps the receiver and value rooted if the elements need to grow.
+pub(crate) fn fast_array_push_one(
+    ctx: &mut ExecCtx<'_, '_>,
+    id: ObjId,
+    value: Value,
+) -> JsResult<Option<Value>> {
+    if !ctx.runtime.vm.can_root_without_growing(1) {
+        return Ok(None);
+    }
+    let heap = ctx.heap();
+    let object = heap.object(id);
+    let ObjectData::Array(array) = &object.data else {
+        return Ok(None);
+    };
+    if !object.flags.contains(ObjectFlags::FAST_ARRAY | ObjectFlags::EXTENSIBLE)
+        || object.flags.contains(ObjectFlags::IS_PROTOTYPE)
+        || !array.length_writable
+        || array.length as usize != array.elements.len()
+        || array.length >= crate::atom::INLINE_INDEX_LIMIT
+        || !plain_index_prototypes(heap, object, Some(array.length))
+    {
+        return Ok(None);
+    }
+    let length = array.length + 1;
+    let grows = length as usize > array.elements.capacity();
+    ctx.check_interrupt()?;
+    if grows {
+        push_one_growing(ctx, id, value, length)?;
+    } else {
+        let ObjectData::Array(array) = &mut ctx.runtime.heap.objects.get_mut(id).unwrap().data else {
+            unreachable!()
+        };
+        array.elements.push_reserved(value);
+        array.length = length;
+    }
+    Ok(Some(Value::number(f64::from(length))))
+}
+
+#[cold]
+fn push_one_growing(ctx: &mut ExecCtx<'_, '_>, id: ObjId, value: Value, length: u32) -> JsResult<()> {
+    ctx.allocate(|runtime| {
+        let heap = &mut runtime.heap;
+        let ObjectData::Array(array) = &mut heap.objects.get_mut(id).unwrap().data else {
+            unreachable!()
+        };
+        array.elements.push(&heap.ledger, value)?;
+        array.length = length;
+        Ok(())
+    })
+}
+
 pub(super) fn fast_push<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     id: ObjId,
@@ -534,37 +593,22 @@ pub(super) fn fast_push<'s>(
     };
     if !object.flags.contains(ObjectFlags::EXTENSIBLE)
         || len != array.elements.len()
-        || !plain_index_prototypes(ctx.heap(), object, (args.len() == 1).then_some(len as u32))
+        || !plain_index_prototypes(ctx.heap(), object, None)
     {
         return Ok(None);
     }
+    // Reserving a batch here would change which earlier writes survive OOM.
     if end > array.elements.capacity() {
-        // Reserving a batch here would change which earlier writes survive OOM.
-        if args.len() != 1 {
-            return Ok(None);
-        }
+        return Ok(None);
+    }
+    for i in 0..args.len() {
         ctx.check_interrupt()?;
-        let value = ctx.get(args.get(0).unwrap());
-        ctx.allocate(|runtime| {
-            let heap = &mut runtime.heap;
-            let ObjectData::Array(array) = &mut heap.objects.get_mut(id).unwrap().data else {
-                unreachable!()
-            };
-            array.elements.push(&heap.ledger, value)?;
-            array.length += 1;
-            Ok(())
-        })?;
-    } else {
-        for i in 0..args.len() {
-            ctx.check_interrupt()?;
-            let value = ctx.get(args.get(i).unwrap());
-            let ObjectData::Array(array) = &mut ctx.runtime.heap.objects.get_mut(id).unwrap().data
-            else {
-                unreachable!()
-            };
-            array.elements.push_reserved(value);
-            array.length += 1;
-        }
+        let value = ctx.get(args.get(i).unwrap());
+        let ObjectData::Array(array) = &mut ctx.runtime.heap.objects.get_mut(id).unwrap().data else {
+            unreachable!()
+        };
+        array.elements.push_reserved(value);
+        array.length += 1;
     }
     Ok(Some(Value::number(end as f64)))
 }

@@ -21,8 +21,7 @@ pub mod typed_atomics;
 pub mod vm_internal;
 
 use crate::atom::{Atom, AtomTable, KeyKind, PropKey};
-use crate::ledger::TrackedVec;
-use crate::object::{JsObject, NativeFunctionData, ObjectData, ObjectFlags};
+use crate::object::{JsObject, NativeFunctionData, ObjectData, ObjectFlags, PropSlots};
 use crate::ops::property::{
     PropertyDescriptor, define_auto_accessor, define_auto_native, define_own_property,
 };
@@ -179,10 +178,7 @@ pub fn make_native_fn<'s>(
         let heap = &mut runtime.heap;
         let name_id = alloc_fn_name(heap, name, is_constructor)?;
         let shape = heap.realm(realm).native_fn_shape;
-        let mut props = TrackedVec::new();
-        props.try_reserve_exact(&heap.ledger, 2)?;
-        props.push_reserved(Value::int32(length as i32));
-        props.push_reserved(Value::string(name_id));
+        let props = PropSlots::two(Value::int32(length as i32), Value::string(name_id));
         heap.objects.insert(
             &heap.ledger,
             JsObject {

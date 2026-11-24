@@ -2,7 +2,7 @@ use crate::atom::{Atom, AtomTable, KeyKind, PropKey};
 use crate::heap::Heap;
 use crate::ledger::{TrackedBox, TrackedVec};
 use crate::object::{
-    Accessor, ErrorKind, JsObject, NativeFunctionData, ObjectData, ObjectFlags, ProxyData,
+    Accessor, ErrorKind, JsObject, NativeFunctionData, ObjectData, ObjectFlags, PropSlots, ProxyData,
 };
 use crate::realm::NativeFnId;
 use crate::root::{Args, ExecCtx, Handle};
@@ -210,10 +210,7 @@ fn materialize_auto_native(
             let heap = &mut runtime.heap;
             let name_id = alloc_auto_native_name(heap, key, None)?;
             let shape = heap.realm(realm_id).native_fn_shape;
-            let mut props = TrackedVec::new();
-            props.try_reserve_exact(&heap.ledger, 2)?;
-            props.push_reserved(Value::int32(i32::from(length)));
-            props.push_reserved(Value::string(name_id));
+            let props = PropSlots::two(Value::int32(i32::from(length)), Value::string(name_id));
             let fn_obj = heap.objects.insert(
                 &heap.ledger,
                 JsObject {
@@ -264,10 +261,7 @@ fn materialize_accessor_fn(
             let heap = &mut runtime.heap;
             let name_id = alloc_auto_native_name(heap, key, Some(prefix))?;
             let shape = heap.realm(realm_id).native_fn_shape;
-            let mut props = TrackedVec::new();
-            props.try_reserve_exact(&heap.ledger, 2)?;
-            props.push_reserved(Value::int32(i32::from(length)));
-            props.push_reserved(Value::string(name_id));
+            let props = PropSlots::two(Value::int32(i32::from(length)), Value::string(name_id));
             let fn_obj = heap.objects.insert(
                 &heap.ledger,
                 JsObject {
@@ -902,6 +896,24 @@ pub fn set_property_with_receiver<'s>(
     if ctx.get(receiver) == Value::object(id) {
         let heap = ctx.heap();
         let obj = heap.object(id);
+        if key == LENGTH
+            && obj.flags.contains(ObjectFlags::FAST_ARRAY)
+            && !obj.flags.contains(ObjectFlags::IS_PROTOTYPE)
+            && let ObjectData::Array(array) = &obj.data
+            && let ValueKind::Int32(length) = ctx.get(value).decode()
+            && length >= 0
+            && ctx.runtime.vm.can_root_without_growing(4)
+        {
+            if !array.length_writable {
+                return Ok(false);
+            }
+            let ObjectData::Array(array) = &mut ctx.runtime.heap.objects.get_mut(id).unwrap().data else {
+                unreachable!()
+            };
+            array.elements.truncate(length as usize);
+            array.length = length as u32;
+            return Ok(true);
+        }
         if !obj.flags.contains(ObjectFlags::IS_EXOTIC)
             && !matches!(obj.data, ObjectData::MappedArguments(_))
             && !is_private(heap, key)
@@ -1607,17 +1619,26 @@ fn define_new_slot(
     change: ShapeProp,
     value: Value,
 ) -> JsResult<()> {
-    let old_shape = ctx.heap().object(id).shape;
-    if ctx.heap().shape(old_shape).is_dictionary() {
-        return ctx.allocate(|runtime| {
-            let heap = &mut runtime.heap;
-            let ledger = heap.ledger.clone();
+    let heap = ctx.heap();
+    let object = heap.object(id);
+    let old_shape = object.shape;
+    let shape = heap.shape(old_shape);
+    if shape.is_dictionary() {
+        if shape.dict_has_spare_capacity(&object.props) {
+            let heap = &mut ctx.runtime.heap;
             let shape = heap.shapes.get_mut(old_shape).unwrap();
             let object = heap.objects.get_mut(id).unwrap();
-            shape.dict_insert(&ledger, &mut object.props, change, value)
+            shape.dict_insert_reserved(&mut object.props, change, value);
+            return Ok(());
+        }
+        return ctx.allocate(|runtime| {
+            let heap = &mut runtime.heap;
+            let shape = heap.shapes.get_mut(old_shape).unwrap();
+            let object = heap.objects.get_mut(id).unwrap();
+            shape.dict_insert(&heap.ledger, &mut object.props, change, value)
         });
     }
-    if ctx.heap().shape(old_shape).is_building() {
+    if shape.is_building() {
         return ctx.allocate(|runtime| {
             let heap = &mut runtime.heap;
             let ledger = heap.ledger.clone();
@@ -1643,6 +1664,15 @@ fn define_new_slot(
             object.shape = next;
             Ok(())
         });
+    }
+    if object.props.len() < object.props.capacity()
+        && shape.props.len() < MAX_SHARED_SHAPE_PROPS
+        && let Some(next) = shape.find_transition(change, |target| heap.shapes.get_weak(target).is_some())
+    {
+        let object = ctx.runtime.heap.objects.get_mut(id).unwrap();
+        object.props.push_reserved(value);
+        object.shape = next;
+        return Ok(());
     }
     ctx.allocate(|runtime| {
         let heap = &mut runtime.heap;
@@ -1773,7 +1803,7 @@ fn downgrade(ctx: &mut ExecCtx<'_, '_>, id: ObjId) -> JsResult<()> {
             shape.churn,
             true,
         )?;
-        let mut props = TrackedVec::new();
+        let mut props = PropSlots::new();
         props.try_reserve_exact(&heap.ledger, count)?;
         for value in shape
             .live_props()
@@ -1856,7 +1886,7 @@ fn set_length(ctx: &mut ExecCtx<'_, '_>, id: ObjId, desc: PropertyDescriptor) ->
                 shape.churn.saturating_add(1),
                 shape.is_dictionary(),
             )?;
-            let mut props = TrackedVec::new();
+            let mut props = PropSlots::new();
             props.try_reserve_exact(&heap.ledger, count)?;
             for (i, prop) in shape.live_props() {
                 if keep(&prop) {
@@ -1898,10 +1928,9 @@ pub fn delete_property<'s>(
             if heap.shape(shape_id).is_dictionary() {
                 let is_proto = obj.flags.contains(ObjectFlags::IS_PROTOTYPE);
                 let heap = &mut ctx.runtime.heap;
-                let ledger = heap.ledger.clone();
                 let shape = heap.shapes.get_mut(shape_id).unwrap();
                 let object = heap.objects.get_mut(id).unwrap();
-                return match shape.dict_delete_if_configurable(&ledger, &mut object.props, key) {
+                return match shape.dict_delete_if_configurable(&heap.ledger, &mut object.props, key) {
                     Some(true) => {
                         if is_proto {
                             invalidate_array_prototypes(ctx, id);

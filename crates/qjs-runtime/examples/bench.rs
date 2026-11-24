@@ -131,9 +131,9 @@ fn print_memory_breakdown(label: &str, engine: &JsEngine) {
             _ => "Other",
         };
         *variant_counts.entry(tag).or_default() += 1;
-        obj_props_cap_bytes += obj.props.capacity() * size_of::<qjs_runtime::value::Value>();
+        obj_props_cap_bytes += obj.props.heap_capacity() * size_of::<qjs_runtime::value::Value>();
         obj_props_len_total += obj.props.len();
-        if obj.props.capacity() > 0 {
+        if !obj.props.is_empty() {
             obj_props_nonempty += 1;
         }
     }

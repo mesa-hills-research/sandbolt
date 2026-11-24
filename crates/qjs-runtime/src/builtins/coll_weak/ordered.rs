@@ -206,15 +206,35 @@ pub(super) fn insert<'s>(
     key: Handle<'s>,
     value: Handle<'s>,
 ) -> JsResult<()> {
-    insert_raw(ctx, id, ctx.get(key), ctx.get(value))
+    fast_map_set(ctx, id, ctx.get(key), ctx.get(value))
 }
 
-fn insert_raw(ctx: &mut ExecCtx<'_, '_>, id: ObjId, key: Value, value: Value) -> JsResult<()> {
+pub(crate) fn fast_map_get(ctx: &ExecCtx<'_, '_>, id: ObjId, key: Value) -> Value {
+    lookup(ctx, id, key).unwrap_or(Value::UNDEFINED)
+}
+
+pub(crate) fn fast_map_has(ctx: &ExecCtx<'_, '_>, id: ObjId, key: Value) -> bool {
+    lookup(ctx, id, key).is_some()
+}
+
+// The caller checks the receiver and keeps the receiver, key and value rooted.
+pub(crate) fn fast_map_set(
+    ctx: &mut ExecCtx<'_, '_>,
+    id: ObjId,
+    key: Value,
+    value: Value,
+) -> JsResult<()> {
     let data = entries(ctx, id);
     let hash = data.hash(ctx.heap(), key);
     if let Some(row) = data.locate(ctx.heap(), key, hash) {
         collection_mut(&mut ctx.runtime.heap.objects.get_mut(id).unwrap().data).update(row, value);
         return Ok(());
+    }
+    if data.has_spare_capacity() {
+        let heap = &mut ctx.runtime.heap;
+        return collection_mut(&mut heap.objects.get_mut(id).unwrap().data)
+            .insert_reserved(hash, key, value)
+            .map_err(|_| ctx.throw_oom());
     }
     ctx.allocate(|runtime| {
         let heap = &mut runtime.heap;
@@ -223,7 +243,9 @@ fn insert_raw(ctx: &mut ExecCtx<'_, '_>, id: ObjId, key: Value, value: Value) ->
     })
 }
 
-pub(super) fn delete(ctx: &mut ExecCtx<'_, '_>, id: ObjId, key: Value) -> bool {
+pub(super) use fast_map_delete as delete;
+
+pub(crate) fn fast_map_delete(ctx: &mut ExecCtx<'_, '_>, id: ObjId, key: Value) -> bool {
     let data = entries(ctx, id);
     if data.len() == 0 {
         return false;
@@ -269,16 +291,16 @@ pub(super) fn method<'s>(
         _ => {
             let raw = args.get(0).map_or(Value::UNDEFINED, |key| ctx.get(key));
             match op {
-                MAP_GET => Ok(lookup(ctx, id, raw).unwrap_or(Value::UNDEFINED)),
-                MAP_HAS | SET_HAS => Ok(Value::bool(lookup(ctx, id, raw).is_some())),
-                MAP_DELETE | SET_DELETE => Ok(Value::bool(delete(ctx, id, raw))),
+                MAP_GET => Ok(fast_map_get(ctx, id, raw)),
+                MAP_HAS | SET_HAS => Ok(Value::bool(fast_map_has(ctx, id, raw))),
+                MAP_DELETE | SET_DELETE => Ok(Value::bool(fast_map_delete(ctx, id, raw))),
                 MAP_SET | SET_ADD => {
                     let value = if is_set {
                         Value::UNDEFINED
                     } else {
                         args.get(1).map_or(Value::UNDEFINED, |value| ctx.get(value))
                     };
-                    insert_raw(ctx, id, raw, value)?;
+                    fast_map_set(ctx, id, raw, value)?;
                     Ok(ctx.get(this))
                 }
                 MAP_UPSERT | MAP_UPSERT_COMPUTED => {

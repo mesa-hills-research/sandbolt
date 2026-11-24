@@ -1,6 +1,8 @@
 use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::BuildHasher;
 use std::num::NonZeroUsize;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::gc::{Trace, Tracer};
 use crate::heap::Heap;
@@ -64,8 +66,12 @@ impl HashIndex {
         None
     }
 
+    pub(crate) fn has_spare_capacity(&self) -> bool {
+        self.len < self.buckets.len() / 2
+    }
+
     pub(crate) fn reserve(&mut self, ledger: &HeapLedger) -> AllocResult<()> {
-        if self.len < self.buckets.len() / 2 {
+        if self.has_spare_capacity() {
             return Ok(());
         }
         let size = self
@@ -153,13 +159,39 @@ pub(crate) struct CollectionCursor {
     epoch: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OrderedCollection {
     entries: TrackedVec<Entry>,
     index: HashIndex,
-    seed: RandomState,
+    seed: u64,
     next_order: u64,
     epoch: u64,
+}
+
+impl Default for OrderedCollection {
+    fn default() -> Self {
+        Self {
+            entries: TrackedVec::new(),
+            index: HashIndex::default(),
+            seed: collection_seed(),
+            next_order: 0,
+            epoch: 0,
+        }
+    }
+}
+
+pub(super) fn collection_seed() -> u64 {
+    static PROCESS_SEED: OnceLock<u64> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let seed = *PROCESS_SEED.get_or_init(|| RandomState::new().hash_one(0u64));
+    mix64(seed ^ NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+#[inline]
+pub(super) fn mix64(word: u64) -> u64 {
+    let word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    let word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    word ^ (word >> 31)
 }
 
 impl Trace for OrderedCollection {
@@ -176,51 +208,34 @@ impl OrderedCollection {
     }
 
     pub(crate) fn hash(&self, heap: &Heap, key: Value) -> u64 {
-        let mut hasher = self.seed.build_hasher();
         match key.decode() {
-            ValueKind::Int32(n) => {
-                0u8.hash(&mut hasher);
-                f64::from(n).to_bits().hash(&mut hasher);
-            }
-            ValueKind::Float64(n) => {
-                0u8.hash(&mut hasher);
-                (if n == 0.0 { 0 } else { n.to_bits() }).hash(&mut hasher);
-            }
+            ValueKind::Int32(n) => mix64(self.seed ^ f64::from(n).to_bits()),
+            ValueKind::Float64(n) => mix64(self.seed ^ if n == 0.0 { 0 } else { n.to_bits() }),
             ValueKind::String(id) => {
-                1u8.hash(&mut hasher);
                 let string = heap.string(id);
+                let state = self.seed ^ 0x9e37_79b9_7f4a_7c15 ^ u64::from(string.len());
                 if let Some(bytes) = string.as_latin1() {
-                    for &byte in bytes {
-                        hasher.write_u16(u16::from(byte));
-                    }
+                    hash_units(state, bytes, u64::from)
                 } else if let Some(units) = string.as_utf16() {
-                    for &unit in units {
-                        hasher.write_u16(unit);
-                    }
+                    hash_units(state, units, u64::from)
                 } else {
-                    for unit in heap.string_units(id) {
-                        hasher.write_u16(unit);
-                    }
+                    hash_iter(state, heap.string_units(id).map(u64::from))
                 }
             }
             ValueKind::ShortBigInt(n) => {
                 let magnitude = n.unsigned_abs();
                 hash_bigint(
+                    self.seed,
                     n < 0,
                     &[magnitude as u32, (magnitude >> 32) as u32],
-                    &mut hasher,
-                );
+                )
             }
             ValueKind::BigInt(id) => {
                 let data = heap.bigints.get(id).unwrap();
-                hash_bigint(data.negative, &data.limbs, &mut hasher);
+                hash_bigint(self.seed, data.negative, &data.limbs)
             }
-            _ => {
-                3u8.hash(&mut hasher);
-                key.hash(&mut hasher);
-            }
+            _ => mix64(self.seed ^ key.bits() ^ 0xd1b5_4a32_d192_ed03),
         }
-        hasher.finish()
     }
 
     pub(crate) fn locate(&self, heap: &Heap, key: Value, hash: u64) -> Option<usize> {
@@ -244,6 +259,10 @@ impl OrderedCollection {
         self.entries[row].pair.as_mut().unwrap().1 = value;
     }
 
+    pub(crate) fn has_spare_capacity(&self) -> bool {
+        self.entries.len() < self.entries.capacity() && self.index.has_spare_capacity()
+    }
+
     pub(crate) fn insert(
         &mut self,
         ledger: &HeapLedger,
@@ -251,9 +270,21 @@ impl OrderedCollection {
         key: Value,
         value: Value,
     ) -> AllocResult<()> {
-        let next_order = self.next_order.checked_add(1).ok_or(AllocError::Limit)?;
+        if self.next_order == u64::MAX {
+            return Err(AllocError::Limit);
+        }
         self.entries.try_reserve(ledger, 1)?;
         self.index.reserve(ledger)?;
+        self.insert_reserved(hash, key, value)
+    }
+
+    pub(crate) fn insert_reserved(
+        &mut self,
+        hash: u64,
+        key: Value,
+        value: Value,
+    ) -> AllocResult<()> {
+        let next_order = self.next_order.checked_add(1).ok_or(AllocError::Limit)?;
         self.index.insert(hash, self.entries.len());
         self.entries.push_reserved(Entry {
             order: self.next_order,
@@ -321,14 +352,44 @@ pub(crate) fn canonical_key(key: Value) -> Value {
     }
 }
 
-fn hash_bigint(negative: bool, limbs: &[u32], hasher: &mut impl Hasher) {
+// Pack four code units into one word regardless of the backing representation.
+#[inline]
+fn hash_units<T: Copy>(mut state: u64, units: &[T], word: impl Fn(T) -> u64) -> u64 {
+    let (chunks, tail) = units.as_chunks::<4>();
+    for &[a, b, c, d] in chunks {
+        let packed = word(a) | (word(b) << 16) | (word(c) << 32) | (word(d) << 48);
+        state = mix64(state ^ packed);
+    }
+    hash_iter(state, tail.iter().copied().map(word))
+}
+
+fn hash_iter(mut state: u64, units: impl Iterator<Item = u64>) -> u64 {
+    let mut packed = 0;
+    let mut shift = 0;
+    for unit in units {
+        packed |= unit << shift;
+        shift += 16;
+        if shift == 64 {
+            state = mix64(state ^ packed);
+            packed = 0;
+            shift = 0;
+        }
+    }
+    mix64(state ^ packed)
+}
+
+fn hash_bigint(seed: u64, negative: bool, limbs: &[u32]) -> u64 {
     let len = limbs
         .iter()
         .rposition(|&limb| limb != 0)
         .map_or(0, |i| i + 1);
-    2u8.hash(hasher);
-    (negative && len != 0).hash(hasher);
-    limbs[..len].hash(hasher);
+    let mut state =
+        seed ^ 0xa076_1d64_78bd_642f ^ ((len as u64) << 1) ^ u64::from(negative && len != 0);
+    let (chunks, tail) = limbs[..len].as_chunks::<2>();
+    for &[low, high] in chunks {
+        state = mix64(state ^ (u64::from(low) | (u64::from(high) << 32)));
+    }
+    mix64(state ^ tail.first().copied().map_or(0, u64::from))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -359,6 +420,73 @@ mod tests {
     #[test]
     fn hash_bucket_uses_the_empty_row_as_its_option_tag() {
         assert_eq!(size_of::<Option<Bucket>>(), size_of::<Bucket>());
+    }
+
+    #[test]
+    fn hash_agrees_across_string_and_number_representations() {
+        use crate::string::JsString;
+
+        let mut heap = Heap::new(1024 * 1024).unwrap();
+        let ledger = heap.ledger.clone();
+        let text = b"abc\xE9\x00xyz!";
+        let left = heap
+            .strings
+            .insert(&ledger, JsString::from_latin1(&ledger, &text[..5]).unwrap())
+            .unwrap();
+        let right = heap
+            .strings
+            .insert(&ledger, JsString::from_latin1(&ledger, &text[5..]).unwrap())
+            .unwrap();
+        let flat = heap
+            .strings
+            .insert(&ledger, JsString::from_latin1(&ledger, text).unwrap())
+            .unwrap();
+        let wide = heap
+            .strings
+            .insert(
+                &ledger,
+                JsString::Utf16(TrackedVec::from_slice(&ledger, &text.map(u16::from)).unwrap()),
+            )
+            .unwrap();
+        let rope = heap
+            .strings
+            .insert(
+                &ledger,
+                JsString::Rope {
+                    left,
+                    right,
+                    len: 9,
+                    is_wide: false,
+                    depth: 1,
+                },
+            )
+            .unwrap();
+        let backing = heap
+            .strings
+            .insert(
+                &ledger,
+                JsString::from_latin1(&ledger, b".abc\xE9\x00xyz!.").unwrap(),
+            )
+            .unwrap();
+        let slice = heap
+            .strings
+            .insert(
+                &ledger,
+                JsString::Slice {
+                    base: backing,
+                    start: 1,
+                    len: 9,
+                    is_wide: false,
+                },
+            )
+            .unwrap();
+        let map = OrderedCollection::default();
+        let hash = |value| map.hash(&heap, value);
+        for id in [wide, rope, slice] {
+            assert_eq!(hash(Value::string(id)), hash(Value::string(flat)));
+        }
+        assert_eq!(hash(Value::int32(-42)), hash(Value::number(-42.0)));
+        assert_eq!(hash(Value::int32(0)), hash(Value::number(-0.0)));
     }
 
     #[test]

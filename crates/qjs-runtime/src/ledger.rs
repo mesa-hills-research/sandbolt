@@ -90,7 +90,7 @@ impl HeapLedger {
         self.charge(bytes, false)
     }
 
-    fn charge(&self, bytes: usize, emergency: bool) -> AllocResult<()> {
+    pub(crate) fn charge(&self, bytes: usize, emergency: bool) -> AllocResult<()> {
         if bytes == 0 {
             return Ok(());
         }

@@ -6,7 +6,7 @@ use crate::atom::{Atom, PropKey};
 use crate::gc::{Trace, Tracer};
 use crate::heap::Heap;
 use crate::ledger::{AllocError, AllocResult, HeapLedger, TrackedBox, TrackedVec};
-use crate::object::{ArrayData, ErrorData, ErrorKind, NativeFunctionData, ObjectData, ObjectFlags};
+use crate::object::{ArrayData, ErrorData, ErrorKind, NativeFunctionData, ObjectData, ObjectFlags, PropSlots};
 use crate::root::{Args, ExecCtx, Handle, RootScope};
 use crate::shape::{PropFlags, Shape, ShapeProp};
 use crate::string::JsString;
@@ -60,9 +60,7 @@ impl EmergencyError {
                 false,
             )?,
         )?;
-        let mut props = TrackedVec::new();
-        props.try_reserve_exact(&heap.ledger, 1)?;
-        props.push_reserved(message);
+        let props = PropSlots::one(message);
         let object = heap.objects.insert(
             &heap.ledger,
             crate::object::JsObject {
@@ -134,6 +132,7 @@ macro_rules! intrinsics {
             pub(crate) regexp_shape: Option<ShapeId>,
             pub(crate) regexp_result_shape: Option<ShapeId>,
             pub(crate) null_proto_shape: Option<ShapeId>,
+            uri_error: Option<(ShapeId, StrId)>,
         }
 
         impl Trace for Realm {
@@ -169,6 +168,10 @@ macro_rules! intrinsics {
                 self.regexp_shape.trace(tracer);
                 self.regexp_result_shape.trace(tracer);
                 self.null_proto_shape.trace(tracer);
+                if let Some((shape, message)) = self.uri_error {
+                    shape.trace(tracer);
+                    message.trace(tracer);
+                }
             }
         }
 
@@ -267,6 +270,7 @@ macro_rules! intrinsics {
                 oom_error, stack_error,
                 native_fn_shape, ctor_proto_shape, ctor_shape,
                 regexp_shape: None, regexp_result_shape: None, null_proto_shape: None,
+                uri_error: None,
             });
             let prev_building = heap.building_shapes;
             heap.building_shapes = true;
@@ -446,7 +450,7 @@ fn bootstrap_ctor(
     instance_proto: ObjId,
 ) -> AllocResult<ObjId> {
     let payload = native_payload(realm, NativeFnId::UNIMPLEMENTED);
-    let mut props = TrackedVec::new();
+    let mut props = PropSlots::new();
     if let Some(empty) = empty_name {
         props.try_reserve_exact(&heap.ledger, 3)?;
         props.push_reserved(Value::object(instance_proto));
@@ -644,6 +648,51 @@ fn install_property(
     obj.props.push(&heap.ledger, value)?;
     obj.shape = new_id;
     Ok(())
+}
+
+pub(crate) fn new_uri_error(heap: &mut Heap, realm: RealmId) -> AllocResult<ObjId> {
+    let (shape, message) = match heap.realm(realm).uri_error {
+        Some(cached) => cached,
+        None => {
+            let proto = heap.realm(realm).error_prototype(ErrorKind::Uri);
+            let shape = Shape::build(
+                &heap.ledger,
+                Some(proto),
+                1,
+                [ShapeProp {
+                    key: PropKey::atom(Atom::MESSAGE),
+                    flags: PropFlags::WRITABLE | PropFlags::CONFIGURABLE,
+                }]
+                .into_iter(),
+                0,
+                false,
+            )?;
+            let message = JsString::from_str(&heap.ledger, "malformed URI")?;
+            let message = heap.strings.insert(&heap.ledger, message)?;
+            let shape = heap.shapes.insert(&heap.ledger, shape)?;
+            heap.realms.get_mut(realm).unwrap().uri_error = Some((shape, message));
+            (shape, message)
+        }
+    };
+    let message = Value::string(message);
+    let data = TrackedBox::new(
+        &heap.ledger,
+        ErrorData {
+            kind: ErrorKind::Uri,
+            message,
+            stack: Value::UNDEFINED,
+            frames: TrackedVec::new(),
+        },
+    )?;
+    heap.objects.insert(
+        &heap.ledger,
+        crate::object::JsObject {
+            shape,
+            props: PropSlots::one(message),
+            flags: ObjectFlags::EXTENSIBLE,
+            data: ObjectData::Error(data),
+        },
+    )
 }
 
 pub(crate) fn bootstrap_error_message(

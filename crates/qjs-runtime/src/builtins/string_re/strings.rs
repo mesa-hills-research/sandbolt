@@ -5,6 +5,7 @@ use qjs_unicode::{
 use crate::ledger::TrackedBox;
 use crate::object::{ObjectData, ObjectFlags, StringIteratorData, StringObjectData};
 use crate::ops::convert::{space, to_integer_or_infinity, to_length, to_number, to_uint32};
+use crate::root::append_latin1_bytes;
 use crate::string::{INLINE_LATIN1_CAPACITY, INLINE_UTF16_CAPACITY, JsString};
 use crate::symbol::SymbolDescription;
 use crate::value::ValueKind;
@@ -309,44 +310,6 @@ fn raw<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>) -> JsResult<Value> {
         }
     }
     out.value(ctx)
-}
-
-fn append_latin1_bytes(heap: &crate::heap::Heap, id: StrId, out: &mut TrackedVec<u8>) {
-    match heap.string(id) {
-        JsString::InlineLatin1 { len: 1, data, .. } => {
-            out.push_reserved(data[0]);
-        }
-        JsString::InlineLatin1 { len, data, .. } => {
-            let slice = &data[..usize::from(*len)];
-            if slice.len() <= 8 {
-                for &b in slice {
-                    out.push_reserved(b);
-                }
-            } else {
-                out.extend_from_slice(&heap.ledger, slice)
-                    .expect("pre-reserved concat inline latin1");
-            }
-        }
-        JsString::Latin1 { data, .. } => {
-            out.extend_from_slice(&heap.ledger, data)
-                .expect("pre-reserved concat latin1");
-        }
-        JsString::Slice {
-            base, start, len, ..
-        } => {
-            let start = *start as usize;
-            let end = start + *len as usize;
-            let bytes = heap.string(*base).as_latin1().expect("latin1 slice");
-            out.extend_from_slice(&heap.ledger, &bytes[start..end])
-                .expect("pre-reserved concat latin1 slice");
-        }
-        JsString::Rope { .. } => {
-            for unit in heap.string_units(id) {
-                out.push_reserved(unit as u8);
-            }
-        }
-        JsString::Utf16(_) | JsString::InlineUtf16 { .. } => unreachable!("wide string in latin1"),
-    }
 }
 
 fn append_latin1_inline(heap: &crate::heap::Heap, id: StrId, dst: &mut [u8], pos: &mut usize) {

@@ -15,6 +15,8 @@ mod from_async;
 mod methods;
 mod sort;
 
+pub(crate) use methods::{fast_array_pop, fast_array_push_one};
+
 const CTOR: u16 = 0;
 const IS_ARRAY: u16 = 1;
 const FROM: u16 = 2;
@@ -202,15 +204,15 @@ pub(super) fn dispatch<'s>(
         }
         _ => {}
     }
-    if matches!(n, POP | PUSH)
-        && let Some(id) = ctx.get(this).as_object()
-        // The generic length lookup uses one temporary root.
-        && ctx.runtime.vm.can_root_without_growing(1)
-    {
+    if matches!(n, POP | PUSH) && let Some(id) = ctx.get(this).as_object() {
         let result = if n == POP {
-            methods::fast_pop(ctx, id)
-        } else {
+            fast_array_pop(ctx, id)
+        } else if args.len() == 1 {
+            fast_array_push_one(ctx, id, ctx.get(args.get(0).unwrap()))?
+        } else if ctx.runtime.vm.can_root_without_growing(1) {
             methods::fast_push(ctx, id, args)?
+        } else {
+            None
         };
         if let Some(result) = result {
             return Ok(result);

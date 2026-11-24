@@ -1,4 +1,3 @@
-use crate::object::ErrorKind;
 use crate::root::{Args, ExecCtx, Handle};
 use crate::string::JsString;
 use crate::value::{JsResult, StrId, Value};
@@ -126,7 +125,7 @@ fn allowed(cp: u32, marks: &[u8]) -> bool {
 }
 
 fn uri_error(ctx: &mut ExecCtx<'_, '_>) -> crate::Abrupt {
-    ctx.throw_error(ErrorKind::Uri, "malformed URI")
+    ctx.throw_uri_error()
 }
 
 fn hex_byte(byte: u8) -> [u8; 2] {
@@ -247,7 +246,7 @@ impl Decoded {
     }
 }
 
-fn decode_parts(mut bytes: &[u8], full: bool) -> impl Iterator<Item = Option<Decoded>> + '_ {
+fn decode_next_latin1(bytes: &mut &[u8], full: bool) -> Option<Decoded> {
     fn escaped(input: &[u8]) -> Option<u8> {
         let &[b'%', hi, lo] = input.get(..3)? else {
             return None;
@@ -256,57 +255,75 @@ fn decode_parts(mut bytes: &[u8], full: bool) -> impl Iterator<Item = Option<Dec
         let lo = UNHEX[usize::from(lo)];
         (hi | lo != u8::MAX).then_some((hi << 4) | lo)
     }
-    fn next(bytes: &mut &[u8], full: bool) -> Option<Decoded> {
-        let (&first, rest) = bytes.split_first()?;
-        if first != b'%' {
-            *bytes = rest;
-            return Some(Decoded::Byte(first));
-        }
-        let byte = escaped(bytes)?;
-        if byte < 128 {
-            let reserved = [first, bytes[1], bytes[2]];
-            *bytes = &bytes[3..];
-            return Some(if full && URI_FLAGS[usize::from(byte)] == URI_FULL {
-                Decoded::Reserved(reserved)
-            } else {
-                Decoded::Byte(byte)
-            });
-        }
-        let (n, min, mask) = match byte {
-            0xc2..=0xdf => (2, 0x80, 0x1f),
-            0xe0..=0xef => (3, 0x800, 0xf),
-            0xf0..=0xf4 => (4, 0x10000, 7),
-            _ => return None,
-        };
-        let mut point = u32::from(byte & mask);
-        let encoded = bytes.get(..3 * n)?;
-        for escape in encoded[3..].chunks_exact(3) {
-            let byte = escaped(escape)?;
-            if byte >> 6 != 2 {
-                return None;
-            }
-            point = (point << 6) | u32::from(byte & 63);
-        }
-        if point < min {
+    let (&first, rest) = bytes.split_first()?;
+    if first != b'%' {
+        *bytes = rest;
+        return Some(Decoded::Byte(first));
+    }
+    let byte = escaped(bytes)?;
+    if byte < 128 {
+        let reserved = [first, bytes[1], bytes[2]];
+        *bytes = &bytes[3..];
+        return Some(if full && URI_FLAGS[usize::from(byte)] == URI_FULL {
+            Decoded::Reserved(reserved)
+        } else {
+            Decoded::Byte(byte)
+        });
+    }
+    let (n, min, mask) = match byte {
+        0xc2..=0xdf => (2, 0x80, 0x1f),
+        0xe0..=0xef => (3, 0x800, 0xf),
+        0xf0..=0xf4 => (4, 0x10000, 7),
+        _ => return None,
+    };
+    let mut point = u32::from(byte & mask);
+    let encoded = bytes.get(..3 * n)?;
+    for escape in encoded[3..].chunks_exact(3) {
+        let byte = escaped(escape)?;
+        if byte >> 6 != 2 {
             return None;
         }
-        *bytes = &bytes[3 * n..];
-        if point <= 255 {
-            Some(Decoded::Byte(point as u8))
-        } else {
-            char::from_u32(point).map(Decoded::Wide)
-        }
+        point = (point << 6) | u32::from(byte & 63);
     }
-    std::iter::from_fn(move || (!bytes.is_empty()).then(|| next(&mut bytes, full)))
+    if point < min {
+        return None;
+    }
+    *bytes = &bytes[3 * n..];
+    if point <= 255 {
+        Some(Decoded::Byte(point as u8))
+    } else {
+        char::from_u32(point).map(Decoded::Wide)
+    }
+}
+
+fn decode_parts(mut bytes: &[u8], full: bool) -> impl Iterator<Item = Option<Decoded>> + '_ {
+    std::iter::from_fn(move || (!bytes.is_empty()).then(|| decode_next_latin1(&mut bytes, full)))
 }
 
 fn decode_latin1_short(ctx: &mut ExecCtx<'_, '_>, id: StrId, full: bool) -> JsResult<Value> {
+    let mut bytes = ctx.heap().string(id).as_latin1().unwrap();
+    let first = match decode_next_latin1(&mut bytes, full) {
+        Some(part) => part,
+        None => return Err(uri_error(ctx)),
+    };
+    if bytes.is_empty() {
+        return match first {
+            Decoded::Byte(byte) => ctx.new_latin1(&[byte]).map(|h| ctx.get(h)),
+            Decoded::Reserved(bytes) => ctx.new_latin1(&bytes).map(|h| ctx.get(h)),
+            Decoded::Wide(c) => {
+                let mut units = [0; 2];
+                ctx.new_utf16(c.encode_utf16(&mut units))
+                    .map(|h| ctx.get(h))
+            }
+        };
+    }
     let mut latin = [0; 32];
     let mut utf16 = [0; 32];
     let mut wide = false;
     let mut len = 0;
-    let complete =
-        decode_parts(ctx.heap().string(id).as_latin1().unwrap(), full).try_for_each(|part| {
+    let complete = std::iter::once(Some(first))
+        .chain(decode_parts(bytes, full))
+        .try_for_each(|part| {
             let part = part?;
             if !wide && !matches!(part, Decoded::Wide(_)) {
                 let (data, n) = part.latin1().unwrap();
@@ -515,6 +532,28 @@ fn unescape(ctx: &mut ExecCtx<'_, '_>, units: &[u16]) -> JsResult<Value> {
 mod tests {
     use crate::EngineLimits;
     use crate::api::{EvalOptions, JsEngine};
+
+    #[test]
+    fn malformed_uri_uses_a_fresh_error_after_collection() {
+        let options = EvalOptions::default();
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        engine.eval_to_string(
+            "try { decodeURI('%'); } catch (e) { globalThis.previous = e; e.message = 'changed'; }",
+            options.clone(),
+        ).unwrap();
+        engine.runtime_mut().collect();
+        let result = engine.eval_to_string(r#"
+            var fresh;
+            try { decodeURIComponent('%F4%90%80%80'); } catch (e) { fresh = e; }
+            const d = Object.getOwnPropertyDescriptor(fresh, 'message');
+            [fresh instanceof URIError, fresh !== previous, previous.message, d.value,
+             d.writable, d.enumerable, d.configurable, decodeURI('%F4%8F%BF%BF').codePointAt(0)].join('|');
+        "#, options).unwrap();
+        assert_eq!(
+            result,
+            "true|true|changed|malformed URI|true|false|true|1114111"
+        );
+    }
 
     #[test]
     fn uri_paths_preserve_reserved_escapes_and_validate_utf8() {

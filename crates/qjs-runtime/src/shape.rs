@@ -4,6 +4,7 @@ use crate::arena::ArenaItem;
 use crate::atom::{Atom, KeyKind, PropKey};
 use crate::gc::{Trace, Tracer};
 use crate::ledger::{AllocError, AllocResult, HeapLedger, TrackedBox, TrackedVec};
+use crate::object::PropSlots;
 use crate::value::{ObjId, ShapeId, Value};
 
 pub(crate) const LINEAR_LOOKUP_LIMIT: usize = 8;
@@ -348,7 +349,7 @@ impl Shape {
     pub(crate) fn push_building_prop(
         &mut self,
         ledger: &HeapLedger,
-        values: &mut TrackedVec<Value>,
+        values: &mut PropSlots,
         prop: ShapeProp,
         value: Value,
     ) -> AllocResult<()> {
@@ -426,7 +427,7 @@ impl Shape {
     pub(crate) fn dict_insert(
         &mut self,
         ledger: &HeapLedger,
-        values: &mut TrackedVec<Value>,
+        values: &mut PropSlots,
         prop: ShapeProp,
         value: Value,
     ) -> AllocResult<()> {
@@ -465,6 +466,26 @@ impl Shape {
 
         self.props.try_reserve(ledger, 1)?;
         values.try_reserve(ledger, 1)?;
+        self.dict_insert_reserved(values, prop, value);
+        Ok(())
+    }
+
+    pub(crate) fn dict_has_spare_capacity(&self, values: &PropSlots) -> bool {
+        let len = self.props.len();
+        len as u64 + 1 < LOOKUP_TOMBSTONE as u64
+            && len < self.props.capacity()
+            && len < values.capacity()
+            && self.lookup.as_deref().map_or(len < LINEAR_LOOKUP_LIMIT, |table| {
+                table.live as usize + (table.tombstones as usize) < table.buckets.len() / 2
+            })
+    }
+
+    pub(crate) fn dict_insert_reserved(
+        &mut self,
+        values: &mut PropSlots,
+        prop: ShapeProp,
+        value: Value,
+    ) {
         let index = self.props.len();
         if is_index_key(prop.key) {
             self.flags.set(ShapeFlags::HAS_INDEX_KEY, true);
@@ -474,7 +495,6 @@ impl Shape {
         if let Some(table) = self.lookup.as_deref_mut() {
             table.insert_slot(prop.key, index);
         }
-        Ok(())
     }
 
     /// Single-probe lookup and delete for dictionary shapes.
@@ -482,7 +502,7 @@ impl Shape {
     pub(crate) fn dict_delete_if_configurable(
         &mut self,
         ledger: &HeapLedger,
-        values: &mut TrackedVec<Value>,
+        values: &mut PropSlots,
         key: PropKey,
     ) -> Option<bool> {
         debug_assert!(self.is_dictionary());
@@ -547,7 +567,7 @@ impl Shape {
     pub(crate) fn dict_delete(
         &mut self,
         ledger: &HeapLedger,
-        values: &mut TrackedVec<Value>,
+        values: &mut PropSlots,
         key: PropKey,
     ) {
         let deleted = self.dict_delete_if_configurable(ledger, values, key);
@@ -557,7 +577,7 @@ impl Shape {
     fn compact_in_place(
         &mut self,
         ledger: &HeapLedger,
-        values: &mut TrackedVec<Value>,
+        values: &mut PropSlots,
         extra: usize,
     ) {
         let mut write = 0;
@@ -606,7 +626,7 @@ mod tests {
         );
         let ledger = HeapLedger::new(1024 * 1024, 4096).unwrap();
         let mut shape = Shape::build(&ledger, None, 0, std::iter::empty(), 0, true).unwrap();
-        let mut values = TrackedVec::new();
+        let mut values = PropSlots::new();
         for i in 0..200u32 {
             let prop = ShapeProp {
                 key: PropKey::index(i).unwrap(),
