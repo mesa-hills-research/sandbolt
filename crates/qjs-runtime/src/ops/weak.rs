@@ -32,11 +32,26 @@ pub fn weak_map_set<'s>(
     value: Handle<'s>,
 ) -> JsResult<()> {
     let map = ctx.object_id(map)?;
+    fast_weak_map_set(ctx, map, ctx.get(key), ctx.get(value))
+}
+
+// The caller keeps the receiver, key and value rooted across a growing insert.
+pub(crate) fn fast_weak_map_set(
+    ctx: &mut ExecCtx<'_, '_>,
+    map: ObjId,
+    key: Value,
+    value: Value,
+) -> JsResult<()> {
     if !matches!(ctx.heap().object(map).data, ObjectData::WeakMap(_)) {
         return Err(ctx.throw_type_error("expected a WeakMap"));
     }
-    let key = require_weak_key(ctx, key)?;
-    let value = ctx.get(value);
+    let key = weak_key(ctx, key)?;
+    let ObjectData::WeakMap(data) = &mut ctx.runtime.heap.objects.get_mut(map).unwrap().data else {
+        unreachable!()
+    };
+    if data.entries.try_insert_reserved((key, value)).is_ok() {
+        return Ok(());
+    }
     ctx.allocate(|runtime| {
         let heap = &mut runtime.heap;
         let ObjectData::WeakMap(map) = &mut heap.objects.get_mut(map).unwrap().data else {
@@ -51,7 +66,26 @@ pub fn weak_map_get<'s>(
     map: Handle<'s>,
     key: Handle<'s>,
 ) -> JsResult<Value> {
-    weak_map_lookup(ctx, map, key).map(|value| value.unwrap_or(Value::UNDEFINED))
+    let map = ctx.object_id(map)?;
+    fast_weak_map_get(ctx, map, ctx.get(key))
+}
+
+pub(crate) fn fast_weak_map_get(
+    ctx: &mut ExecCtx<'_, '_>,
+    map: ObjId,
+    key: Value,
+) -> JsResult<Value> {
+    weak_map_lookup_raw(ctx, map, key).map(|value| value.unwrap_or(Value::UNDEFINED))
+}
+
+// Keep this available for dispatch that already has a receiver and argument.
+#[allow(dead_code)]
+pub(crate) fn fast_weak_map_has(
+    ctx: &mut ExecCtx<'_, '_>,
+    map: ObjId,
+    key: Value,
+) -> JsResult<bool> {
+    weak_map_lookup_raw(ctx, map, key).map(|value| value.is_some())
 }
 
 pub(crate) fn weak_map_lookup<'s>(
@@ -60,12 +94,20 @@ pub(crate) fn weak_map_lookup<'s>(
     key: Handle<'s>,
 ) -> JsResult<Option<Value>> {
     let id = ctx.object_id(map)?;
+    weak_map_lookup_raw(ctx, id, ctx.get(key))
+}
+
+fn weak_map_lookup_raw(
+    ctx: &mut ExecCtx<'_, '_>,
+    id: ObjId,
+    key: Value,
+) -> JsResult<Option<Value>> {
     let ObjectData::WeakMap(map) = &ctx.heap().object(id).data else {
         return Err(ctx.throw_type_error("expected a WeakMap"));
     };
     Ok(ctx
         .heap()
-        .weak_key(ctx.get(key))
+        .weak_key(key)
         .and_then(|key| map.entries.get(key))
         .map(|entry| entry.1))
 }
@@ -132,16 +174,26 @@ pub(crate) fn weak_delete<'s>(
     is_set: bool,
 ) -> JsResult<bool> {
     let id = ctx.object_id(collection)?;
-    let key = ctx.heap().weak_key(ctx.get(key));
-    match &mut ctx.runtime.heap.objects.get_mut(id).unwrap().data {
-        ObjectData::WeakMap(map) if !is_set => Ok(key.is_some_and(|key| map.entries.remove(key))),
-        ObjectData::WeakSet(set) if is_set => Ok(key.is_some_and(|key| set.entries.remove(key))),
-        _ => Err(ctx.throw_type_error(if is_set {
-            "expected a WeakSet"
-        } else {
-            "expected a WeakMap"
-        })),
+    if !is_set {
+        return fast_weak_map_delete(ctx, id, ctx.get(key));
     }
+    let key = ctx.heap().weak_key(ctx.get(key));
+    let ObjectData::WeakSet(set) = &mut ctx.runtime.heap.objects.get_mut(id).unwrap().data else {
+        return Err(ctx.throw_type_error("expected a WeakSet"));
+    };
+    Ok(key.is_some_and(|key| set.entries.remove(key)))
+}
+
+pub(crate) fn fast_weak_map_delete(
+    ctx: &mut ExecCtx<'_, '_>,
+    map: ObjId,
+    key: Value,
+) -> JsResult<bool> {
+    let key = ctx.heap().weak_key(key);
+    let ObjectData::WeakMap(map) = &mut ctx.runtime.heap.objects.get_mut(map).unwrap().data else {
+        return Err(ctx.throw_type_error("expected a WeakMap"));
+    };
+    Ok(key.is_some_and(|key| map.entries.remove(key)))
 }
 
 pub fn new_weak_ref<'s>(ctx: &mut ExecCtx<'_, 's>, target: Handle<'s>) -> JsResult<Handle<'s>> {
@@ -195,8 +247,12 @@ pub(crate) fn require_weak_key<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     key: Handle<'s>,
 ) -> JsResult<WeakKey> {
+    weak_key(ctx, ctx.get(key))
+}
+
+fn weak_key(ctx: &mut ExecCtx<'_, '_>, key: Value) -> JsResult<WeakKey> {
     ctx.heap()
-        .weak_key(ctx.get(key))
+        .weak_key(key)
         .ok_or_else(|| ctx.throw_type_error("weak key must be an object or an unregistered symbol"))
 }
 

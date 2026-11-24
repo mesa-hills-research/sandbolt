@@ -5,7 +5,7 @@ use crate::arena::{Arena, ArenaItem};
 use crate::atom::{AtomTable, KeyKind, PropKey};
 use crate::gc::{Trace, Tracer};
 use crate::ledger::{AllocResult, HeapLedger, TrackedVec};
-use crate::object::{Accessor, HashIndex, JsObject, ObjectData, ObjectFlags, WeakKey};
+use crate::object::{Accessor, HashIndex, JsObject, ObjectData, ObjectFlags, PropSlots, WeakKey};
 use crate::realm::Realm;
 use crate::shape::Shape;
 use crate::string::{JsString, StringUnits};
@@ -260,7 +260,7 @@ impl Heap {
             &self.ledger,
             JsObject {
                 shape,
-                props: TrackedVec::new(),
+                props: PropSlots::new(),
                 flags,
                 data,
             },

@@ -12,6 +12,26 @@ use crate::vm::{BytecodeFunc, Job, MiniOp};
 
 type Brand<'s, T> = PhantomData<fn(&'s T) -> &'s T>;
 
+// The caller reserves space for the entire string before walking the rope.
+pub(crate) fn append_latin1_bytes(heap: &Heap, id: StrId, out: &mut TrackedVec<u8>) {
+    let bytes = match heap.string(id) {
+        JsString::Rope { left, right, .. } => {
+            append_latin1_bytes(heap, *left, out);
+            return append_latin1_bytes(heap, *right, out);
+        }
+        JsString::Slice { base, start, len, .. } => {
+            let start = *start as usize;
+            &heap.string(*base).as_latin1().unwrap()[start..start + *len as usize]
+        }
+        flat => flat.as_latin1().unwrap(),
+    };
+    if let [byte] = bytes {
+        out.push_reserved(*byte);
+    } else {
+        out.extend_from_slice(&heap.ledger, bytes).expect("pre-reserved string buffer");
+    }
+}
+
 impl crate::vm::VmState {
     pub(crate) fn can_root_without_growing(&self, count: usize) -> bool {
         let tail = self.stack.len();
@@ -310,6 +330,14 @@ impl<'s> ExecCtx<'_, 's> {
         self.throw_error_with(kind, |heap| JsString::from_str(&heap.ledger, text))
     }
 
+    pub(crate) fn throw_uri_error(&mut self) -> Abrupt {
+        let realm = self.realm_id();
+        match self.allocate(|runtime| crate::realm::new_uri_error(&mut runtime.heap, realm)) {
+            Ok(id) => self.throw_value(Value::object(id), false),
+            Err(error) => error,
+        }
+    }
+
     pub(crate) fn throw_error_with(
         &mut self,
         kind: ErrorKind,
@@ -457,7 +485,10 @@ impl<'s> ExecCtx<'_, 's> {
         };
         let len = end - start;
         let backing = self.heap().string(base);
-        if len >= 4096 && backing.len() as usize <= len.saturating_mul(4) {
+        // A bounded backing also serves medium slices without pinning arbitrarily large strings.
+        if len >= 1024
+            && (backing.len() <= 262_144 || backing.len() as usize <= len.saturating_mul(4))
+        {
             let is_wide = backing.is_wide();
             return self.make_string(|_| {
                 Ok(JsString::Slice {
@@ -536,12 +567,21 @@ impl<'s> ExecCtx<'_, 's> {
                 return heap.strings.insert(&heap.ledger, string);
             }
             let string = if depth > MAX_ROPE_DEPTH {
-                JsString::from_units(
-                    &heap.ledger,
-                    len as usize,
-                    is_wide,
-                    heap.string_units(a).chain(heap.string_units(b)),
-                )?
+                if is_wide {
+                    JsString::from_units(
+                        &heap.ledger,
+                        len as usize,
+                        true,
+                        heap.string_units(a).chain(heap.string_units(b)),
+                    )?
+                } else {
+                    let mut data = TrackedVec::new();
+                    data.try_reserve_exact(&heap.ledger, len as usize)?;
+                    append_latin1_bytes(heap, a, &mut data);
+                    append_latin1_bytes(heap, b, &mut data);
+                    let is_ascii = data.is_ascii();
+                    JsString::Latin1 { data, is_ascii }
+                }
             } else {
                 JsString::Rope {
                     left: a,
@@ -565,12 +605,16 @@ impl<'s> ExecCtx<'_, 's> {
         self.allocate(|runtime| {
             let heap = &mut runtime.heap;
             let string = heap.string(id);
-            let flat = JsString::from_units(
-                &heap.ledger,
-                string.len() as usize,
-                string.is_wide(),
-                heap.string_units(id),
-            )?;
+            let len = string.len() as usize;
+            let flat = if string.is_wide() || len <= INLINE_LATIN1_CAPACITY {
+                JsString::from_units(&heap.ledger, len, string.is_wide(), heap.string_units(id))?
+            } else {
+                let mut data = TrackedVec::new();
+                data.try_reserve_exact(&heap.ledger, len)?;
+                append_latin1_bytes(heap, id, &mut data);
+                let is_ascii = data.is_ascii();
+                JsString::Latin1 { data, is_ascii }
+            };
             *heap.strings.get_mut(id).unwrap() = flat;
             Ok(())
         })
@@ -849,6 +893,48 @@ mod tests {
             let independent = ctx.string_slice(result, 2, 10).unwrap();
             let ValueKind::String(id) = ctx.get(independent).decode() else { unreachable!() };
             assert_eq!(ctx.heap().string(id).as_latin1(), Some(b"78901234".as_slice()));
+        });
+    }
+
+    #[test]
+    fn medium_slices_share_bounded_backings_and_release_large_ones() {
+        let mut runtime = Runtime::new(crate::EngineLimits::default()).unwrap();
+        runtime.with_scope(runtime.default_realm(), |ctx| {
+            for (len, shared) in [(65_536, true), (262_145, false)] {
+                let (value, base) = ctx.with_scope(|ctx| {
+                    let text = b"\xE9".repeat(len);
+                    let source = ctx.new_latin1(&text).unwrap();
+                    let ValueKind::String(base) = ctx.get(source).decode() else { unreachable!() };
+                    let slice = ctx.string_slice(source, len - 1024, len).unwrap();
+                    (ctx.get(slice), base)
+                });
+                ctx.root(value).unwrap();
+                ctx.collect();
+                let ValueKind::String(id) = value.decode() else { unreachable!() };
+                assert_eq!(ctx.heap().strings.get_weak(base).is_some(), shared);
+                assert_eq!(ctx.heap().string(id).len(), 1024);
+                assert!(ctx.heap().string_units(id).all(|unit| unit == 0xe9));
+            }
+        });
+    }
+
+    #[test]
+    fn latin1_rope_flatten_copies_slices_and_preserves_non_ascii() {
+        let mut runtime = Runtime::new(crate::EngineLimits::default()).unwrap();
+        runtime.with_scope(runtime.default_realm(), |ctx| {
+            let source = ctx.new_latin1(&[0xe9; 2048]).unwrap();
+            let mut rope = ctx.string_slice(source, 512, 1536).unwrap();
+            let suffix = ctx.new_latin1(b"!?;").unwrap();
+            for _ in 0..=MAX_ROPE_DEPTH {
+                rope = ctx.concat_strings(rope, suffix).unwrap();
+            }
+            ctx.flatten_string(rope).unwrap();
+            let ValueKind::String(id) = ctx.get(rope).decode() else { unreachable!() };
+            let string = ctx.heap().string(id);
+            let flat = string.as_latin1().unwrap();
+            assert!(!string.is_ascii());
+            assert_eq!(&flat[..1024], &[0xe9; 1024]);
+            assert_eq!(&flat[1024..], b"!?;".repeat(usize::from(MAX_ROPE_DEPTH) + 1));
         });
     }
 

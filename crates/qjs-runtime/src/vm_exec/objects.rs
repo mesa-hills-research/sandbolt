@@ -1,8 +1,7 @@
 use qjs_bytecode::{BuiltinAtom, Instruction, Opcode, Operands};
 
 use crate::atom::{Atom, KeyKind, PropKey};
-use crate::ledger::TrackedVec;
-use crate::object::{ErrorKind, JsObject, ObjectData, ObjectFlags, RegExpData, RegExpProgram};
+use crate::object::{ErrorKind, JsObject, ObjectData, ObjectFlags, PropSlots, RegExpData, RegExpProgram};
 use crate::ops::{call, convert, property};
 use crate::root::{ExecCtx, Handle};
 use crate::shape::PropFlags;
@@ -60,9 +59,7 @@ fn make_regexp(
     let source = ctx.get(source);
     let obj = ctx.allocate(|rt| {
         let heap = &mut rt.heap;
-        let mut props = TrackedVec::new();
-        props.try_reserve_exact(&heap.ledger, 1)?;
-        props.push_reserved(Value::int32(0));
+        let props = PropSlots::one(Value::int32(0));
         heap.objects.insert(
             &heap.ledger,
             JsObject {
