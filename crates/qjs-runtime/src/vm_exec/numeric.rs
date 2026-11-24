@@ -1,7 +1,9 @@
+use std::cmp::Ordering;
+
 use qjs_bigint::{BigInt, BigIntError, BigIntHost};
 use qjs_bytecode::Opcode;
 
-use crate::heap::{BigIntData, Heap};
+use crate::heap::{BigIntData, BigIntLimbs, Heap};
 use crate::ledger::{AllocError, AllocResult, HeapLedger, TrackedVec};
 use crate::object::ErrorKind;
 use crate::ops::convert::{self, PreferredType};
@@ -108,15 +110,31 @@ fn store_magnitude(
     negative: bool,
     words: impl ExactSizeIterator<Item = u32>,
 ) -> AllocResult<Value> {
-    let mut limbs = TrackedVec::new();
-    limbs.try_reserve_exact(&heap.ledger, words.len())?;
-    for word in words {
-        limbs.push_reserved(word);
-    }
-    let id = heap
-        .bigints
-        .insert(&heap.ledger, BigIntData { negative, limbs })?;
-    Ok(Value::bigint(id))
+    let len = words.len();
+    let limbs = if len <= INLINE_WORDS {
+        let mut inline = [0; INLINE_WORDS];
+        for (dst, word) in inline.iter_mut().zip(words) {
+            *dst = word;
+        }
+        BigIntLimbs::Inline {
+            len: len as u8,
+            words: inline,
+        }
+    } else {
+        let mut limbs = TrackedVec::new();
+        limbs.try_reserve_exact(&heap.ledger, len)?;
+        for word in words {
+            limbs.push_reserved(word);
+        }
+        BigIntLimbs::Heap(limbs)
+    };
+    store_limbs(heap, negative, limbs)
+}
+
+fn store_limbs(heap: &mut Heap, negative: bool, limbs: BigIntLimbs) -> AllocResult<Value> {
+    heap.bigints
+        .insert(&heap.ledger, BigIntData { negative, limbs })
+        .map(Value::bigint)
 }
 
 fn store(heap: &mut Heap, host: &mut Host<'_>, bigint: &BigInt) -> Result<Value, BigIntError> {
@@ -207,8 +225,31 @@ pub(crate) fn compare_big_string(
             Err(BigIntError::InvalidString) => return Ok(None),
             Err(error) => return Err(error),
         };
-        let value = read(heap, host, value)?;
-        Ok(Some(value.cmp_bigint(&other)))
+        let mut short = [0; 2];
+        if host.handler.is_some() {
+            let value = read(heap, host, value)?;
+            return Ok(Some(value.cmp_bigint(&other)));
+        }
+        let Some((negative, words)) = inline_magnitude(heap, value, &mut short) else {
+            let value = read(heap, host, value)?;
+            return Ok(Some(value.cmp_bigint(&other)));
+        };
+        Ok(Some(match (negative, other.is_negative()) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => {
+                let other = other.magnitude_u32_limbs();
+                let order = words.len().cmp(&other.len()).then_with(|| {
+                    // Words arrive least significant first, so keep the last difference.
+                    words
+                        .iter()
+                        .copied()
+                        .zip(other)
+                        .fold(Ordering::Equal, |order, (a, b)| a.cmp(&b).then(order))
+                });
+                if negative { order.reverse() } else { order }
+            }
+        }))
     })
 }
 
@@ -316,75 +357,316 @@ pub(super) fn short_binary(op: Opcode, a: i64, b: i64, has_interrupt: bool) -> O
     Value::short_bigint(result)
 }
 
-fn small_bigint(heap: &Heap, value: Value) -> Option<i128> {
+const INLINE_WORDS: usize = BigIntLimbs::INLINE_LEN;
+type InlineWords = [u32; INLINE_WORDS];
+
+type Magnitude<'a> = (bool, &'a [u32]);
+
+fn trim(words: &[u32]) -> &[u32] {
+    let len = words
+        .iter()
+        .rposition(|&word| word != 0)
+        .map_or(0, |i| i + 1);
+    &words[..len]
+}
+
+fn inline_magnitude<'a>(
+    heap: &'a Heap,
+    value: Value,
+    short: &'a mut [u32; 2],
+) -> Option<Magnitude<'a>> {
     match value.decode() {
-        ValueKind::ShortBigInt(n) => Some(i128::from(n)),
+        ValueKind::ShortBigInt(n) => {
+            let m = n.unsigned_abs();
+            *short = [m as u32, (m >> 32) as u32];
+            let len = usize::from(m != 0) + usize::from(short[1] != 0);
+            Some((n < 0, &short[..len]))
+        }
         ValueKind::BigInt(id) => {
             let data = heap.bigints.get(id).unwrap();
-            if data.limbs.len() > 4 {
+            let words = &*data.limbs;
+            if words.len() > INLINE_WORDS {
                 return None;
             }
-            let magnitude = data
-                .limbs
-                .iter()
-                .rev()
-                .fold(0u128, |n, &word| (n << 32) | u128::from(word));
-            if data.negative {
-                (magnitude <= i128::MIN.unsigned_abs()).then(|| magnitude.wrapping_neg() as i128)
+            let words = if words.last() == Some(&0) {
+                trim(words)
             } else {
-                i128::try_from(magnitude).ok()
-            }
+                words
+            };
+            Some((data.negative && !words.is_empty(), words))
         }
         _ => unreachable!(),
     }
 }
 
-fn small_bigint_binary(op: Opcode, a: i128, b: i128) -> Option<(bool, u128)> {
-    use Opcode::*;
-    let value = match op {
-        Add => a.checked_add(b)?,
-        Sub => a.checked_sub(b)?,
-        Mul => {
-            return Some((
-                (a < 0) ^ (b < 0),
-                a.unsigned_abs().checked_mul(b.unsigned_abs())?,
-            ));
+fn store_inline(ctx: &mut ExecCtx<'_, '_>, negative: bool, words: InlineWords) -> JsResult<Value> {
+    let len = trim(&words).len();
+    if len <= 2 && words[1] <= (1 << 14) {
+        let m = low_u64(&words) as i64;
+        if let Some(v) = Value::short_bigint(if negative { -m } else { m }) {
+            return Ok(v);
         }
-        Div => a.checked_div(b)?,
-        Mod => a.checked_rem(b)?,
-        Pow => a.checked_pow(u32::try_from(b).ok()?)?,
-        And => a & b,
-        Or => a | b,
-        Xor => a ^ b,
-        Shl | Sar => {
-            let shift = b.unsigned_abs();
-            if (op == Sar) ^ (b < 0) {
-                a >> shift.min(127)
-            } else if a == 0 {
-                0
-            } else {
-                let shift = u32::try_from(shift).ok()?;
-                a.checked_shl(shift).filter(|result| result >> shift == a)?
-            }
-        }
-        _ => return None,
-    };
-    Some((value < 0, value.unsigned_abs()))
+    }
+    ctx.allocate(|rt| {
+        store_limbs(
+            &mut rt.heap,
+            negative,
+            BigIntLimbs::Inline {
+                len: len as u8,
+                words,
+            },
+        )
+    })
 }
 
-fn store_small_bigint(
-    ctx: &mut ExecCtx<'_, '_>,
-    negative: bool,
-    magnitude: u128,
-) -> JsResult<Value> {
-    if let Ok(magnitude) = i64::try_from(magnitude)
-        && let Some(value) = Value::short_bigint(if negative { -magnitude } else { magnitude })
-    {
-        return Ok(value);
+fn low_u64(words: &[u32]) -> u64 {
+    match words {
+        [lo, hi, ..] => u64::from(*lo) | (u64::from(*hi) << 32),
+        [lo] => u64::from(*lo),
+        [] => 0,
     }
-    let bits = (u128::BITS - magnitude.leading_zeros()) as usize;
-    let words = (0..bits.div_ceil(32)).map(|i| (magnitude >> (i * 32)) as u32);
-    ctx.allocate(|rt| store_magnitude(&mut rt.heap, negative, words.clone()))
+}
+
+fn write_u128(words: &mut [u32], n: u128) {
+    words[..4].copy_from_slice(&[
+        n as u32,
+        (n >> 32) as u32,
+        (n >> 64) as u32,
+        (n >> 96) as u32,
+    ]);
+}
+
+fn compare_words(a: &[u32], b: &[u32]) -> Ordering {
+    a.len()
+        .cmp(&b.len())
+        .then_with(|| a.iter().rev().cmp(b.iter().rev()))
+}
+
+fn inline_add(
+    out: &mut InlineWords,
+    (a_neg, a): Magnitude<'_>,
+    (b_neg, b): Magnitude<'_>,
+) -> Option<bool> {
+    if a_neg == b_neg {
+        let (long, short) = if a.len() < b.len() { (b, a) } else { (a, b) };
+        let (head, tail) = long.split_at(short.len());
+        let mut carry = 0;
+        for ((&a, &b), word) in head.iter().zip(short).zip(&mut *out) {
+            carry += u64::from(a) + u64::from(b);
+            *word = carry as u32;
+            carry >>= 32;
+        }
+        out[head.len()..long.len()].copy_from_slice(tail);
+        if carry != 0 {
+            for word in out.get_mut(head.len()..)? {
+                *word = word.wrapping_add(1);
+                if *word != 0 {
+                    return Some(a_neg);
+                }
+            }
+            return None;
+        }
+        return Some(a_neg);
+    }
+    let (negative, long, short) = if compare_words(a, b) == Ordering::Less {
+        (b_neg, b, a)
+    } else {
+        (a_neg, a, b)
+    };
+    let mut borrow = 0;
+    for (i, &word) in long.iter().enumerate() {
+        borrow =
+            u64::from(word).wrapping_sub(u64::from(short.get(i).copied().unwrap_or(0)) + borrow);
+        out[i] = borrow as u32;
+        borrow >>= 63;
+    }
+    Some(negative)
+}
+
+fn inline_mul(
+    out: &mut InlineWords,
+    (a_neg, a): Magnitude<'_>,
+    (b_neg, b): Magnitude<'_>,
+) -> Option<bool> {
+    if a.is_empty() || b.is_empty() {
+        return Some(false);
+    }
+    if a.len().max(b.len()) <= 4 {
+        let a_lo = u128::from(low_u64(a));
+        let b_lo = u128::from(low_u64(b));
+        let lo = a_lo * b_lo;
+        if a.len().max(b.len()) <= 2 {
+            write_u128(out, lo);
+        } else {
+            let a_hi = u128::from(low_u64(a.get(2..).unwrap_or(&[])));
+            let b_hi = u128::from(low_u64(b.get(2..).unwrap_or(&[])));
+            let ab = a_lo * b_hi;
+            let ba = a_hi * b_lo;
+            let mid = (lo >> 64) + u128::from(ab as u64) + u128::from(ba as u64);
+            let hi = a_hi * b_hi + (ab >> 64) + (ba >> 64) + (mid >> 64);
+            write_u128(out, u128::from(lo as u64) | (mid << 64));
+            write_u128(&mut out[4..], hi);
+        }
+        return Some(a_neg ^ b_neg);
+    }
+    if a.len() + b.len() > INLINE_WORDS + 1 {
+        return None;
+    }
+    for (i, &a) in a.iter().enumerate() {
+        let mut carry = 0;
+        for (&b, word) in b.iter().zip(&mut out[i..]) {
+            carry += u64::from(a) * u64::from(b) + u64::from(*word);
+            *word = carry as u32;
+            carry >>= 32;
+        }
+        if carry != 0 {
+            *out.get_mut(i + b.len())? = carry as u32;
+        }
+    }
+    Some(a_neg ^ b_neg)
+}
+
+fn complement_word(word: u32, carry: &mut bool) -> u32 {
+    let (word, next) = (!word).overflowing_add(u32::from(*carry));
+    *carry = next;
+    word
+}
+
+fn inline_logic(
+    out: &mut InlineWords,
+    op: Opcode,
+    (a_neg, a): Magnitude<'_>,
+    (b_neg, b): Magnitude<'_>,
+) -> Option<bool> {
+    let logic = |a, b| match op {
+        Opcode::And => a & b,
+        Opcode::Or => a | b,
+        Opcode::Xor => a ^ b,
+        _ => unreachable!(),
+    };
+    let negative = logic(a_neg as u32, b_neg as u32) != 0;
+    let (mut a_carry, mut b_carry, mut carry) = (true, true, true);
+    let len = a.len().max(b.len());
+    for (i, word) in out[..len].iter_mut().enumerate() {
+        let mut x = a.get(i).copied().unwrap_or(0);
+        let mut y = b.get(i).copied().unwrap_or(0);
+        if a_neg {
+            x = complement_word(x, &mut a_carry);
+        }
+        if b_neg {
+            y = complement_word(y, &mut b_carry);
+        }
+        let result = logic(x, y);
+        *word = if negative {
+            complement_word(result, &mut carry)
+        } else {
+            result
+        };
+    }
+    if negative && carry {
+        *out.get_mut(len)? = 1;
+    }
+    Some(negative)
+}
+
+fn inline_shift(
+    out: &mut InlineWords,
+    right: bool,
+    (negative, words): Magnitude<'_>,
+    (reverse, shift): Magnitude<'_>,
+) -> Option<bool> {
+    let Some(&high) = words.last() else {
+        return Some(false);
+    };
+    let bit_len = words.len() * 32 - high.leading_zeros() as usize;
+    let shift = match shift {
+        [] => 0,
+        [n] => *n as usize,
+        _ => usize::MAX,
+    };
+    let whole = shift / 32;
+    let bits = shift % 32;
+    if right ^ reverse {
+        if shift >= bit_len {
+            out[0] = u32::from(negative);
+            return Some(negative);
+        }
+        let words_high = &words[whole..];
+        for (i, &word) in words_high.iter().enumerate() {
+            out[i] = word >> bits;
+            if bits != 0 {
+                out[i] |= words_high.get(i + 1).copied().unwrap_or(0) << (32 - bits);
+            }
+        }
+        // A negative arithmetic shift rounds toward minus infinity.
+        if negative
+            && ((bits != 0 && words_high[0] << (32 - bits) != 0)
+                || words[..whole].iter().any(|&n| n != 0))
+        {
+            for word in out {
+                *word = word.wrapping_add(1);
+                if *word != 0 {
+                    break;
+                }
+            }
+        }
+    } else {
+        if shift > INLINE_WORDS * 32 - bit_len {
+            return None;
+        }
+        for (i, &word) in words.iter().enumerate() {
+            out[i + whole] |= word << bits;
+            if bits != 0
+                && let Some(next) = out.get_mut(i + whole + 1)
+            {
+                *next = word >> (32 - bits);
+            }
+        }
+    }
+    Some(negative)
+}
+
+fn inline_binary(heap: &Heap, op: Opcode, a: Value, b: Value) -> Option<(bool, InlineWords)> {
+    let (mut a_short, mut b_short) = ([0; 2], [0; 2]);
+    let a = inline_magnitude(heap, a, &mut a_short)?;
+    let b = inline_magnitude(heap, b, &mut b_short)?;
+    inline_binary_words(op, a, b)
+}
+
+fn inline_binary_words(
+    op: Opcode,
+    a: Magnitude<'_>,
+    b: Magnitude<'_>,
+) -> Option<(bool, InlineWords)> {
+    use Opcode::*;
+    let mut words = [0; INLINE_WORDS];
+    let negative = match op {
+        Add => inline_add(&mut words, a, b),
+        Sub => inline_add(&mut words, a, (!b.0, b.1)),
+        Mul => inline_mul(&mut words, a, b),
+        And | Or | Xor => inline_logic(&mut words, op, a, b),
+        Shl | Sar => inline_shift(&mut words, op == Sar, a, b),
+        _ => return None,
+    }?;
+    Some((negative, words))
+}
+
+fn inline_unary(heap: &Heap, op: Opcode, value: Value) -> Option<(bool, InlineWords)> {
+    use Opcode::*;
+    let mut short = [0; 2];
+    let (negative, magnitude) = inline_magnitude(heap, value, &mut short)?;
+    let mut words = [0; INLINE_WORDS];
+    let negative = match op {
+        Neg => {
+            words[..magnitude.len()].copy_from_slice(magnitude);
+            !negative
+        }
+        Not => inline_add(&mut words, (!negative, magnitude), (true, &[1]))?,
+        Inc | PostInc => inline_add(&mut words, (negative, magnitude), (false, &[1]))?,
+        Dec | PostDec => inline_add(&mut words, (negative, magnitude), (true, &[1]))?,
+        _ => unreachable!(),
+    };
+    Some((negative, words))
 }
 
 fn bigint_binary(ctx: &mut ExecCtx<'_, '_>, op: Opcode, a: Value, b: Value) -> JsResult<Value> {
@@ -397,11 +679,11 @@ fn bigint_binary(ctx: &mut ExecCtx<'_, '_>, op: Opcode, a: Value, b: Value) -> J
     {
         return Ok(result);
     }
+    // The general bridge polls when reading arena values.
     if ctx.runtime.vm.interrupt_handler.is_none()
-        && let (Some(a), Some(b)) = (small_bigint(ctx.heap(), a), small_bigint(ctx.heap(), b))
-        && let Some((negative, magnitude)) = small_bigint_binary(op, a, b)
+        && let Some((negative, words)) = inline_binary(ctx.heap(), op, a, b)
     {
-        return store_small_bigint(ctx, negative, magnitude);
+        return store_inline(ctx, negative, words);
     }
     with_host(ctx, |heap, host| {
         let a = read(heap, host, a)?;
@@ -472,6 +754,11 @@ pub(super) fn unary<'s>(
         if op == Plus {
             return Err(ctx.throw_type_error("cannot convert BigInt to number"));
         }
+        if ctx.runtime.vm.interrupt_handler.is_none()
+            && let Some((negative, words)) = inline_unary(ctx.heap(), op, raw)
+        {
+            return Ok((raw, store_inline(ctx, negative, words)?));
+        }
         let result = with_host(ctx, |heap, host| {
             let integer = read(heap, host, raw)?;
             let result = match op {
@@ -523,8 +810,156 @@ pub(super) fn number_unary(op: Opcode, number: f64) -> (Value, Value) {
 
 #[cfg(test)]
 mod tests {
+    use qjs_bigint::UnlimitedBigIntHost;
+
+    use super::*;
     use crate::EngineLimits;
     use crate::api::{EvalOptions, JsEngine};
+
+    #[test]
+    fn inline_bigint_binary_matches_general_arithmetic() {
+        use Opcode::*;
+
+        let host = &mut UnlimitedBigIntHost;
+        let mut state = 0xd032_7356_b8c5_669fu64;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u32
+        };
+        let mut check = |op, a: Magnitude<'_>, b: Magnitude<'_>| {
+            let a_big = BigInt::from_sign_and_u32_limbs(a.0, a.1, host).unwrap();
+            let b_big = BigInt::from_sign_and_u32_limbs(b.0, b.1, host).unwrap();
+            let result = match op {
+                Add => a_big.add(&b_big, host),
+                Sub => a_big.sub(&b_big, host),
+                Mul => a_big.mul(&b_big, host),
+                And => a_big.bitand(&b_big, host),
+                Or => a_big.bitor(&b_big, host),
+                Xor => a_big.bitxor(&b_big, host),
+                Shl => a_big.shl(&b_big, host),
+                Sar => a_big.sar(&b_big, host),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            let expected = result.magnitude_u32_limbs();
+            match inline_binary_words(op, a, b) {
+                Some((negative, words)) => {
+                    let got = trim(&words);
+                    assert_eq!(
+                        negative && !got.is_empty(),
+                        result.is_negative(),
+                        "{op:?} {a:?} {b:?}"
+                    );
+                    assert!(
+                        got.iter().copied().eq(expected),
+                        "{op:?} {a:?} {b:?}: {got:?}"
+                    );
+                }
+                None => assert!(expected.len() > INLINE_WORDS, "{op:?} {a:?} {b:?}"),
+            }
+        };
+        let all = [u32::MAX; INLINE_WORDS];
+        check(Add, (false, &all), (false, &[1]));
+        check(And, (true, &all), (true, &[2]));
+        check(Mul, (false, &all[..4]), (false, &all[..4]));
+        check(Sar, (true, &all), (false, &[32]));
+        check(Shl, (true, &all), (true, &[31]));
+        for i in 0..4096 {
+            let a = [(); INLINE_WORDS].map(|_| random());
+            let b = [(); INLINE_WORDS].map(|_| random());
+            let a = trim(&a[..i % 9]);
+            let b = trim(&b[..(i / 9) % 9]);
+            let x = (i & 1 != 0 && !a.is_empty(), a);
+            let y = (i & 2 != 0 && !b.is_empty(), b);
+            for op in [Add, Sub, Mul, And, Or, Xor] {
+                check(op, x, y);
+            }
+            let shift = [random() % 300];
+            let shift = (i & 2 != 0 && shift[0] != 0, trim(&shift));
+            check(Shl, x, shift);
+            check(Sar, x, shift);
+        }
+    }
+
+    #[test]
+    fn inline_bigint_charges_only_the_arena_slot() {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        let realm = engine.default_realm();
+        engine.runtime_mut().with_scope(realm, |ctx| {
+            let heap = &mut ctx.runtime.heap;
+            assert_eq!(heap.bigints.capacity(), 0);
+            heap.bigints.try_reserve_slot(&heap.ledger).unwrap();
+            let charged = heap.ledger.used_bytes();
+            let words = [u32::MAX; INLINE_WORDS];
+            heap.ledger.fail_after(Some(0));
+            let value = store_magnitude(heap, true, words.into_iter()).unwrap();
+            let ValueKind::BigInt(id) = value.decode() else {
+                unreachable!()
+            };
+            let data = heap.bigints.get(id).unwrap();
+            assert!(matches!(data.limbs, BigIntLimbs::Inline { .. }));
+            assert_eq!(&*data.limbs, &words);
+            assert_eq!(heap.ledger.used_bytes(), charged);
+            assert!(heap.ledger.failpoint_armed());
+            let large = [u32::MAX; INLINE_WORDS + 1];
+            assert_eq!(
+                store_magnitude(heap, false, large.into_iter()),
+                Err(AllocError::Failpoint)
+            );
+            assert_eq!(heap.ledger.used_bytes(), charged);
+        });
+    }
+
+    #[test]
+    fn inline_bigint_operations_keep_the_read_polls() {
+        use std::{cell::Cell, rc::Rc};
+
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        let realm = engine.default_realm();
+        engine.runtime_mut().with_scope(realm, |ctx| {
+            let a = store_inline(ctx, false, [0, 0, 1, 0, 0, 0, 0, 0]).unwrap();
+            ctx.root(a).unwrap();
+            let b = store_inline(ctx, false, [5, 0, 1, 0, 0, 0, 0, 0]).unwrap();
+            ctx.root(b).unwrap();
+            for op in [Opcode::Add, Opcode::Mul, Opcode::And, Opcode::Sar] {
+                let polls = Rc::new(Cell::new(0));
+                ctx.runtime.set_interrupt_handler(Some(Box::new({
+                    let polls = polls.clone();
+                    move || {
+                        polls.set(polls.get() + 1);
+                        polls.get() == 2
+                    }
+                })));
+                assert_eq!(bigint_binary(ctx, op, a, b), Err(Abrupt::Interrupted));
+                assert_eq!(polls.get(), 2);
+            }
+        });
+    }
+
+    #[test]
+    fn bigint_unary_and_comparisons_cross_inline_storage_boundaries() {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        let result = engine
+            .eval_to_string(
+                r#"
+            const base = 1n << 255n;
+            const limit = 1n << 256n;
+            let pos = limit - 1n;
+            let neg = -(base + 1n);
+            const box = { valueOf() { return (1n << 255n) + 3n; } };
+            [pos++ === limit - 1n, pos === limit, --pos === limit - 1n,
+             neg++ === -base - 1n, neg === -base, -box === -base - 3n,
+             ~(-base) === base - 1n, ~pos === -limit, (pos & -limit) === 0n,
+             -((1n << 256n) - 1n) < String(-base), String(base + 1n) > base,
+             String(base) == base, -1n >> 123456789123456789n === -1n].every(Boolean)
+        "#,
+                EvalOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(result, "true");
+    }
 
     #[test]
     fn bigint_binary_crosses_signed_128_bit_boundary() {

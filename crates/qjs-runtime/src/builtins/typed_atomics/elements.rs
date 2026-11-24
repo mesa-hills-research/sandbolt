@@ -1,5 +1,5 @@
 use super::*;
-use crate::heap::BigIntData;
+use crate::heap::{BigIntData, BigIntLimbs};
 use crate::ledger::TrackedVec;
 use crate::value::ValueKind;
 
@@ -128,8 +128,7 @@ fn make_bigint(ctx: &mut ExecCtx<'_, '_>, negative: bool, magnitude: u64) -> JsR
     let id = ctx.allocate(|runtime| {
         let heap = &mut runtime.heap;
         let words = [magnitude as u32, (magnitude >> 32) as u32];
-        let limbs =
-            TrackedVec::from_slice(&heap.ledger, &words[..if words[1] == 0 { 1 } else { 2 }])?;
+        let limbs = BigIntLimbs::inline(&words[..if words[1] == 0 { 1 } else { 2 }]);
         heap.bigints
             .insert(&heap.ledger, BigIntData { negative, limbs })
     })?;
@@ -196,12 +195,12 @@ fn parse_bigint(ctx: &mut ExecCtx<'_, '_>, id: crate::value::StrId) -> JsResult<
         return make_bigint(ctx, negative, low | (high << 32));
     }
     ctx.allocate(|runtime| runtime.heap.bigints.try_reserve_slot(&runtime.heap.ledger))?;
-    Ok(Value::bigint(
-        ctx.runtime
-            .heap
-            .bigints
-            .insert_reserved(BigIntData { negative, limbs }),
-    ))
+    Ok(Value::bigint(ctx.runtime.heap.bigints.insert_reserved(
+        BigIntData {
+            negative,
+            limbs: limbs.into(),
+        },
+    )))
 }
 
 pub(super) fn to_half(n: f64) -> u16 {

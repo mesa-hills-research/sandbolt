@@ -11,7 +11,8 @@ use crate::builtins::{NUM_DATE_BASE, configure_ctor, define_data, install_method
 use crate::ledger::{HeapLedger, TrackedBox, TrackedVec};
 use crate::object::{BooleanObjectData, NumberObjectData, ObjectData, ObjectFlags};
 use crate::ops::convert::{
-    PreferredType, to_boolean, to_int32, to_integer_or_infinity, to_number, to_primitive, to_string,
+    PreferredType, format_f64_fast, to_boolean, to_int32, to_integer_or_infinity, to_number,
+    to_primitive, to_string,
 };
 use crate::realm::NativeFnId;
 use crate::root::{Args, ExecCtx, Handle};
@@ -242,6 +243,13 @@ pub fn dispatch<'s>(
         date::START..=date::END => return date::dispatch(offset, ctx, this, args),
         _ => {}
     }
+    if (ToExponential.id().0..=NumberValueOf.id().0).contains(&id.0) {
+        let value = receiver_value(ctx, this, Wrapper::Number)?;
+        if id == NumberValueOf.id() {
+            return Ok(value);
+        }
+        return format_number(ctx, id, value.as_number().unwrap(), args.get(0));
+    }
     let arg = argument(ctx, args, 0)?;
     match id {
         n if n == IsNaN.id() => Ok(Value::bool(to_number(ctx, arg)?.is_nan())),
@@ -324,13 +332,6 @@ pub fn dispatch<'s>(
                 })?;
                 Ok(ctx.get(string))
             }
-        }
-        n if (ToExponential.id().0..=NumberValueOf.id().0).contains(&n.0) => {
-            let value = receiver_value(ctx, this, Wrapper::Number)?;
-            if n == NumberValueOf.id() {
-                return Ok(value);
-            }
-            format_number(ctx, n, value.as_number().unwrap(), arg)
         }
         _ => Err(ctx.throw_type_error("unknown numeric builtin")),
     }
@@ -493,11 +494,12 @@ fn receiver_value<'s>(
     }
 }
 
-fn radix<'s>(ctx: &mut ExecCtx<'_, 's>, arg: Handle<'s>) -> JsResult<u32> {
-    if ctx.get(arg) == Value::UNDEFINED {
-        return Ok(10);
-    }
-    let radix = to_integer_or_infinity(ctx, arg)?;
+fn radix<'s>(ctx: &mut ExecCtx<'_, 's>, arg: Option<Handle<'s>>) -> JsResult<u32> {
+    let radix = match arg.map(|arg| ctx.get(arg).decode()) {
+        None | Some(ValueKind::Undefined) => return Ok(10),
+        Some(ValueKind::Int32(radix)) => f64::from(radix),
+        _ => to_integer_or_infinity(ctx, arg.unwrap())?,
+    };
     if (2.0..=36.0).contains(&radix) {
         Ok(radix as u32)
     } else {
@@ -509,11 +511,10 @@ fn format_number<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     id: NativeFnId,
     n: f64,
-    arg: Handle<'s>,
+    arg: Option<Handle<'s>>,
 ) -> JsResult<Value> {
     use Numeric::*;
     let default = DtoaOptions::default();
-    let undefined = ctx.get(arg) == Value::UNDEFINED;
     if id == ToString.id() || id == ToLocaleString.id() {
         let radix = if id == ToString.id() {
             radix(ctx, arg)?
@@ -525,14 +526,20 @@ fn format_number<'s>(
         } else {
             DtoaExp::Disabled
         };
-        return render_number(ctx, n, radix, 0, DtoaOptions { exp, ..default });
+        return format_f64_fast(ctx, n, radix, 0, DtoaOptions { exp, ..default });
     }
+    let kind = arg.map(|arg| ctx.get(arg).decode());
+    let undefined = matches!(kind, None | Some(ValueKind::Undefined));
     if id == ToPrecision.id() && undefined {
-        return render_number(ctx, n, 10, 0, default);
+        return format_f64_fast(ctx, n, 10, 0, default);
     }
-    let digits = to_integer_or_infinity(ctx, arg)?;
+    let digits = match kind {
+        None | Some(ValueKind::Undefined) => 0.0,
+        Some(ValueKind::Int32(n)) => f64::from(n),
+        _ => to_integer_or_infinity(ctx, arg.unwrap())?,
+    };
     if id != ToFixed.id() && !n.is_finite() {
-        return render_number(ctx, n, 10, 0, default);
+        return format_f64_fast(ctx, n, 10, 0, default);
     }
     let min = if id == ToPrecision.id() { 1.0 } else { 0.0 };
     if !(min..=100.0).contains(&digits) {
@@ -552,7 +559,7 @@ fn format_number<'s>(
     } else {
         (digits, DtoaFormat::Frac, DtoaExp::Auto)
     };
-    render_number(
+    format_f64_fast(
         ctx,
         n,
         10,
@@ -563,15 +570,4 @@ fn format_number<'s>(
             ..default
         },
     )
-}
-
-fn render_number(
-    ctx: &mut ExecCtx<'_, '_>,
-    n: f64,
-    radix: u32,
-    digits: usize,
-    options: DtoaOptions,
-) -> JsResult<Value> {
-    let string = crate::ops::convert::format_number(ctx, n, radix, digits, options)?;
-    Ok(ctx.get(string))
 }

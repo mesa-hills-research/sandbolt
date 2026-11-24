@@ -169,7 +169,7 @@ fn map_uses_same_value_zero_for_number_string_and_bigint_keys() {
                     &heap.ledger,
                     BigIntData {
                         negative: true,
-                        limbs,
+                        limbs: limbs.into(),
                     },
                 )
             })
