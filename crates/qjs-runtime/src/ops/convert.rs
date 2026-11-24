@@ -4,6 +4,7 @@ use crate::ledger::{TrackedBox, TrackedVec};
 use crate::object::*;
 use crate::realm::{NativeFn, NativeFnId};
 use crate::root::{Args, ExecCtx, Handle};
+use crate::string::JsString;
 use crate::symbol::{SymbolDescription, WellKnown};
 use crate::value::*;
 
@@ -124,6 +125,9 @@ pub fn to_number<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<f
     if let Some(number) = raw.as_number() {
         return Ok(number);
     }
+    if let ValueKind::String(id) = raw.decode() {
+        return string_to_number(ctx, id);
+    }
     ctx.with_scope(|ctx| {
         let value = ctx.root(raw)?;
         let raw = to_primitive(ctx, value, PreferredType::Number)?;
@@ -216,6 +220,9 @@ pub(crate) fn string_to_number(ctx: &mut ExecCtx<'_, '_>, id: StrId) -> JsResult
 }
 
 fn parse_number(bytes: &[u8]) -> f64 {
+    if let Some(number) = qjs_dtoa::parse_simple_decimal(bytes) {
+        return number;
+    }
     let prefixed = matches!(bytes, [b'0', b'x' | b'X' | b'o' | b'O' | b'b' | b'B', ..]);
     let flags = qjs_dtoa::AtodFlags {
         int_only: prefixed,
@@ -277,7 +284,10 @@ pub fn to_string<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<H
         ValueKind::Undefined => ctx.new_string("undefined"),
         ValueKind::Null => ctx.new_string("null"),
         ValueKind::Bool(v) => ctx.new_string(if v { "true" } else { "false" }),
-        ValueKind::Int32(n) => integer_text(ctx, i64::from(n)),
+        ValueKind::Int32(n) => {
+            let value = format_int32_to_string(ctx, n, 10)?;
+            ctx.root(value)
+        }
         ValueKind::Float64(n) => number_text(ctx, n),
         ValueKind::ShortBigInt(n) => integer_text(ctx, n),
         ValueKind::BigInt(_) => {
@@ -292,38 +302,60 @@ pub fn to_string<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<H
 
 fn integer_text<'s>(ctx: &mut ExecCtx<'_, 's>, n: i64) -> JsResult<Handle<'s>> {
     let mut bytes = [0; 20];
-    let mut i = bytes.len();
-    let mut magnitude = n.unsigned_abs();
-    loop {
-        i -= 1;
-        bytes[i] = b'0' + (magnitude % 10) as u8;
-        magnitude /= 10;
-        if magnitude == 0 {
-            break;
-        }
-    }
-    if n < 0 {
-        i -= 1;
-        bytes[i] = b'-';
-    }
-    ctx.new_latin1(&bytes[i..])
+    let len = qjs_dtoa::i64toa(&mut bytes, n);
+    ctx.new_latin1(&bytes[..len])
 }
 
 fn number_text<'s>(ctx: &mut ExecCtx<'_, 's>, n: f64) -> JsResult<Handle<'s>> {
     let i = n as i32;
     if n == f64::from(i) {
-        return integer_text(ctx, i64::from(i));
+        let value = format_int32_to_string(ctx, i, 10)?;
+        return ctx.root(value);
     }
-    format_number(ctx, n, 10, 0, qjs_dtoa::DtoaOptions::default())
+    format_f64_result(
+        ctx,
+        n,
+        10,
+        0,
+        qjs_dtoa::DtoaOptions::default(),
+        |ctx, bytes| ctx.new_latin1(bytes),
+    )
 }
 
-pub(crate) fn format_number<'s>(
+/// Formats an integer in a validated radix and returns an unrooted string.
+pub(crate) fn format_int32_to_string(
+    ctx: &mut ExecCtx<'_, '_>,
+    n: i32,
+    radix: u32,
+) -> JsResult<Value> {
+    let mut bytes = [0; 33];
+    let len = if radix == 10 {
+        qjs_dtoa::i32toa(&mut bytes, n)
+    } else {
+        qjs_dtoa::i64toa_radix(&mut bytes, i64::from(n), radix)
+    };
+    number_latin1(ctx, &bytes[..len])
+}
+
+/// Formats a float with validated radix and precision and returns an unrooted string.
+pub(crate) fn format_f64_fast(
+    ctx: &mut ExecCtx<'_, '_>,
+    n: f64,
+    radix: u32,
+    digits: usize,
+    options: qjs_dtoa::DtoaOptions,
+) -> JsResult<Value> {
+    format_f64_result(ctx, n, radix, digits, options, number_latin1)
+}
+
+fn format_f64_result<'s, T>(
     ctx: &mut ExecCtx<'_, 's>,
     n: f64,
     radix: u32,
     digits: usize,
     options: qjs_dtoa::DtoaOptions,
-) -> JsResult<Handle<'s>> {
+    emit: impl FnOnce(&mut ExecCtx<'_, 's>, &[u8]) -> JsResult<T>,
+) -> JsResult<T> {
     let bytes = qjs_dtoa::dtoa_max_len(n, radix, digits, options);
     let ledger = ctx.heap().ledger.clone();
     ctx.allocate(|_| ledger.charge_bytes(bytes))?;
@@ -331,13 +363,32 @@ pub(crate) fn format_number<'s>(
     let result = if bytes <= 128 {
         let mut buf = [0; 128];
         let len = qjs_dtoa::dtoa_into(&mut buf, n, radix, digits, options);
-        ctx.new_latin1(&buf[..len])
+        emit(ctx, &buf[..len])
     } else {
         let text = qjs_dtoa::dtoa(n, radix, digits, options);
-        ctx.new_latin1(text.as_bytes())
+        emit(ctx, text.as_bytes())
     };
     ledger.release_bytes(bytes);
     result
+}
+
+fn number_latin1(ctx: &mut ExecCtx<'_, '_>, bytes: &[u8]) -> JsResult<Value> {
+    let digit = match bytes {
+        [digit] => Some(usize::from(*digit)),
+        _ => None,
+    };
+    if let Some(id) = digit.and_then(|digit| ctx.heap().atoms.ascii_string(digit)) {
+        return Ok(Value::string(id));
+    }
+    let id = ctx.allocate(|rt| {
+        let heap = &mut rt.heap;
+        let string = JsString::from_latin1(&heap.ledger, bytes)?;
+        heap.strings.insert(&heap.ledger, string)
+    })?;
+    if let Some(digit) = digit {
+        ctx.runtime.heap.atoms.cache_ascii_string(digit, id);
+    }
+    Ok(Value::string(id))
 }
 
 pub fn to_property_key<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsResult<PropKey> {

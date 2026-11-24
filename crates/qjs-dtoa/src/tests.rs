@@ -1,5 +1,7 @@
 use super::*;
 
+const DECIMAL_MIDPOINT: f64 = 1_000_000_000_000_000.0 + 0.25;
+
 fn opts(format: DtoaFormat, exp: DtoaExp) -> DtoaOptions {
     DtoaOptions {
         format,
@@ -46,6 +48,35 @@ fn simple_decimals_match_the_general_parser() {
 }
 
 #[test]
+fn whole_ascii_decimal_fast_path_requires_every_byte() {
+    for (bytes, expected) in [
+        (&b"-.0"[..], -0.0f64),
+        (b"5.", 5.0),
+        (b"+0.25", 0.25),
+        (b"12345678901234.5", 12345678901234.5),
+    ] {
+        assert_eq!(
+            parse_simple_decimal(bytes).unwrap().to_bits(),
+            expected.to_bits()
+        );
+    }
+    for bytes in [
+        &b""[..],
+        b"-",
+        b"+.",
+        b"0x10",
+        b"NaN",
+        b"1e2",
+        b"1\x00",
+        b"5..",
+        b"1\xff",
+        b"1234567890123456",
+    ] {
+        assert_eq!(parse_simple_decimal(bytes), None, "{bytes:?}");
+    }
+}
+
+#[test]
 fn shortest_decimal_uses_ecmascript_thresholds() {
     let free = DtoaOptions::default();
     for (value, expected) in [
@@ -62,6 +93,24 @@ fn shortest_decimal_uses_ecmascript_thresholds() {
         let mut buf = [0xff; 128];
         let len = dtoa_into(&mut buf, value, 10, 0, free);
         assert_eq!(&buf[..len], expected.as_bytes());
+    }
+}
+
+#[test]
+fn shortest_rounds_a_midpoint_to_even_but_explicit_precision_rounds_away() {
+    let value = DECIMAL_MIDPOINT;
+    for (format, exp, digits, expected) in [
+        (DtoaFormat::Free, DtoaExp::Auto, 0, "1000000000000000.2"),
+        (DtoaFormat::Frac, DtoaExp::Auto, 1, "1000000000000000.3"),
+        (DtoaFormat::Fixed, DtoaExp::Auto, 17, "1000000000000000.3"),
+        (
+            DtoaFormat::Fixed,
+            DtoaExp::Enabled,
+            17,
+            "1.0000000000000003e+15",
+        ),
+    ] {
+        assert_eq!(dtoa(value, 10, digits, opts(format, exp)), expected);
     }
 }
 
@@ -360,6 +409,102 @@ fn integer_radixes_use_lowercase_and_write_no_terminator() {
             assert_eq!(buf[len], 0xff);
         }
     }
+}
+
+#[test]
+#[ignore = "requires QJS_REF to name a built QuickJS-ng 0.17.0 checkout"]
+fn number_precisions_match_quickjs() {
+    use std::fmt::Write;
+    use std::process::Command;
+
+    let mut cases = vec![
+        0,
+        1 << 63,
+        1,
+        FRACTION_MASK,
+        FRACTION_BIT,
+        f64::NAN.to_bits(),
+        f64::INFINITY.to_bits(),
+        f64::NEG_INFINITY.to_bits(),
+    ];
+    let mut around = |n: f64| {
+        let bits = n.to_bits();
+        for bits in [bits - 1, bits, bits + 1] {
+            cases.extend([bits, bits | (1 << 63)]);
+        }
+    };
+    for power in -24..=24 {
+        around(10_f64.powi(power));
+        around(2_f64.powi(power));
+    }
+    for power in 1..=21 {
+        for odd in [1, 3, 5, 11, 123, 1999] {
+            around(f64::from(odd) * 2_f64.powi(-power));
+        }
+    }
+    around(DECIMAL_MIDPOINT);
+    let mut rand = 0x333e_a913_287e_ad53u64;
+    for i in 0..2048 {
+        rand ^= rand << 13;
+        rand ^= rand >> 7;
+        rand ^= rand << 17;
+        cases.push(if i % 2 == 0 {
+            rand
+        } else {
+            ((rand >> 52) % 128 + 959) << 52 | (rand & FRACTION_MASK)
+        });
+    }
+    let mut expr = String::from("const bits = [");
+    for bits in &cases {
+        write!(expr, "0x{bits:x}n,").unwrap();
+    }
+    expr.push_str(
+        r#"];
+        const view = new DataView(new ArrayBuffer(8));
+        for (const b of bits) {
+            view.setBigUint64(0, b);
+            const n = view.getFloat64(0);
+            print(n.toString(), n.toExponential());
+            for (let d = 0; d <= 20; d++)
+                print(n.toFixed(d), n.toPrecision(d + 1), n.toExponential(d));
+        }
+    "#,
+    );
+    let reference = std::path::PathBuf::from(std::env::var_os("QJS_REF").expect("set QJS_REF"));
+    let output = Command::new(reference.join("build/qjs"))
+        .args(["-e", &expr])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = String::from_utf8(output.stdout).unwrap();
+    let mut expected = output.split_ascii_whitespace();
+    for &bits in &cases {
+        let n = f64::from_bits(bits);
+        let mut compare = |format, exp, digits| {
+            assert_eq!(
+                dtoa(n, 10, digits, opts(format, exp)),
+                expected.next().unwrap(),
+                "{bits:016x} {format:?} {exp:?} {digits}"
+            );
+        };
+        compare(DtoaFormat::Free, DtoaExp::Auto, 0);
+        compare(DtoaFormat::Free, DtoaExp::Enabled, 0);
+        for d in 0..=20 {
+            if n.abs() >= 1e21 {
+                compare(DtoaFormat::Free, DtoaExp::Auto, 0);
+            } else {
+                compare(DtoaFormat::Frac, DtoaExp::Auto, d);
+            }
+            compare(DtoaFormat::Fixed, DtoaExp::Auto, d + 1);
+            compare(DtoaFormat::Fixed, DtoaExp::Enabled, d + 1);
+        }
+    }
+    assert_eq!(expected.next(), None);
+    println!("{} decimal strings, 0 mismatches", cases.len() * 65);
 }
 
 #[test]

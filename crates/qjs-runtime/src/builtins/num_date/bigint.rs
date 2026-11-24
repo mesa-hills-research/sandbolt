@@ -78,14 +78,12 @@ pub(super) fn dispatch<'s>(
     if id == ValueOf.id() {
         return Ok(value);
     }
-    let value = ctx.root(value)?;
     let radix = if id == ToString.id() {
-        let arg = argument(ctx, args, 0)?;
-        radix(ctx, arg)?
+        radix(ctx, args.get(0))?
     } else {
         10
     };
-    numeric::bigint_radix_text(ctx, ctx.get(value), radix)
+    numeric::bigint_radix_text(ctx, value, radix)
 }
 
 fn convert<'s>(ctx: &mut ExecCtx<'_, 's>, arg: Handle<'s>, allow_number: bool) -> JsResult<Value> {

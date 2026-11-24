@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 
-use crate::integer::write_limb;
+use crate::decimal;
+use crate::integer::{u128toa, write_limb};
 use crate::{
     DIGITS_PER_LIMB, DTOA_MAX_DIGITS, DtoaExp, DtoaFormat, DtoaOptions, FRACTION_BIT,
     FRACTION_MASK, LIMB_BASES, Limbs, RADICES, Radix, Round, u32toa, u64toa_radix,
@@ -125,8 +126,8 @@ pub fn dtoa_into(buf: &mut [u8], d: f64, radix: u32, n_digits: usize, opts: Dtoa
 fn format_into(bytes: &mut [u8], d: f64, radix: Radix, n_digits: i32, opts: DtoaOptions) -> usize {
     let bits = d.to_bits();
     let negative = bits >> 63 != 0;
-    let mut exponent = exponent_field(bits);
-    let mut mantissa = bits & FRACTION_MASK;
+    let exponent = exponent_field(bits);
+    let mantissa = bits & FRACTION_MASK;
     let mut buf = Output { bytes, len: 0 };
 
     if exponent == 0x7ff {
@@ -154,6 +155,32 @@ fn format_into(bytes: &mut [u8], d: f64, radix: Radix, n_digits: i32, opts: Dtoa
         return buf.len + u64toa_radix(&mut buf.bytes[buf.len..], magnitude, radix.value);
     }
 
+    if radix.value == 10
+        && exponent != 0
+        && decimal_fast(
+            &mut buf,
+            mantissa | FRACTION_BIT,
+            integer_exponent,
+            n_digits,
+            opts,
+        )
+    {
+        return buf.len;
+    }
+
+    format_limbs(buf, zero, radix, mantissa, exponent, n_digits, opts)
+}
+
+#[inline(never)]
+fn format_limbs(
+    mut buf: Output<'_>,
+    zero: bool,
+    radix: Radix,
+    mut mantissa: u64,
+    mut exponent: i32,
+    n_digits: i32,
+    opts: DtoaOptions,
+) -> usize {
     let mut scaled = Limbs::new(0);
     let (digits, point) = if zero {
         let digits = match opts.format {
@@ -248,6 +275,51 @@ fn format_into(bytes: &mut [u8], d: f64, radix: Radix, n_digits: i32, opts: Dtoa
     buf.len
 }
 
+fn decimal_fast(
+    buf: &mut Output<'_>,
+    mantissa: u64,
+    exponent: i32,
+    digits: i32,
+    opts: DtoaOptions,
+) -> bool {
+    let binary = exponent - 53;
+    let point = 1 + (((i64::from(exponent - 1) * INVERSE_LOG2[8]) >> 24) as i32);
+    let (number, mut point) = match opts.format {
+        DtoaFormat::Free => match decimal::shortest(mantissa, binary, point) {
+            Some(pair) => pair,
+            None => return false,
+        },
+        DtoaFormat::Fixed => match decimal::fixed(mantissa, binary, digits, point) {
+            Some(pair) => pair,
+            None => return false,
+        },
+        DtoaFormat::Frac => match decimal::fraction(mantissa, binary, digits) {
+            Some(number) => (number, 0),
+            None => return false,
+        },
+    };
+    let mut bytes = [0; 39];
+    let len = u128toa(&mut bytes, number);
+    let text = &bytes[..len];
+    let max_point = match opts.format {
+        DtoaFormat::Fixed => digits,
+        _ => 21,
+    };
+    if opts.format == DtoaFormat::Frac {
+        point = len as i32 - digits;
+    } else if opts.exp == DtoaExp::Enabled
+        || (opts.exp == DtoaExp::Auto && (point <= -6 || point > max_point))
+    {
+        buf.decimal(text, 1);
+        let exp = point - 1;
+        buf.extend(if exp < 0 { b"e-" } else { b"e+" });
+        buf.len += u32toa(&mut buf.bytes[buf.len..], exp.unsigned_abs());
+        return true;
+    }
+    buf.decimal(text, point);
+    true
+}
+
 struct Output<'a> {
     bytes: &'a mut [u8],
     len: usize,
@@ -267,6 +339,22 @@ impl Output<'_> {
     fn zeros(&mut self, count: usize) {
         self.bytes[self.len..self.len + count].fill(b'0');
         self.len += count;
+    }
+
+    fn decimal(&mut self, digits: &[u8], point: i32) {
+        if point <= 0 {
+            self.extend(b"0.");
+            self.zeros((-point) as usize);
+            self.extend(digits);
+        } else if (point as usize) < digits.len() {
+            let (left, right) = digits.split_at(point as usize);
+            self.extend(left);
+            self.push(b'.');
+            self.extend(right);
+        } else {
+            self.extend(digits);
+            self.zeros(point as usize - digits.len());
+        }
     }
 }
 

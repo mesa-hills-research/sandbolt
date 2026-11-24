@@ -220,7 +220,21 @@ const POW10: [f64; 16] = {
     powers
 };
 
+/// Parses a whole ASCII decimal with at most 15 digits and no exponent.
+/// Returns `None` if the input needs the general parser.
+#[inline]
+pub fn parse_simple_decimal(input: &[u8]) -> Option<f64> {
+    let (negative, start) = match input.first() {
+        Some(b'-') => (true, 1),
+        Some(b'+') => (false, 1),
+        _ => (false, 0),
+    };
+    let (value, end) = simple_decimal(input, start, false)?;
+    (end == input.len()).then_some(if negative { -value } else { value })
+}
+
 // Both operands of the division are exact, so it rounds just once.
+#[inline]
 fn simple_decimal(input: &[u8], mut pos: usize, int_only: bool) -> Option<(f64, usize)> {
     let start = pos;
     let mut mantissa = 0u64;

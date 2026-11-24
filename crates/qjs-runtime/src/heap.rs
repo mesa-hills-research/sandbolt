@@ -16,13 +16,67 @@ use crate::vm::{BytecodeFunc, CoroutineState, ModuleRecord, VarRef};
 #[derive(Debug, Default)]
 pub struct BigIntData {
     pub negative: bool,
-    pub limbs: TrackedVec<u32>,
+    pub limbs: BigIntLimbs,
 }
 impl ArenaItem for BigIntData {
     type Id = BigIntId;
 }
 impl Trace for BigIntData {
     fn trace(&self, _: &Tracer<'_>) {}
+}
+
+pub enum BigIntLimbs {
+    Inline {
+        len: u8,
+        words: [u32; Self::INLINE_LEN],
+    },
+    Heap(TrackedVec<u32>),
+}
+
+impl BigIntLimbs {
+    pub(crate) const INLINE_LEN: usize = 8;
+
+    pub(crate) fn inline(words: &[u32]) -> Self {
+        let mut inline = [0; Self::INLINE_LEN];
+        inline[..words.len()].copy_from_slice(words);
+        Self::Inline {
+            len: words.len() as u8,
+            words: inline,
+        }
+    }
+}
+
+impl Default for BigIntLimbs {
+    fn default() -> Self {
+        Self::inline(&[])
+    }
+}
+
+impl std::fmt::Debug for BigIntLimbs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl std::ops::Deref for BigIntLimbs {
+    type Target = [u32];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Inline { len, words } => &words[..usize::from(*len)],
+            Self::Heap(words) => words,
+        }
+    }
+}
+
+impl From<TrackedVec<u32>> for BigIntLimbs {
+    fn from(words: TrackedVec<u32>) -> Self {
+        if words.len() <= Self::INLINE_LEN {
+            Self::inline(&words)
+        } else {
+            Self::Heap(words)
+        }
+    }
 }
 
 pub(crate) struct PersistentRoot(pub Value);

@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+mod decimal;
 mod format;
 mod integer;
 mod limbs;
@@ -12,7 +13,7 @@ mod tests;
 
 pub use format::{dtoa, dtoa_into, dtoa_max_len};
 pub use integer::{i32toa, i64toa, i64toa_radix, u32toa, u64toa, u64toa_radix};
-pub use parse::atod;
+pub use parse::{atod, parse_simple_decimal};
 
 use limbs::{Limbs, Round};
 
