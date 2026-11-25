@@ -1,0 +1,23 @@
+Sandbolt
+Copyright (c) 2026 Mesa Hills Research
+
+Sandbolt is licensed under the MIT License, in LICENSE.
+
+Sandbolt is a Rust port of QuickJS-ng. The parts derived from it are under
+QuickJS-ng's MIT License, whose copyright notices follow. Its full license
+text is in LICENSE-QUICKJS, and in each crate that ports its code.
+
+QuickJS-ng 0.17.0 (https://github.com/quickjs-ng/quickjs, tag v0.17.0), MIT
+  crates/sandbolt-bigint, sandbolt-bytecode, sandbolt-compiler,
+  sandbolt-dtoa, sandbolt-regexp, sandbolt-runtime, sandbolt-syntax and
+  sandbolt-unicode
+  Copyright (c) 2017-2026 Fabrice Bellard
+  Copyright (c) 2017-2024 Charlie Gordon
+  Copyright (c) 2023-2026 Ben Noordhuis
+  Copyright (c) 2023-2026 Saúl Ibarra Corretgé
+
+Unicode Character Database, Unicode License v3
+  crates/sandbolt-unicode, whose tables come from QuickJS-ng's
+  libunicode-table.h, generated from the Unicode data files
+  Copyright (c) 1991-2026 Unicode, Inc.
+  (its license text is in crates/sandbolt-unicode/LICENSE-UNICODE)
