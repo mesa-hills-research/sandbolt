@@ -87,6 +87,10 @@ pub(crate) struct Emitter<'a> {
     depth: usize,
     remaining: usize,
     oom: bool,
+    /// The source may call `eval` directly, which can add bindings to a
+    /// function's scope while it runs. (A direct call spells `eval`, or
+    /// escapes a letter of it.)
+    pub(crate) may_eval: bool,
 }
 
 pub(crate) fn compile(
@@ -105,6 +109,10 @@ pub(crate) fn compile(
         depth: 0,
         remaining: options.max_bytes,
         oom: false,
+        may_eval: {
+            let text = source.as_bytes();
+            text.windows(4).any(|w| w == b"eval") || text.windows(2).any(|w| w == b"\\u")
+        },
     };
     emitter.charge(source.as_bytes().len())?;
     for (count, size) in [

@@ -1872,6 +1872,29 @@ fn global_updates_keep_reference_semantics() {
             "ReferenceError",
         ),
         ("missing1 += 1", "ReferenceError: missing1 is not defined"),
+        // A direct `eval` can add a binding to the function between the
+        // reference and the store, which goes where the reference went.
+        (
+            "(function () { eval(''); e1 = (eval('var e1 = 10'), 2); return [e1, globalThis.e1].join(); })()",
+            "10,2",
+        ),
+        (
+            "globalThis.e2 = 1; (function () { eval(''); e2 += (eval('var e2 = 10'), 5); return [e2, globalThis.e2].join(); })()",
+            "10,6",
+        ),
+        (
+            "globalThis.e3 = 0; (function () { eval(''); e3 ||= (eval('var e3 = 10'), 2); return [e3, globalThis.e3].join(); })()",
+            "10,2",
+        ),
+        // A `var` over a configurable global keeps it configurable, so a
+        // strict store to it still needs it to exist when it's made.
+        (
+            &*format!(
+                "'use strict'; var Reflect; delete globalThis.Reflect; {}",
+                caught("Reflect = (globalThis.Reflect = 10, 20); return 'stored';")
+            ),
+            "ReferenceError",
+        ),
     ] {
         let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
         let got = match engine.eval_to_string(script, EvalOptions::default()) {

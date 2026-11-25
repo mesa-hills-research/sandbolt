@@ -46,20 +46,35 @@ impl Emitter<'_> {
         }
     }
 
-    /// Whether `name` resolves to a global without passing a `with` or eval
-    /// scope, and if so, whether this script declares it, which makes the
-    /// binding one that can't be missing or deleted.
+    /// Whether `name` resolves to a global without passing a `with` scope,
+    /// in code that can't call `eval` directly, and if so, whether this
+    /// script declares it lexically, which makes it a binding that can't
+    /// be missing or deleted. (A `var` over a configurable property of the
+    /// global object, such as `var Reflect`, leaves it configurable.)
     pub(crate) fn static_global(&self, name: ScopedName) -> Option<bool> {
+        use sandbolt_syntax::ParseGoal;
+        if self.may_eval || matches!(self.options.goal, ParseGoal::DirectEval { .. }) {
+            return None;
+        }
         let mut function = self.current;
         let mut scope = name.scope;
         loop {
             let draft = &self.functions[function];
             let block = &draft.scopes[usize::from(scope)];
             if let Some(slot) = block.names.get(&name.name) {
-                return matches!(slot, Slot::Global(_))
-                    .then_some(self.options.goal == sandbolt_syntax::ParseGoal::Script);
+                if !matches!(slot, Slot::Global(_)) {
+                    return None;
+                }
+                let lexical = draft.globals.iter().any(|&(global, kind, _)| {
+                    global == name.name
+                        && matches!(
+                            kind,
+                            VarKind::Let | VarKind::Const | VarKind::Using | VarKind::AwaitUsing
+                        )
+                });
+                return Some(lexical && self.options.goal == ParseGoal::Script);
             }
-            if block.with_object.is_some() || block.eval_object.is_some() {
+            if block.with_object.is_some() {
                 return None;
             }
             if let Some(parent) = block.info.parent {
