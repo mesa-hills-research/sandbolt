@@ -294,6 +294,18 @@ impl<'s> ExecCtx<'_, 's> {
         self.runtime.clear_kept_objects();
     }
 
+    /// Counts `weight` ticks toward a poll of the interrupt handler, see
+    /// [`crate::vm::tick_interrupt`], and is interrupted once it says stop.
+    pub(crate) fn tick_interrupt(&mut self, weight: u32) -> JsResult<()> {
+        let vm = &mut self.runtime.vm;
+        if crate::vm::tick_interrupt(&mut vm.interrupt_ticks, &mut vm.interrupt_handler, weight) {
+            self.take_exception();
+            Err(Abrupt::Interrupted)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn check_interrupt(&mut self) -> JsResult<()> {
         if self
             .runtime

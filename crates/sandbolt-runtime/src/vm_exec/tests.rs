@@ -1397,24 +1397,18 @@ fn direct_calls_restore_the_receiver_and_close_captured_slots() {
     );
 }
 
+/// Calls and backward jumps tick toward a poll of the interrupt handler,
+/// which a loop of calls reaches within [`crate::vm::INTERRUPT_TICKS`] of
+/// them, and an interrupt skips `finally`.
 #[test]
-fn direct_calls_poll_once_per_entry_and_skip_finally_on_interrupt() {
+fn calls_tick_toward_interrupt_polls_and_an_interrupt_skips_finally() {
     use std::{cell::Cell, rc::Rc};
 
     let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
     let options = EvalOptions::default();
     engine
         .eval(
-            r#"
-        var reached = 0;
-        function outer() {
-            const leaf = () => ++reached;
-            leaf();
-            leaf();
-        }
-        outer();
-        reached = 0;
-    "#,
+            "var reached = 0; const leaf = () => ++reached; function outer() { for (;;) leaf(); }",
             options.clone(),
         )
         .unwrap();
@@ -1423,7 +1417,7 @@ fn direct_calls_poll_once_per_entry_and_skip_finally_on_interrupt() {
         let polls = polls.clone();
         move || {
             polls.set(polls.get() + 1);
-            polls.get() == 5
+            polls.get() == 3
         }
     })));
     assert_eq!(
@@ -1433,9 +1427,18 @@ fn direct_calls_poll_once_per_entry_and_skip_finally_on_interrupt() {
         ),
         Err(EngineError::Interrupted)
     );
-    assert_eq!(polls.get(), 5);
+    assert_eq!(polls.get(), 3);
     engine.set_interrupt_handler(None);
-    assert_eq!(engine.eval_to_string("reached", options).unwrap(), "1");
+    let reached: u32 = engine
+        .eval_to_string("reached", options)
+        .unwrap()
+        .parse()
+        .unwrap();
+    // (Each iteration is a call and a backward jump.)
+    assert!(
+        reached > 0 && reached <= crate::vm::INTERRUPT_TICKS,
+        "{reached}"
+    );
 }
 
 #[test]
@@ -1972,4 +1975,86 @@ fn a_global_store_looks_its_name_up_after_its_value() {
              log.join()"),
         "value,has,1"
     );
+}
+
+/// A loop polls the interrupt handler once per [`crate::vm::INTERRUPT_TICKS`]
+/// backward jumps, not on each, so a handler that reads a clock costs a
+/// hot loop next to nothing.
+#[test]
+fn a_loop_polls_the_interrupt_handler_once_per_thousand_jumps() {
+    use std::{cell::Cell, rc::Rc};
+
+    for code in [
+        "for (let i = 0; i < 100000; i++) {}",
+        "(function () { let s = 0; for (let i = 0; i < 100000; i++) s += i; })()",
+        "(function* () { for (let i = 0; i < 100000; i++) {} })().next()",
+        "(async () => { for (let i = 0; i < 100000; i++) {} })()",
+    ] {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        let polls = Rc::new(Cell::new(0u32));
+        engine.set_interrupt_handler(Some(Box::new({
+            let polls = polls.clone();
+            move || {
+                polls.set(polls.get() + 1);
+                false
+            }
+        })));
+        engine.eval(code, EvalOptions::default()).unwrap();
+        engine.run_jobs().unwrap();
+        let expected = 100_000 / crate::vm::INTERRUPT_TICKS;
+        assert!(
+            (expected..expected + 10).contains(&polls.get()),
+            "{code}: {} polls",
+            polls.get()
+        );
+    }
+}
+
+/// A stop set from another thread ends a running loop within a bound,
+/// whether the loop is plain, allocates, calls, iterates an array or a
+/// generator, or runs in an async function before or after an `await`.
+#[test]
+fn a_stop_ends_a_loop_within_a_bound() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    // These stop within about a millisecond unoptimized, and the bound
+    // leaves room for slow machines.
+    const BOUND: Duration = Duration::from_millis(50);
+    for code in [
+        "for (;;) {}",
+        "for (let i = 0; ; i++) { const o = { i, s: 'x' + i }; }",
+        "function f(n) { return n ? f(n - 1) : 0; } for (;;) f(100);",
+        "const a = new Array(100000).fill(0); for (;;) for (const x of a) {}",
+        "function* g() { for (let i = 0; ; i++) yield i; } for (const x of g()) {}",
+        "(async () => { for (;;) {} })()",
+        "(async () => { for (;;) await null; })()",
+    ] {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        engine.set_interrupt_handler(Some(Box::new({
+            let stop = stop.clone();
+            move || stop.load(Ordering::Relaxed)
+        })));
+        let setter = std::thread::spawn({
+            let stop = stop.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(100));
+                stop.store(true, Ordering::Relaxed);
+                Instant::now()
+            }
+        });
+        let result = engine
+            .eval(code, EvalOptions::default())
+            .and_then(|()| engine.run_jobs());
+        let ended = Instant::now();
+        let set = setter.join().unwrap();
+        assert_eq!(result, Err(EngineError::Interrupted), "{code}");
+        let latency = ended.saturating_duration_since(set);
+        assert!(
+            latency < BOUND,
+            "{code}: stopped {latency:?} after the stop"
+        );
+    }
 }

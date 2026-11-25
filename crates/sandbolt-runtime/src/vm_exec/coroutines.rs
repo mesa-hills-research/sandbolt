@@ -314,7 +314,7 @@ fn abandon(ctx: &mut ExecCtx<'_, '_>, id: CoroId) {
 }
 
 fn resume(ctx: &mut ExecCtx<'_, '_>, id: CoroId, mode: u16, input: Value) -> JsResult<Value> {
-    ctx.check_interrupt()?;
+    ctx.tick_interrupt(crate::vm::HEAVY_TICKS)?;
     let status = state(ctx, id).status;
     let start = ctx.runtime.vm.stack.len();
     let depth = ctx.runtime.vm.frames.len();

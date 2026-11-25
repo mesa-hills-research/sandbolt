@@ -196,9 +196,7 @@ impl PlainCall {
             vm.stack.push_reserved(Value::UNDEFINED);
             vm.stack[base + 1..].rotate_right(1);
         }
-        if vm.interrupt_handler.is_some() {
-            ctx.check_interrupt()?;
-        }
+        ctx.tick_interrupt(1)?;
         let vm = &mut ctx.runtime.vm;
         while vm.stack.len() < self.frame.floor as usize {
             vm.stack.push_reserved(Value::UNDEFINED);
@@ -289,7 +287,7 @@ fn enter_call(
     mut count: usize,
     mut new_target: Option<ObjId>,
 ) -> JsResult<()> {
-    ctx.check_interrupt()?;
+    ctx.tick_interrupt(1)?;
     let mut require_object = false;
     let mut callee = ctx.runtime.vm.stack[base]
         .as_object()

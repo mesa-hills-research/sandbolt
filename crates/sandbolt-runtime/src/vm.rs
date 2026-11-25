@@ -466,6 +466,36 @@ impl Trace for Job {
     }
 }
 
+/// Backward jumps and calls between two polls of the interrupt handler. As
+/// in QuickJS-ng, a hot loop polls it every so often rather than at every
+/// iteration, which would cost more than the iteration.
+pub(crate) const INTERRUPT_TICKS: u32 = 1000;
+
+/// What a promise job or a resumed generator or async function counts
+/// toward [`INTERRUPT_TICKS`], since each costs many backward jumps.
+pub(crate) const HEAVY_TICKS: u32 = 50;
+
+/// Counts `weight` ticks, a backward jump or a call being one, and polls the
+/// interrupt handler every [`INTERRUPT_TICKS`] of them. Once it says stop,
+/// the next tick polls it too.
+#[inline]
+pub(crate) fn tick_interrupt(
+    ticks: &mut u32,
+    handler: &mut Option<Box<dyn FnMut() -> bool>>,
+    weight: u32,
+) -> bool {
+    let Some(handler) = handler.as_mut() else {
+        return false;
+    };
+    if *ticks > weight {
+        *ticks -= weight;
+        return false;
+    }
+    let stop = handler();
+    *ticks = if stop { 1 } else { INTERRUPT_TICKS };
+    stop
+}
+
 pub struct VmState {
     pub(crate) stack: TrackedVec<Value>,
     pub(crate) frames: TrackedVec<CallFrame>,
@@ -474,6 +504,8 @@ pub struct VmState {
     pub(crate) oom_thrown: bool,
     pub(crate) stack_capture: Option<(Value, Option<Value>)>,
     pub(crate) interrupt_handler: Option<Box<dyn FnMut() -> bool>>,
+    /// Ticks left before [`tick_interrupt`] polls the handler.
+    pub(crate) interrupt_ticks: u32,
     pub can_block: bool,
     pub limits: EngineLimits,
     pub(crate) thrown_frames: Vec<crate::Frame>,
@@ -494,6 +526,7 @@ impl VmState {
             oom_thrown: false,
             stack_capture: None,
             interrupt_handler: None,
+            interrupt_ticks: INTERRUPT_TICKS,
             can_block: false,
             limits,
             thrown_frames: Vec::new(),

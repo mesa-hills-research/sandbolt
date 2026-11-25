@@ -28,7 +28,8 @@ pub(super) fn iterator_op(
     use Opcode::*;
     let op = inst.opcode;
     let tail = ctx.runtime.vm.stack.len();
-    if op == ForOfNext && ctx.runtime.vm.interrupt_handler.is_none() {
+    // (The loop's backward jump polls the interrupt handler.)
+    if op == ForOfNext {
         let Operands::Unsigned(skip) = inst.operands else {
             unreachable!()
         };

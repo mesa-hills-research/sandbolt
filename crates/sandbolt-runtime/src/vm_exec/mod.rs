@@ -141,7 +141,7 @@ fn replace(ctx: &mut ExecCtx<'_, '_>, drop: usize, values: &[Value]) {
 
 fn branch(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame, index: usize, target: u32) -> JsResult<()> {
     if target <= frame.pc {
-        ctx.check_interrupt()?;
+        ctx.tick_interrupt(1)?;
     }
     ctx.runtime.vm.frames[index].pc = target;
     Ok(())
@@ -1539,7 +1539,11 @@ pub(crate) fn run_frame(
                         FastOp::Goto(target) => {
                             let target = target as usize;
                             if target <= cur_ip
-                                && vm.interrupt_handler.as_mut().is_some_and(|h| h())
+                                && crate::vm::tick_interrupt(
+                                    &mut vm.interrupt_ticks,
+                                    &mut vm.interrupt_handler,
+                                    1,
+                                )
                             {
                                 break FastBreak::Interrupted(orig_pcs[cur_ip]);
                             }
@@ -1550,7 +1554,11 @@ pub(crate) fn run_frame(
                             if !convert::to_boolean_value(heap, stack[sp]) {
                                 let target = target as usize;
                                 if target <= cur_ip
-                                    && vm.interrupt_handler.as_mut().is_some_and(|h| h())
+                                    && crate::vm::tick_interrupt(
+                                        &mut vm.interrupt_ticks,
+                                        &mut vm.interrupt_handler,
+                                        1,
+                                    )
                                 {
                                     break FastBreak::Interrupted(orig_pcs[cur_ip]);
                                 }
@@ -1562,7 +1570,11 @@ pub(crate) fn run_frame(
                             if convert::to_boolean_value(heap, stack[sp]) {
                                 let target = target as usize;
                                 if target <= cur_ip
-                                    && vm.interrupt_handler.as_mut().is_some_and(|h| h())
+                                    && crate::vm::tick_interrupt(
+                                        &mut vm.interrupt_ticks,
+                                        &mut vm.interrupt_handler,
+                                        1,
+                                    )
                                 {
                                     break FastBreak::Interrupted(orig_pcs[cur_ip]);
                                 }
@@ -1616,7 +1628,11 @@ pub(crate) fn run_frame(
                             if cond == branch_on_true {
                                 let target = target as usize;
                                 if target <= cur_ip
-                                    && vm.interrupt_handler.as_mut().is_some_and(|h| h())
+                                    && crate::vm::tick_interrupt(
+                                        &mut vm.interrupt_ticks,
+                                        &mut vm.interrupt_handler,
+                                        1,
+                                    )
                                 {
                                     break FastBreak::Interrupted(orig_pcs[cur_ip]);
                                 }
@@ -1631,7 +1647,11 @@ pub(crate) fn run_frame(
                             stack[slot] = after;
                             let target = target as usize;
                             if target <= cur_ip
-                                && vm.interrupt_handler.as_mut().is_some_and(|h| h())
+                                && crate::vm::tick_interrupt(
+                                    &mut vm.interrupt_ticks,
+                                    &mut vm.interrupt_handler,
+                                    1,
+                                )
                             {
                                 break FastBreak::Interrupted(orig_pcs[cur_ip]);
                             }
@@ -1645,7 +1665,11 @@ pub(crate) fn run_frame(
                             stack[slot] = after;
                             let target = target as usize;
                             if target <= cur_ip
-                                && vm.interrupt_handler.as_mut().is_some_and(|h| h())
+                                && crate::vm::tick_interrupt(
+                                    &mut vm.interrupt_ticks,
+                                    &mut vm.interrupt_handler,
+                                    1,
+                                )
                             {
                                 break FastBreak::Interrupted(orig_pcs[cur_ip]);
                             }
@@ -1661,7 +1685,11 @@ pub(crate) fn run_frame(
                             if !cond {
                                 let target = target as usize;
                                 if target <= cur_ip
-                                    && vm.interrupt_handler.as_mut().is_some_and(|h| h())
+                                    && crate::vm::tick_interrupt(
+                                        &mut vm.interrupt_ticks,
+                                        &mut vm.interrupt_handler,
+                                        1,
+                                    )
                                 {
                                     break FastBreak::Interrupted(orig_pcs[cur_ip]);
                                 }
@@ -1678,7 +1706,11 @@ pub(crate) fn run_frame(
                             if !cond {
                                 let target = target as usize;
                                 if target <= cur_ip
-                                    && vm.interrupt_handler.as_mut().is_some_and(|h| h())
+                                    && crate::vm::tick_interrupt(
+                                        &mut vm.interrupt_ticks,
+                                        &mut vm.interrupt_handler,
+                                        1,
+                                    )
                                 {
                                     break FastBreak::Interrupted(orig_pcs[cur_ip]);
                                 }
@@ -1695,7 +1727,11 @@ pub(crate) fn run_frame(
                             if !cond {
                                 let target = target as usize;
                                 if target <= cur_ip
-                                    && vm.interrupt_handler.as_mut().is_some_and(|h| h())
+                                    && crate::vm::tick_interrupt(
+                                        &mut vm.interrupt_ticks,
+                                        &mut vm.interrupt_handler,
+                                        1,
+                                    )
                                 {
                                     break FastBreak::Interrupted(orig_pcs[cur_ip]);
                                 }
@@ -1712,7 +1748,11 @@ pub(crate) fn run_frame(
                             if !cond {
                                 let target = target as usize;
                                 if target <= cur_ip
-                                    && vm.interrupt_handler.as_mut().is_some_and(|h| h())
+                                    && crate::vm::tick_interrupt(
+                                        &mut vm.interrupt_ticks,
+                                        &mut vm.interrupt_handler,
+                                        1,
+                                    )
                                 {
                                     break FastBreak::Interrupted(orig_pcs[cur_ip]);
                                 }
@@ -1729,7 +1769,11 @@ pub(crate) fn run_frame(
                             if !cond {
                                 let target = target as usize;
                                 if target <= cur_ip
-                                    && vm.interrupt_handler.as_mut().is_some_and(|h| h())
+                                    && crate::vm::tick_interrupt(
+                                        &mut vm.interrupt_ticks,
+                                        &mut vm.interrupt_handler,
+                                        1,
+                                    )
                                 {
                                     break FastBreak::Interrupted(orig_pcs[cur_ip]);
                                 }
@@ -1746,7 +1790,11 @@ pub(crate) fn run_frame(
                             if !cond {
                                 let target = target as usize;
                                 if target <= cur_ip
-                                    && vm.interrupt_handler.as_mut().is_some_and(|h| h())
+                                    && crate::vm::tick_interrupt(
+                                        &mut vm.interrupt_ticks,
+                                        &mut vm.interrupt_handler,
+                                        1,
+                                    )
                                 {
                                     break FastBreak::Interrupted(orig_pcs[cur_ip]);
                                 }
@@ -3298,7 +3346,11 @@ pub(crate) fn run_frame(
                                     {
                                         break FastBreak::Slow(call_pc);
                                     }
-                                    if vm.interrupt_handler.as_mut().is_some_and(|h| h()) {
+                                    if crate::vm::tick_interrupt(
+                                        &mut vm.interrupt_ticks,
+                                        &mut vm.interrupt_handler,
+                                        1,
+                                    ) {
                                         break FastBreak::Interrupted(call_pc);
                                     }
                                     sp = floor;

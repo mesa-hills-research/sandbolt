@@ -797,6 +797,8 @@ impl Runtime {
     }
     pub fn set_interrupt_handler(&mut self, handler: Option<Box<dyn FnMut() -> bool>>) {
         self.vm.interrupt_handler = handler;
+        // A new handler is polled at the next tick.
+        self.vm.interrupt_ticks = 1;
     }
     pub fn can_block(&self) -> bool {
         self.vm.can_block
@@ -924,6 +926,7 @@ impl Runtime {
             let arg = ctx.root(job.argument)?;
             let args = ctx.args(&[arg])?;
             ctx.runtime.job_queue.remove(0);
+            ctx.tick_interrupt(crate::vm::HEAVY_TICKS)?;
             crate::ops::call::call(ctx, callback, this, args)?;
             Ok(true)
         });
