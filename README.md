@@ -53,7 +53,7 @@ The table compares default release builds of Sandbolt (`cargo build --release`, 
 | Bootstrap heap used, pre- and post-GC (KiB) | 115.4 | 84.4 |
 | RSS per retained post-GC engine, 32 engines (KiB) | 106.0 | not measured |
 | Cold engine startup p50, 50 runs (ms) | 0.190 | 0.040 |
-| Test262 errors (`test262.conf -a -m`) | 0 / 82,220 | 49 / 82,220 |
+| Test262 errors, QuickJS-ng's `test262.conf` (below) | 0 / 82,220 | 49 / 82,220 |
 | `unsafe` blocks / external runtime crates | 0 / 0 | C codebase |
 
 The `microbench.js` numbers come from 20 randomized-order paired rounds of all 57 tests timed with `os.now` on an AMD EPYC 9R45 pinned to CPU 0. On that suite, Sandbolt takes less time than C QuickJS-ng in both geometric mean (each test weighted equally) and total time. Against GCC 13.4.0 (`4,523.44` ns median total), Sandbolt's geometric mean is `0.930` (95% CI `0.928` to `0.932`) and total ratio is `0.939` (95% CI `0.935` to `0.946`). Against GCC 15.2.0 (`4,739.62` ns median total), the geometric mean is `0.849` (95% CI `0.846` to `0.853`) and total ratio is `0.897` (95% CI `0.891` to `0.908`). All intervals are exact binomial 95% intervals for the median round.
