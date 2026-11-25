@@ -1954,3 +1954,22 @@ fn atoms_resolve_after_a_collection_prunes_others() {
         "200,150,kept199,7"
     );
 }
+
+/// A store to a global that isn't an own property of the global object
+/// looks the name up after its value is made, as QuickJS-ng and V8 do,
+/// where the spec's reference looks first. Only a proxy in the global
+/// object's prototype chain can tell.
+#[test]
+fn a_global_store_looks_its_name_up_after_its_value() {
+    assert_eq!(
+        run("const log = [];
+             const proto = Object.getPrototypeOf(globalThis);
+             Object.setPrototypeOf(globalThis, new Proxy(proto, {
+               has(target, key) { if (key === 'pinned') log.push('has'); return Reflect.has(target, key); },
+             }));
+             pinned = (log.push('value'), 1);
+             log.push(pinned);
+             log.join()"),
+        "value,has,1"
+    );
+}

@@ -792,6 +792,12 @@ impl Emitter<'_> {
         // Loading and storing a global by name gives what a reference gives,
         // unless strict code stores to a name it hasn't read and this script
         // doesn't declare, which must still exist after its value is made.
+        // One difference stays, as in QuickJS-ng and V8. A store looks the
+        // name up after its value is made, where the reference looked first,
+        // which only a proxy in the global object's prototype chain can see
+        // (its `has` trap runs after the value). Keeping the reference for
+        // every global that isn't lexical would make loops over top-level
+        // `var` bindings about half again as slow.
         if let Some(declared) = self.static_global(binding)
             && (declared || reads_first || !self.f().bytecode.strict)
         {
