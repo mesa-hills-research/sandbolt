@@ -2406,9 +2406,10 @@ pub(crate) fn run_frame(
                                 }
                             }
                         }
+                        // (The loop's backward jump ticks toward a poll of the
+                        // interrupt handler.)
                         FastOp::ForOfStart => {
-                            if vm.interrupt_handler.is_none()
-                                && let Some(arr_id) = stack[sp - 1].as_object()
+                            if let Some(arr_id) = stack[sp - 1].as_object()
                                 && matches!(heap.object(arr_id).data, ObjectData::Array(_))
                             {
                                 break FastBreak::ForOfStartArray {
@@ -2421,9 +2422,6 @@ pub(crate) fn run_frame(
                             break FastBreak::Slow(orig_pcs[cur_ip]);
                         }
                         FastOp::ForOfNext(skip) => {
-                            if vm.interrupt_handler.is_some() {
-                                break FastBreak::Slow(orig_pcs[cur_ip]);
-                            }
                             let pos = sp - usize::from(skip) - 3;
                             let iterator = stack[pos];
                             let method = stack[pos + 1];
@@ -2500,7 +2498,7 @@ pub(crate) fn run_frame(
                             };
                         }
                         FastOp::CallConstructor(count) => {
-                            if count == 0 && vm.interrupt_handler.is_none() {
+                            if count == 0 {
                                 let start = sp - 2;
                                 let callee_val = stack[start];
                                 if callee_val == stack[start + 1]
@@ -2553,9 +2551,9 @@ pub(crate) fn run_frame(
                             };
 
                             match &heap.object(callee_id).data {
-                                ObjectData::NativeFunction(native)
-                                    if vm.interrupt_handler.is_none() =>
-                                {
+                                // (These natives call no code and end at once, so
+                                // they needn't tick toward an interrupt poll.)
+                                ObjectData::NativeFunction(native) => {
                                     let fn_id = native.function.0;
                                     let handled = match fn_id {
                                         FN_MATH_MIN | FN_MATH_MAX if count == 2 => {

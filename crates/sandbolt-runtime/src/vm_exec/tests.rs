@@ -1984,13 +1984,32 @@ fn a_global_store_looks_its_name_up_after_its_value() {
 fn a_loop_polls_the_interrupt_handler_once_per_thousand_jumps() {
     use std::{cell::Cell, rc::Rc};
 
-    for code in [
-        "for (let i = 0; i < 100000; i++) {}",
-        "(function () { let s = 0; for (let i = 0; i < 100000; i++) s += i; })()",
-        "(function* () { for (let i = 0; i < 100000; i++) {} })().next()",
-        "(async () => { for (let i = 0; i < 100000; i++) {} })()",
+    for (setup, code) in [
+        ("", "for (let i = 0; i < 100000; i++) {}"),
+        (
+            "",
+            "(function () { let s = 0; for (let i = 0; i < 100000; i++) s += i; })()",
+        ),
+        (
+            "",
+            "(function* () { for (let i = 0; i < 100000; i++) {} })().next()",
+        ),
+        (
+            "",
+            "(async () => { for (let i = 0; i < 100000; i++) {} })()",
+        ),
+        // Natives that call no code don't tick, with a handler set or not.
+        (
+            "var a = [];",
+            "for (let i = 0; i < 100000; i++) { a.push(i); a.pop(); Math.min(i, 5); new Object(); }",
+        ),
+        (
+            "var a = new Array(100000).fill(0);",
+            "for (const x of a) {}",
+        ),
     ] {
         let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        engine.eval(setup, EvalOptions::default()).unwrap();
         let polls = Rc::new(Cell::new(0u32));
         engine.set_interrupt_handler(Some(Box::new({
             let polls = polls.clone();
