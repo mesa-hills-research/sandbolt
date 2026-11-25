@@ -1,0 +1,15 @@
+[package]
+name = "sandbolt-compiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sandbolt-syntax.workspace = true
+sandbolt-bytecode.workspace = true
+sandbolt-regexp.workspace = true
+sandbolt-unicode.workspace = true
+
+[lints]
+workspace = true

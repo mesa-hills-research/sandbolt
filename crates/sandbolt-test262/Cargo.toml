@@ -1,0 +1,19 @@
+[package]
+name = "sandbolt-test262"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["integrated-runtime"]
+integrated-runtime = []
+
+[dependencies]
+sandbolt-runtime.workspace = true
+sandbolt-syntax.workspace = true
+sandbolt-bytecode.workspace = true
+sandbolt-compiler.workspace = true
+
+[lints]
+workspace = true

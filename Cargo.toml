@@ -1,15 +1,15 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/qjs-unicode",
-    "crates/qjs-dtoa",
-    "crates/qjs-bigint",
-    "crates/qjs-regexp",
-    "crates/qjs-syntax",
-    "crates/qjs-bytecode",
-    "crates/qjs-compiler",
-    "crates/qjs-runtime",
-    "crates/qjs-test262",
+    "crates/sandbolt-unicode",
+    "crates/sandbolt-dtoa",
+    "crates/sandbolt-bigint",
+    "crates/sandbolt-regexp",
+    "crates/sandbolt-syntax",
+    "crates/sandbolt-bytecode",
+    "crates/sandbolt-compiler",
+    "crates/sandbolt-runtime",
+    "crates/sandbolt-test262",
 ]
 
 [workspace.package]
@@ -26,11 +26,11 @@ unreachable_pub = "warn"
 all = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
-qjs-unicode = { path = "crates/qjs-unicode" }
-qjs-dtoa = { path = "crates/qjs-dtoa" }
-qjs-bigint = { path = "crates/qjs-bigint" }
-qjs-regexp = { path = "crates/qjs-regexp" }
-qjs-syntax = { path = "crates/qjs-syntax" }
-qjs-bytecode = { path = "crates/qjs-bytecode" }
-qjs-compiler = { path = "crates/qjs-compiler" }
-qjs-runtime = { path = "crates/qjs-runtime" }
+sandbolt-unicode = { path = "crates/sandbolt-unicode" }
+sandbolt-dtoa = { path = "crates/sandbolt-dtoa" }
+sandbolt-bigint = { path = "crates/sandbolt-bigint" }
+sandbolt-regexp = { path = "crates/sandbolt-regexp" }
+sandbolt-syntax = { path = "crates/sandbolt-syntax" }
+sandbolt-bytecode = { path = "crates/sandbolt-bytecode" }
+sandbolt-compiler = { path = "crates/sandbolt-compiler" }
+sandbolt-runtime = { path = "crates/sandbolt-runtime" }

@@ -3,66 +3,66 @@
 version = 4
 
 [[package]]
-name = "qjs-bigint"
+name = "sandbolt-bigint"
 version = "0.1.0"
 
 [[package]]
-name = "qjs-bytecode"
+name = "sandbolt-bytecode"
 version = "0.1.0"
 
 [[package]]
-name = "qjs-compiler"
+name = "sandbolt-compiler"
 version = "0.1.0"
 dependencies = [
- "qjs-bytecode",
- "qjs-regexp",
- "qjs-syntax",
- "qjs-unicode",
+ "sandbolt-bytecode",
+ "sandbolt-regexp",
+ "sandbolt-syntax",
+ "sandbolt-unicode",
 ]
 
 [[package]]
-name = "qjs-dtoa"
+name = "sandbolt-dtoa"
 version = "0.1.0"
 
 [[package]]
-name = "qjs-regexp"
+name = "sandbolt-regexp"
 version = "0.1.0"
 dependencies = [
- "qjs-unicode",
+ "sandbolt-unicode",
 ]
 
 [[package]]
-name = "qjs-runtime"
+name = "sandbolt-runtime"
 version = "0.1.0"
 dependencies = [
- "qjs-bigint",
- "qjs-bytecode",
- "qjs-compiler",
- "qjs-dtoa",
- "qjs-regexp",
- "qjs-syntax",
- "qjs-unicode",
+ "sandbolt-bigint",
+ "sandbolt-bytecode",
+ "sandbolt-compiler",
+ "sandbolt-dtoa",
+ "sandbolt-regexp",
+ "sandbolt-syntax",
+ "sandbolt-unicode",
 ]
 
 [[package]]
-name = "qjs-syntax"
+name = "sandbolt-syntax"
 version = "0.1.0"
 dependencies = [
- "qjs-dtoa",
- "qjs-regexp",
- "qjs-unicode",
+ "sandbolt-dtoa",
+ "sandbolt-regexp",
+ "sandbolt-unicode",
 ]
 
 [[package]]
-name = "qjs-test262"
+name = "sandbolt-test262"
 version = "0.1.0"
 dependencies = [
- "qjs-bytecode",
- "qjs-compiler",
- "qjs-runtime",
- "qjs-syntax",
+ "sandbolt-bytecode",
+ "sandbolt-compiler",
+ "sandbolt-runtime",
+ "sandbolt-syntax",
 ]
 
 [[package]]
-name = "qjs-unicode"
+name = "sandbolt-unicode"
 version = "0.1.0"

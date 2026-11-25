@@ -1,4 +1,4 @@
-# Pure-Rust Port of QuickJS-ng v0.17.0 — Architecture Plan
+# Sandbolt, a Pure-Rust Port of QuickJS-ng v0.17.0 — Architecture Plan
 
 ## 1. Goal & Scope
 
@@ -58,11 +58,11 @@
 ### 2.3 Parser & Compiler Pipeline
 
 Clean multi-stage pipeline (replacing QuickJS's single-pass bytecode-rewinding parser):
-1. **Lexer (`qjs-syntax`)**: Contextual lexical goals (regex vs div, template tails, hashbang, Unicode IDs via `qjs-unicode`, lossless lone surrogates, raw/cooked literals, exact byte spans).
-2. **Parser + Cover Grammar + Early-Error Validator (`qjs-syntax`)**: Arena-backed AST (charged to `heap_bytes`, recursion-bounded against `stack_bytes`, freed after compilation). Pure AST cover-grammar reinterpretation for arrows, async arrows, and destructuring targets; full ES2025 static semantics and strict/Annex B early errors before emitting bytecode.
-3. **Scoped IR Emitter (`qjs-compiler`)**: Lowers validated AST to typed `Vec<IrOp>` modeling ES `Reference` evaluation order directly (fixing QuickJS-ng's destructuring/computed-property `ToPropertyKey` ordering and `get`/`set` ASI failures by construction).
-4. **Variable & Closure Resolver (`qjs-compiler`)**: Ports QuickJS's scope resolution (`resolve_variables`): lexical TDZ, `var`/Annex B B.3.3 hoisting, `for (let)` per-iteration closure cloning, `with` (`Symbol.unscopables` + `HasBinding` recheck), direct `eval` (dynamic scope + retained var names), sloppy mapped `arguments`, private fields/brands, `using`/`await using` disposal scopes.
-5. **Assembler & Verifier (`qjs-compiler` / `qjs-bytecode`)**: Resolves labels, performs short-opcode/jump shrinking, computes exact `stack_size`, builds `pc2line` debug info, and runs a structural bytecode + handler-stack verifier.
+1. **Lexer (`sandbolt-syntax`)**: Contextual lexical goals (regex vs div, template tails, hashbang, Unicode IDs via `sandbolt-unicode`, lossless lone surrogates, raw/cooked literals, exact byte spans).
+2. **Parser + Cover Grammar + Early-Error Validator (`sandbolt-syntax`)**: Arena-backed AST (charged to `heap_bytes`, recursion-bounded against `stack_bytes`, freed after compilation). Pure AST cover-grammar reinterpretation for arrows, async arrows, and destructuring targets; full ES2025 static semantics and strict/Annex B early errors before emitting bytecode.
+3. **Scoped IR Emitter (`sandbolt-compiler`)**: Lowers validated AST to typed `Vec<IrOp>` modeling ES `Reference` evaluation order directly (fixing QuickJS-ng's destructuring/computed-property `ToPropertyKey` ordering and `get`/`set` ASI failures by construction).
+4. **Variable & Closure Resolver (`sandbolt-compiler`)**: Ports QuickJS's scope resolution (`resolve_variables`): lexical TDZ, `var`/Annex B B.3.3 hoisting, `for (let)` per-iteration closure cloning, `with` (`Symbol.unscopables` + `HasBinding` recheck), direct `eval` (dynamic scope + retained var names), sloppy mapped `arguments`, private fields/brands, `using`/`await using` disposal scopes.
+5. **Assembler & Verifier (`sandbolt-compiler` / `sandbolt-bytecode`)**: Resolves labels, performs short-opcode/jump shrinking, computes exact `stack_size`, builds `pc2line` debug info, and runs a structural bytecode + handler-stack verifier.
 
 ### 2.4 VM Execution, Coroutines, Unwinding, and Limits
 
@@ -72,7 +72,7 @@ Clean multi-stage pipeline (replacing QuickJS's single-pass bytecode-rewinding p
 - **Unwinding & Interrupts**:
   - `Abrupt::Thrown` (catchable, including OOM `InternalError("out of memory")`): unwinds to `CatchOffset`, executes `finally` and `using` disposers, converts to Promise rejection in async frames.
   - `Abrupt::Interrupted` (uncatchable): bypasses all `catch`, `finally`, `using`, and Promise wrappers straight to `EngineError::Interrupted`.
-  - Interrupts (`stop()`), `heap_bytes`, and `stack_bytes` are enforced in VM backedges/calls/resumes, `qjs-regexp` backtracking (`RegExpHost`), parser recursion, `qjs-bigint`, and long builtin loops (`String.repeat/pad`, `Array.fill/sort`, `JSON`).
+  - Interrupts (`stop()`), `heap_bytes`, and `stack_bytes` are enforced in VM backedges/calls/resumes, `sandbolt-regexp` backtracking (`RegExpHost`), parser recursion, `sandbolt-bigint`, and long builtin loops (`String.repeat/pad`, `Array.fill/sort`, `JSON`).
 - **Multi-realm & `$262.agent`**: One `Runtime` per agent (non-`Send` heap); `$262.createRealm()` creates a new `Realm` inside the same `Runtime` with its own intrinsics and `globalThis`; every bytecode and native function carries its `RealmId`. `$262.agent` spawns worker threads with their own `Runtime`s sharing only `Arc<SharedArrayBufferBacking>` (atomic storage + wait/notify table; locks are never held across JS execution).
 
 ---
@@ -84,34 +84,34 @@ quickjs-port/
 ├── Cargo.toml                  # Workspace (edition 2024, zero external runtime deps)
 ├── DESIGN.md
 └── crates/
-    ├── qjs-unicode/            # Port of libunicode.c + libunicode-table.h
-    ├── qjs-dtoa/               # Port of dtoa.c (ES Number <-> string)
-    ├── qjs-bigint/             # Port of QuickJS-ng BigInt (charge + interrupt host)
-    ├── qjs-regexp/             # Port of libregexp.c (ES2025 /v /d modifiers, RegExpHost)
-    ├── qjs-syntax/             # SourceText, lexer, arena AST, early-error validator
-    ├── qjs-bytecode/           # Opcodes, IrOp, FunctionBytecode, DebugInfo, verifier, codec
-    ├── qjs-compiler/           # AST -> scoped IR -> resolve_vars -> resolve_labels -> Bytecode
-    ├── qjs-runtime/            # Unified GC/heap/rooting/objects/ops/VM/coroutines/modules/builtins/API
-    └── qjs-test262/            # Parallel test262 runner ($262 harness + differential oracle mode)
+    ├── sandbolt-unicode/            # Port of libunicode.c + libunicode-table.h
+    ├── sandbolt-dtoa/               # Port of dtoa.c (ES Number <-> string)
+    ├── sandbolt-bigint/             # Port of QuickJS-ng BigInt (charge + interrupt host)
+    ├── sandbolt-regexp/             # Port of libregexp.c (ES2025 /v /d modifiers, RegExpHost)
+    ├── sandbolt-syntax/             # SourceText, lexer, arena AST, early-error validator
+    ├── sandbolt-bytecode/           # Opcodes, IrOp, FunctionBytecode, DebugInfo, verifier, codec
+    ├── sandbolt-compiler/           # AST -> scoped IR -> resolve_vars -> resolve_labels -> Bytecode
+    ├── sandbolt-runtime/            # Unified GC/heap/rooting/objects/ops/VM/coroutines/modules/builtins/API
+    └── sandbolt-test262/            # Parallel test262 runner ($262 harness + differential oracle mode)
 ```
 
 ### Staged Phases (Sol 6.2 xhigh Swarm + Occasional Neon/Astra Advisor Reviews)
 
 - **Phase 1 (Freeze Core Seams & Vertical Slice)**:
-  - Build the workspace skeleton and freeze `qjs-bytecode` schemas, `RegExpHost`/`BigIntHost`, and `qjs-runtime`'s core memory/object/rooting/ops/VM seam (`Value`, `Heap`, `HeapLedger`, `Arena`, `RootScope`, `Handle`, `JsString`, `Atom`, `Shape`, `JsObject`, pre-declared `ObjectData`, `Realm`, `NativeFnId`, `CallFrame`).
+  - Build the workspace skeleton and freeze `sandbolt-bytecode` schemas, `RegExpHost`/`BigIntHost`, and `sandbolt-runtime`'s core memory/object/rooting/ops/VM seam (`Value`, `Heap`, `HeapLedger`, `Arena`, `RootScope`, `Handle`, `JsString`, `Atom`, `Shape`, `JsObject`, pre-declared `ObjectData`, `Realm`, `NativeFnId`, `CallFrame`).
   - Land a minimal working vertical slice that evaluates nested re-entrant callbacks under `gc_stress` + OOM failpoints, unwinds exceptions & interrupts, runs a Promise job, and checks cross-realm identity.
 - **Phase 2 (Parallel Foundation & Frontend Fan-Out — 6 concurrent workers)**:
-  - W1: `qjs-unicode` (+ differential test suite against C `libunicode`)
-  - W2: `qjs-dtoa` (+ differential test suite against C `dtoa`)
-  - W3: `qjs-bigint` (+ differential test suite against C `quickjs` BigInt)
-  - W4: `qjs-regexp` (+ differential test suite against C `lre-test` / `libregexp`)
-  - W5: `qjs-syntax` (full ES2025 lexer, parser, cover grammar, early errors)
-  - W6: `qjs-runtime` core object model, abstract operations (`ops/*`), and `Realm` bootstrap
+  - W1: `sandbolt-unicode` (+ differential test suite against C `libunicode`)
+  - W2: `sandbolt-dtoa` (+ differential test suite against C `dtoa`)
+  - W3: `sandbolt-bigint` (+ differential test suite against C `quickjs` BigInt)
+  - W4: `sandbolt-regexp` (+ differential test suite against C `lre-test` / `libregexp`)
+  - W5: `sandbolt-syntax` (full ES2025 lexer, parser, cover grammar, early errors)
+  - W6: `sandbolt-runtime` core object model, abstract operations (`ops/*`), and `Realm` bootstrap
 - **Phase 3 (Compiler, VM, Coroutines, Modules & Harness — 4 concurrent workers)**:
-  - W1: `qjs-compiler` (AST → scoped IR → `resolve_vars` → `resolve_labels` → bytecode)
-  - W2: `qjs-runtime::vm` (full opcode dispatch, frames, unwinding, exceptions, `eval`, `with`, interrupts, stack limits)
-  - W3: `qjs-runtime::vm::{coroutine, job, module}` (generators, async, async generators, Promises/microtasks, ES2025 TLA module graph)
-  - W4: `qjs-test262` parallel runner (`$262` harness, `createRealm`, `gc`, `detachArrayBuffer`, `IsHTMLDDA`, `agent`, differential C comparison)
+  - W1: `sandbolt-compiler` (AST → scoped IR → `resolve_vars` → `resolve_labels` → bytecode)
+  - W2: `sandbolt-runtime::vm` (full opcode dispatch, frames, unwinding, exceptions, `eval`, `with`, interrupts, stack limits)
+  - W3: `sandbolt-runtime::vm::{coroutine, job, module}` (generators, async, async generators, Promises/microtasks, ES2025 TLA module graph)
+  - W4: `sandbolt-test262` parallel runner (`$262` harness, `createRealm`, `gc`, `detachArrayBuffer`, `IsHTMLDDA`, `agent`, differential C comparison)
 - **Phase 4 (Parallel Builtins & Public API Fan-Out — 7-8 concurrent workers on disjoint files)**:
   - W1: `Object`, `Function`, `Error`/`AggregateError`/`SuppressedError`, `Reflect`, `Proxy`
   - W2: `Array`, `Iterator` helpers (+ `Iterator.zip`/`zipKeyed`, `Array.fromAsync`), `DisposableStack`/`AsyncDisposableStack`
@@ -120,7 +120,7 @@ quickjs-port/
   - W5: `Map`, `Set`, `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`, `Symbol`
   - W6: `ArrayBuffer`, `SharedArrayBuffer`, `TypedArray` (including `Float16Array` + base64/hex), `DataView`, `Atomics`
   - W7: `Promise`, `JSON`, QuickJS-ng globals (`DOMException`, `performance`, `atob`, `btoa`, `queueMicrotask`), bytecode serialization codec
-  - W8: Public idiomatic Rust API (`qjs-runtime::api`), Arko `code_mode::Interpreter` acceptance test suite, and snapshot-hook invariant tests
+  - W8: Public idiomatic Rust API (`sandbolt-runtime::api`), Arko `code_mode::Interpreter` acceptance test suite, and snapshot-hook invariant tests
 - **Phase 5 (Conformance Drive to 0 Errors)**:
   - Run QuickJS-ng core `tests/`, Arko `code_mode` acceptance tests, `gc_stress`, OOM failpoints, and full `test262` (`-m -c test262.conf -a`).
   - Cluster failures by root cause, dispatch parallel Sol 6.2 xhigh fix workers + `review-sol62` audits (consulting Neon + Astra on genuinely subtle spec conflicts), and drive `test262` down to **0 errors** (including fixing upstream's 49 known failures).

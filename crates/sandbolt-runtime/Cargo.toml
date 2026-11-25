@@ -1,0 +1,22 @@
+[package]
+name = "sandbolt-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+gc_stress = []
+
+[dependencies]
+sandbolt-unicode.workspace = true
+sandbolt-dtoa.workspace = true
+sandbolt-bigint.workspace = true
+sandbolt-regexp.workspace = true
+sandbolt-syntax.workspace = true
+sandbolt-bytecode.workspace = true
+sandbolt-compiler.workspace = true
+
+[lints]
+workspace = true
