@@ -4,22 +4,22 @@ version = 4
 
 [[package]]
 name = "sandbolt"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sandbolt-runtime",
 ]
 
 [[package]]
 name = "sandbolt-bigint"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "sandbolt-bytecode"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "sandbolt-compiler"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sandbolt-bytecode",
  "sandbolt-regexp",
@@ -29,18 +29,18 @@ dependencies = [
 
 [[package]]
 name = "sandbolt-dtoa"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "sandbolt-regexp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sandbolt-unicode",
 ]
 
 [[package]]
 name = "sandbolt-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sandbolt-bigint",
  "sandbolt-bytecode",
@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "sandbolt-syntax"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sandbolt-dtoa",
  "sandbolt-regexp",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "sandbolt-test262"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sandbolt-bytecode",
  "sandbolt-compiler",
@@ -72,4 +72,4 @@ dependencies = [
 
 [[package]]
 name = "sandbolt-unicode"
-version = "0.1.0"
+version = "0.1.1"

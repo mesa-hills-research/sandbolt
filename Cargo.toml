@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -28,11 +28,11 @@ unreachable_pub = "warn"
 all = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
-sandbolt-unicode = { path = "crates/sandbolt-unicode", version = "0.1.0" }
-sandbolt-dtoa = { path = "crates/sandbolt-dtoa", version = "0.1.0" }
-sandbolt-bigint = { path = "crates/sandbolt-bigint", version = "0.1.0" }
-sandbolt-regexp = { path = "crates/sandbolt-regexp", version = "0.1.0" }
-sandbolt-syntax = { path = "crates/sandbolt-syntax", version = "0.1.0" }
-sandbolt-bytecode = { path = "crates/sandbolt-bytecode", version = "0.1.0" }
-sandbolt-compiler = { path = "crates/sandbolt-compiler", version = "0.1.0" }
-sandbolt-runtime = { path = "crates/sandbolt-runtime", version = "0.1.0" }
+sandbolt-unicode = { path = "crates/sandbolt-unicode", version = "0.1.1" }
+sandbolt-dtoa = { path = "crates/sandbolt-dtoa", version = "0.1.1" }
+sandbolt-bigint = { path = "crates/sandbolt-bigint", version = "0.1.1" }
+sandbolt-regexp = { path = "crates/sandbolt-regexp", version = "0.1.1" }
+sandbolt-syntax = { path = "crates/sandbolt-syntax", version = "0.1.1" }
+sandbolt-bytecode = { path = "crates/sandbolt-bytecode", version = "0.1.1" }
+sandbolt-compiler = { path = "crates/sandbolt-compiler", version = "0.1.1" }
+sandbolt-runtime = { path = "crates/sandbolt-runtime", version = "0.1.1" }
