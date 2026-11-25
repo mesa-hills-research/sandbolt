@@ -1007,3 +1007,190 @@ fn json_widens_its_text_at_the_first_wide_unit() {
         assert_eq!(eval(&mut engine, code), expected, "{code}");
     }
 }
+
+#[test]
+fn json_stringify_fast_paths_handle_mutations_and_edge_cases() {
+    let (mut engine, _) = engine();
+    for (code, expected) in [
+        // Leaf object primitives, special numbers, escapes, undefined/symbol omission, indentation.
+        (
+            r#"JSON.stringify({ a: undefined, b: Symbol('s'), c: -0, d: NaN, e: Infinity, f: -Infinity, g: -2147483648, h: 2147483647, i: 2147483648, j: 1.5, k: 'a"b\\c\n\t\x00\x1f\u00e9' })"#,
+            r#"{"c":0,"d":null,"e":null,"f":null,"g":-2147483648,"h":2147483647,"i":2147483648,"j":1.5,"k":"a\"b\\c\n\t\u0000\u001f"#.to_owned() + "\u{e9}\"}",
+        ),
+        (
+            r#"JSON.stringify({ a: undefined, b: Symbol() }, null, 2)"#,
+            "{}".to_owned(),
+        ),
+        (
+            r#"JSON.stringify({ a: 1 }, null, 2)"#,
+            "{\n  \"a\": 1\n}".to_owned(),
+        ),
+        // Large array-index string keys (>= 2^30) still sort before non-index keys.
+        (
+            r#"JSON.stringify({ b: 1, "2000000000": 2, a: 3 })"#,
+            r#"{"2000000000":2,"b":1,"a":3}"#.to_owned(),
+        ),
+        (
+            r#"JSON.stringify({ b: { x: 1 }, "2000000000": 2, a: 3 })"#,
+            r#"{"2000000000":2,"b":{"x":1},"a":3}"#.to_owned(),
+        ),
+        // toJSON mutating parent object and sibling slots mid-stringify.
+        (
+            r#"(() => {
+                const o = { a: { toJSON() { delete o.b; o.c = 9; o.d = 4; return 1; } }, b: 2, d: 3 };
+                return JSON.stringify(o);
+            })()"#,
+            r#"{"a":1,"d":4}"#.to_owned(),
+        ),
+        // toJSON adding Object.prototype.toJSON mid-stringify invalidates prototype cache.
+        (
+            r#"(() => {
+                const first = { x: 1 };
+                const trigger = { toJSON() { Object.prototype.toJSON = function() { return 'patched'; }; return 2; } };
+                const second = { x: 3 };
+                try {
+                    return JSON.stringify([first, trigger, second]);
+                } finally {
+                    delete Object.prototype.toJSON;
+                }
+            })()"#,
+            r#"[{"x":1},2,"patched"]"#.to_owned(),
+        ),
+        // Non-enumerable toJSON is still invoked on nested objects.
+        (
+            r#"(() => {
+                const o = { a: 1 };
+                Object.defineProperty(o, 'toJSON', { value() { return 42; }, enumerable: false });
+                return JSON.stringify([o, { nested: o }]);
+            })()"#,
+            "[42,{\"nested\":42}]".to_owned(),
+        ),
+        // BigInt fails by default and respects BigInt.prototype.toJSON.
+        (
+            r#"(() => {
+                let threw = false;
+                try { JSON.stringify({ a: 1, b: 2n }); } catch (e) { threw = e instanceof TypeError; }
+                BigInt.prototype.toJSON = function() { return this.toString(); };
+                try {
+                    return threw + '|' + JSON.stringify({ a: 1, b: 2n }) + '|' + JSON.stringify([1, 2n]);
+                } finally {
+                    delete BigInt.prototype.toJSON;
+                }
+            })()"#,
+            r#"true|{"a":1,"b":"2"}|[1,"2"]"#.to_owned(),
+        ),
+        // Sparse array holes still consult Array.prototype.
+        (
+            r#"(() => {
+                Array.prototype[1] = 'proto';
+                try {
+                    const a = [1, , 3];
+                    return JSON.stringify(a);
+                } finally {
+                    delete Array.prototype[1];
+                }
+            })()"#,
+            r#"[1,"proto",3]"#.to_owned(),
+        ),
+        // Boxed primitives, functions, rawJSON, and cyclic checks.
+        (
+            r#"JSON.stringify({ n: new Number(7), s: new String('hi'), b: new Boolean(false), f: () => 1, r: JSON.rawJSON('123') })"#,
+            r#"{"n":7,"s":"hi","b":false,"r":123}"#.to_owned(),
+        ),
+        (
+            r#"JSON.stringify([() => 1, Symbol(), undefined, JSON.rawJSON('456')])"#,
+            "[null,null,null,456]".to_owned(),
+        ),
+        (
+            r#"(() => {
+                const o = {}; o.self = o;
+                const a = []; a.push(a);
+                let ok = true;
+                try { JSON.stringify(o); ok = false; } catch (e) { ok &&= e instanceof TypeError; }
+                try { JSON.stringify(a); ok = false; } catch (e) { ok &&= e instanceof TypeError; }
+                return ok;
+            })()"#,
+            "true".to_owned(),
+        ),
+    ] {
+        assert_eq!(eval(&mut engine, code), expected, "{code}");
+    }
+}
+
+#[test]
+fn json_parse_fast_paths_handle_numbers_strings_keys_and_interrupts() {
+    let (mut engine, _) = engine();
+    for (code, expected) in [
+        // Signed zero and integer/float boundaries.
+        (
+            r#"Object.is(JSON.parse('-0'), -0) && Object.is(JSON.parse('0'), 0)"#,
+            "true",
+        ),
+        (
+            r#"JSON.parse('[-2147483648,2147483647,2147483648,-2147483649,9007199254740991,-9007199254740991,1.25,-0.0005,1e30,1e-30]').join('|')"#,
+            "-2147483648|2147483647|2147483648|-2147483649|9007199254740991|-9007199254740991|1.25|-0.0005|1e+30|1e-30",
+        ),
+        (
+            r#"JSON.parse('1e500') === Infinity && JSON.parse('-1e500') === -Infinity"#,
+            "true",
+        ),
+        // Short inline escaped strings, empty/single-char strings, long strings, and UTF-16 input.
+        (
+            r#"(() => {
+                const a = JSON.parse('["","a","a\\nb\\u00e9","' + 'x'.repeat(40) + '","' + 'x'.repeat(35) + '\\n\\t"]');
+                return a[0] === '' && a[1] === 'a' && a[2] === 'a\nb\u00e9' && a[3].length === 40 && a[4] === 'x'.repeat(35) + '\n\t';
+            })()"#,
+            "true",
+        ),
+        (
+            r#"(() => {
+                const v = JSON.parse('["\u20ac","a\\nb",123]');
+                return v[0] === '\u20ac' && v[1] === 'a\nb' && v[2] === 123;
+            })()"#,
+            "true",
+        ),
+        // Duplicate keys in both shared and dictionary shapes, plus __proto__, empty, and Latin-1 keys.
+        (
+            r#"(() => {
+                const shared = JSON.parse('{"a":1,"b":2,"a":3}');
+                let parts = [];
+                for (let i = 0; i < 80; i++) parts.push('"k' + i + '":' + i);
+                parts.push('"k5":999');
+                const dict = JSON.parse('{' + parts.join(',') + '}');
+                const proto = JSON.parse('{"__proto__":{"x":1},"":2}');
+                const latin = JSON.parse('[{"caf\u00e9":1},{"caf\u00e9":2}]');
+                return shared.a === 3 && shared.b === 2
+                    && dict.k5 === 999 && dict.k79 === 79
+                    && Object.getPrototypeOf(proto) === Object.prototype
+                    && Object.getOwnPropertyDescriptor(proto, '__proto__').value.x === 1
+                    && proto[''] === 2
+                    && latin[0]['caf\u00e9'] === 1 && latin[1]['caf\u00e9'] === 2;
+            })()"#,
+            "true",
+        ),
+    ] {
+        assert_eq!(eval(&mut engine, code), expected, "{code}");
+    }
+
+    // Interrupt polling during large flat JSON.parse arrays.
+    let (mut interrupted_engine, _) = self::engine();
+    eval(
+        &mut interrupted_engine,
+        "globalThis.big = '[' + '0,'.repeat(2500) + '0]';",
+    );
+    let polls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    interrupted_engine
+        .runtime_mut()
+        .set_interrupt_handler(Some(Box::new({
+            let polls = polls.clone();
+            move || {
+                polls.set(polls.get() + 1);
+                polls.get() >= 2
+            }
+        })));
+    let err = interrupted_engine
+        .eval_to_string("JSON.parse(big)", crate::api::EvalOptions::default())
+        .unwrap_err();
+    assert_eq!(err, crate::EngineError::Interrupted);
+    assert!(polls.get() >= 2);
+}

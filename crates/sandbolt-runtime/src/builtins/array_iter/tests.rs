@@ -765,3 +765,82 @@ static CALLBACKS: [NativeFn; 15] = [
     reject_53,
     no_args,
 ];
+
+#[test]
+fn array_from_fast_paths_handle_mutations_and_subclasses() {
+    use crate::api::{EvalOptions, JsEngine};
+
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let eval = |engine: &mut JsEngine, code: &str| {
+        engine.eval_to_string(code, EvalOptions::default()).unwrap()
+    };
+
+    for (code, expected) in [
+        // Plain array-like without mapper populates own undefined elements.
+        (
+            r#"(() => {
+                const a = Array.from({ length: 3 });
+                return a.length === 3 && (0 in a) && (2 in a) && a[1] === undefined;
+            })()"#,
+            "true",
+        ),
+        // Mapper mutating source[i] mid-loop invalidates the index-free cache.
+        (
+            r#"(() => {
+                const src = { length: 4 };
+                const a = Array.from(src, (v, i) => {
+                    if (i === 0) src[2] = 'added';
+                    return String(v) + ':' + i;
+                });
+                return a.join('|');
+            })()"#,
+            "undefined:0|undefined:1|added:2|undefined:3",
+        ),
+        // Mapper mutating Object.prototype[i] mid-loop invalidates the prototype cache.
+        (
+            r#"(() => {
+                const src = { length: 4 };
+                try {
+                    const a = Array.from(src, (v, i) => {
+                        if (i === 0) Object.prototype[2] = 'proto';
+                        return String(v);
+                    });
+                    return a.join('|');
+                } finally {
+                    delete Object.prototype[2];
+                }
+            })()"#,
+            "undefined|undefined|proto|undefined",
+        ),
+        // Mapper changing source's prototype mid-loop is observed.
+        (
+            r#"(() => {
+                const src = { length: 3 };
+                const a = Array.from(src, (v, i) => {
+                    if (i === 0) Object.setPrototypeOf(src, { 2: 'newproto' });
+                    return String(v);
+                });
+                return a.join('|');
+            })()"#,
+            "undefined|undefined|newproto",
+        ),
+        // Subclass and non-Array constructors plus frozen output error path.
+        (
+            r#"(() => {
+                class Sub extends Array {}
+                const sub = Sub.from({ length: 4 }, function(_, i) { return i + this.base; }, { base: 10 });
+                function Box(n) { this.n = n; }
+                const box = Array.from.call(Box, { length: 3 }, (_, i) => i * 2);
+                function Frozen(n) { const a = new Array(n); Object.freeze(a); return a; }
+                let threw = false;
+                try { Array.from.call(Frozen, { length: 2 }, (_, i) => i); } catch (e) { threw = e instanceof TypeError; }
+                return (sub instanceof Sub) && sub.join(',') === '10,11,12,13'
+                    && (box instanceof Box) && box.n === 3 && box.length === 3 && box[2] === 4
+                    && threw;
+            })()"#,
+            "true",
+        ),
+    ] {
+        assert_eq!(eval(&mut engine, code), expected, "{code}");
+    }
+}

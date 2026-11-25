@@ -423,17 +423,125 @@ fn construct_result<'s>(
     ctx.root(value)
 }
 
+#[inline]
+fn index_value(i: u64) -> Value {
+    if i <= i32::MAX as u64 {
+        Value::int32(i as i32)
+    } else {
+        Value::number(i as f64)
+    }
+}
+
+/// Returns `(src_shape, proto_and_shape)` when `src_id` is an ordinary object
+/// with an immutable shape carrying no array-index keys, and its prototype
+/// chain (at most one ordinary object, e.g. `Object.prototype`) also has an
+/// immutable shape with no array-index keys. Any read of an index below
+/// `INLINE_INDEX_LIMIT` on such an object is `undefined` as long as those
+/// shapes match.
+fn index_free_source_shapes(
+    heap: &crate::heap::Heap,
+    src_id: ObjId,
+) -> Option<(
+    crate::value::ShapeId,
+    Option<(ObjId, crate::value::ShapeId)>,
+)> {
+    let src_obj = heap.object(src_id);
+    if !matches!(src_obj.data, ObjectData::Ordinary)
+        || src_obj.flags.contains(ObjectFlags::IS_EXOTIC)
+    {
+        return None;
+    }
+    let src_shape_id = src_obj.shape;
+    let src_shape = heap.shape(src_shape_id);
+    if src_shape.is_mutable() || src_shape.has_index_key() {
+        return None;
+    }
+    let Some(proto_id) = src_shape.proto else {
+        return Some((src_shape_id, None));
+    };
+    let proto_obj = heap.object(proto_id);
+    if !matches!(proto_obj.data, ObjectData::Ordinary)
+        || proto_obj.flags.contains(ObjectFlags::IS_EXOTIC)
+    {
+        return None;
+    }
+    let proto_shape_id = proto_obj.shape;
+    let proto_shape = heap.shape(proto_shape_id);
+    if proto_shape.is_mutable() || proto_shape.has_index_key() || proto_shape.proto.is_some() {
+        return None;
+    }
+    Some((src_shape_id, Some((proto_id, proto_shape_id))))
+}
+
+#[inline]
+fn fast_push_output_index<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    output_id: ObjId,
+    i: u64,
+    value: Value,
+    val_root: &crate::root::MutRoot<'s>,
+) -> JsResult<bool> {
+    if i >= u64::from(crate::atom::INLINE_INDEX_LIMIT) {
+        return Ok(false);
+    }
+    let idx = i as u32;
+    let can_fast = {
+        let obj = ctx.heap().object(output_id);
+        obj.flags
+            .contains(ObjectFlags::FAST_ARRAY | ObjectFlags::EXTENSIBLE)
+            && match &obj.data {
+                ObjectData::Array(array) => {
+                    array.elements.len() == idx as usize
+                        && (idx < array.length || array.length_writable)
+                }
+                _ => false,
+            }
+    };
+    if !can_fast {
+        return Ok(false);
+    }
+    let pushed = {
+        let ObjectData::Array(array) =
+            &mut ctx.runtime.heap.objects.get_mut(output_id).unwrap().data
+        else {
+            unreachable!()
+        };
+        if array.elements.len() < array.elements.capacity() {
+            array.elements.push_reserved(value);
+            array.length = array.length.max(idx + 1);
+            true
+        } else {
+            false
+        }
+    };
+    if !pushed {
+        ctx.set(val_root, value);
+        ctx.allocate(|runtime| {
+            let ObjectData::Array(array) =
+                &mut runtime.heap.objects.get_mut(output_id).unwrap().data
+            else {
+                unreachable!()
+            };
+            array.elements.push(&runtime.heap.ledger, value)?;
+            array.length = array.length.max(idx + 1);
+            Ok(())
+        })?;
+        ctx.set(val_root, Value::UNDEFINED);
+    }
+    Ok(true)
+}
+
 fn from<'s>(ctx: &mut ExecCtx<'_, 's>, c: Handle<'s>, args: Args<'s>) -> JsResult<Value> {
     let source = arg(ctx, args, 0)?;
-    let mapper = arg(ctx, args, 1)?;
-    let this_arg = arg(ctx, args, 2)?;
-    let mapper = ctx.get(mapper);
+    let mapper_handle = arg(ctx, args, 1)?;
+    let this_handle = arg(ctx, args, 2)?;
+    let mapper = ctx.get(mapper_handle);
     if mapper != Value::UNDEFINED && !callable(ctx, mapper) {
         return Err(ctx.throw_type_error("Array.from mapper is not callable"));
     }
     let source_object = to_object(ctx, source)?;
     let method = get_method_v(ctx, source_object, source, symbol(ctx, WellKnown::Iterator))?;
-    let this_arg = ctx.get(this_arg);
+    let this_arg = ctx.get(this_handle);
     if let Some(method) = method {
         let result = construct_result(ctx, c, None)?;
         let output = ctx.get(result);
@@ -443,7 +551,9 @@ fn from<'s>(ctx: &mut ExecCtx<'_, 's>, c: Handle<'s>, args: Args<'s>) -> JsResul
                 let err = Err(ctx.throw_type_error("Array exceeds maximum length"));
                 return on_error(ctx, err, |ctx| IterRecord::close(ctx, record.object));
             }
-            ctx.check_interrupt()?;
+            if (i & 1023) == 0 {
+                ctx.check_interrupt()?;
+            }
             let Some(value) = IterRecord::step(ctx, record)? else {
                 set_len(ctx, result, i)?;
                 return Ok(output);
@@ -459,15 +569,73 @@ fn from<'s>(ctx: &mut ExecCtx<'_, 's>, c: Handle<'s>, args: Args<'s>) -> JsResul
     let len = get_length(ctx, source_object)?;
     let result = construct_result(ctx, c, Some(len))?;
     let output = ctx.get(result);
-    let source = ctx.get(source_object);
+    let output_id = output.as_object();
+    let src_id = ctx.get(source_object).as_object();
+    let has_mapper = mapper != Value::UNDEFINED;
+    let arg0 = ctx.mut_root(Value::UNDEFINED)?;
+    let arg1 = ctx.mut_root(Value::UNDEFINED)?;
+    debug_assert_eq!(arg1.handle().index(), arg0.handle().index() + 1);
+    let call_args = Args::new(arg0.handle().index(), 2);
+    let out_val = ctx.mut_root(Value::UNDEFINED)?;
+    let mut gc_epoch = ctx.heap().collection_count();
+    let mut index_free = src_id.and_then(|id| index_free_source_shapes(ctx.heap(), id));
     for i in 0..len {
-        ctx.with_scope(|ctx| {
+        if (i & 1023) == 0 {
             ctx.check_interrupt()?;
-            let source = ctx.root(source)?;
-            let value = get_index(ctx, source, i)?;
-            let value = ctx.root(value)?;
-            from_item(ctx, output, mapper, this_arg, i, value)
-        })?;
+        }
+        let item = if i < u64::from(crate::atom::INLINE_INDEX_LIMIT)
+            && let Some(id) = src_id
+            && let Some((src_shape, proto_check)) = index_free
+        {
+            let heap = ctx.heap();
+            let valid = if heap.collection_count() == gc_epoch {
+                heap.object(id).shape == src_shape
+                    && proto_check.is_none_or(|(proto_id, proto_shape)| {
+                        heap.object(proto_id).shape == proto_shape
+                    })
+            } else {
+                gc_epoch = heap.collection_count();
+                index_free = index_free_source_shapes(heap, id);
+                index_free.is_some()
+            };
+            if valid {
+                Value::UNDEFINED
+            } else {
+                index_free = None;
+                let source = ctx.get(source_object);
+                ctx.with_scope(|ctx| {
+                    let source = ctx.root(source)?;
+                    get_index(ctx, source, i)
+                })?
+            }
+        } else {
+            let source = ctx.get(source_object);
+            ctx.with_scope(|ctx| {
+                let source = ctx.root(source)?;
+                get_index(ctx, source, i)
+            })?
+        };
+        let mapped = if has_mapper {
+            ctx.set(&arg0, item);
+            ctx.set(&arg1, index_value(i));
+            let v = call(ctx, mapper_handle, this_handle, call_args)?;
+            ctx.set(&arg0, Value::UNDEFINED);
+            v
+        } else {
+            item
+        };
+        if let Some(out_id) = output_id
+            && fast_push_output_index(ctx, out_id, i, mapped, &out_val)?
+        {
+            continue;
+        }
+        ctx.set(&out_val, mapped);
+        let status = ctx.with_scope(|ctx| {
+            let result = ctx.root(output)?;
+            create_index(ctx, result, i, mapped)
+        });
+        ctx.set(&out_val, Value::UNDEFINED);
+        status?;
     }
     set_len(ctx, result, len)?;
     Ok(output)
@@ -501,7 +669,7 @@ fn from_item<'s>(
     let value = if mapper != Value::UNDEFINED {
         let mapper = ctx.root(mapper)?;
         let this = ctx.root(this)?;
-        let index = ctx.root(Value::number(i as f64))?;
+        let index = ctx.root(index_value(i))?;
         let args = ctx.args(&[value, index])?;
         call(ctx, mapper, this, args)?
     } else {

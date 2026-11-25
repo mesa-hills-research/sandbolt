@@ -279,6 +279,63 @@ fn primitive_to_numeric<'s>(ctx: &mut ExecCtx<'_, 's>, value: Handle<'s>) -> JsR
     }
 }
 
+#[inline]
+fn int32_for_string_add(value: Value) -> Option<i32> {
+    match value.decode() {
+        ValueKind::Int32(n) => Some(n),
+        ValueKind::Float64(f) if f.is_finite() => {
+            let n = f as i32;
+            (f64::from(n) == f).then_some(n)
+        }
+        _ => None,
+    }
+}
+
+fn fast_string_int_add(
+    ctx: &mut ExecCtx<'_, '_>,
+    str_id: StrId,
+    number: i32,
+    str_first: bool,
+) -> JsResult<Option<Value>> {
+    let mut num_buf = [0u8; 16];
+    let num_len = sandbolt_dtoa::i32toa(&mut num_buf, number);
+    let num_bytes = &num_buf[..num_len];
+    let (total, is_ascii, data) = {
+        let string = ctx.heap().string(str_id);
+        let Some(bytes) = string.as_latin1() else {
+            return Ok(None);
+        };
+        let total = bytes.len() + num_bytes.len();
+        if total > crate::string::INLINE_LATIN1_CAPACITY {
+            return Ok(None);
+        }
+        let mut data = [0u8; crate::string::INLINE_LATIN1_CAPACITY];
+        if str_first {
+            data[..bytes.len()].copy_from_slice(bytes);
+            data[bytes.len()..total].copy_from_slice(num_bytes);
+        } else {
+            data[..num_bytes.len()].copy_from_slice(num_bytes);
+            data[num_bytes.len()..total].copy_from_slice(bytes);
+        }
+        (total, string.is_ascii(), data)
+    };
+    if total == 1
+        && data[0] < 128
+        && let Some(ch) = ctx.heap().atoms.ascii_string(data[0] as usize)
+    {
+        return Ok(Some(Value::string(ch)));
+    }
+    let id = ctx.allocate(|runtime| {
+        let s = crate::string::JsString::InlineLatin1 {
+            len: total as u8,
+            is_ascii,
+            data,
+        };
+        runtime.heap.strings.insert(&runtime.heap.ledger, s)
+    })?;
+    Ok(Some(Value::string(id)))
+}
+
 pub(super) fn binary<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     op: Opcode,
@@ -294,6 +351,18 @@ pub(super) fn binary<'s>(
         return bigint_binary(ctx, op, a, b);
     }
     let (left, right) = if op == Add {
+        if let ValueKind::String(str_id) = a.decode()
+            && let Some(n) = int32_for_string_add(b)
+            && let Some(joined) = fast_string_int_add(ctx, str_id, n, true)?
+        {
+            return Ok(joined);
+        }
+        if let ValueKind::String(str_id) = b.decode()
+            && let Some(n) = int32_for_string_add(a)
+            && let Some(joined) = fast_string_int_add(ctx, str_id, n, false)?
+        {
+            return Ok(joined);
+        }
         let a = convert::to_primitive(ctx, left, PreferredType::Default)?;
         let left = ctx.root(a)?;
         let b = convert::to_primitive(ctx, right, PreferredType::Default)?;
@@ -1022,5 +1091,44 @@ mod tests {
             result,
             "true|true|true|true|true|64|true|true|9007199254740992|9007199254740996"
         );
+    }
+
+    #[test]
+    fn string_int_add_fast_path_matches_spec_boundaries() {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        let result = engine
+            .eval_to_string(
+                r#"
+            const s28 = 'a'.repeat(28);
+            const f1 = 1.5 - 0.5;
+            [
+                ('x' + (-0)) === 'x0',
+                ((-0) + 'x') === '0x',
+                ('' + 5) === '5',
+                (5 + '') === '5',
+                ('x' + (-2147483648)) === 'x-2147483648',
+                ((-2147483648) + 'x') === '-2147483648x',
+                ('x' + 2147483647) === 'x2147483647',
+                ('x' + 2147483648) === 'x2147483648',
+                ('x' + (-2147483649)) === 'x-2147483649',
+                ('x' + 1.5) === 'x1.5',
+                ('x' + NaN) === 'xNaN',
+                ('x' + Infinity) === 'xInfinity',
+                ('\u00e9' + 42) === '\u00e942',
+                (42 + '\u00e9') === '42\u00e9',
+                ('\u00e9' + 42).charCodeAt(0) === 0xe9,
+                (s28 + 99) === s28 + '99',
+                (s28 + 100) === s28 + '100',
+                (99 + s28) === '99' + s28,
+                (100 + s28) === '100' + s28,
+                ('\u{1f600}' + 42) === '\u{1f600}42',
+                (42 + '\u{1f600}') === '42\u{1f600}',
+                ('item_' + f1) === 'item_1',
+            ].every(Boolean)
+        "#,
+                EvalOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(result, "true");
     }
 }

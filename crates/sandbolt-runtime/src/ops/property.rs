@@ -1838,6 +1838,23 @@ fn define_new_slot(
     })
 }
 
+pub(crate) fn define_plain_data(
+    ctx: &mut ExecCtx<'_, '_>,
+    id: ObjId,
+    key: PropKey,
+    value: Value,
+) -> JsResult<()> {
+    define_slot(
+        ctx,
+        id,
+        ShapeProp {
+            key,
+            flags: PropFlags::DEFAULT_DATA,
+        },
+        value,
+    )
+}
+
 fn define_slot(
     ctx: &mut ExecCtx<'_, '_>,
     id: ObjId,
