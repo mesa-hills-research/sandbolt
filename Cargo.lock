@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "sandbolt"
+version = "0.1.0"
+dependencies = [
+ "sandbolt-runtime",
+]
+
+[[package]]
 name = "sandbolt-bigint"
 version = "0.1.0"
 

@@ -10,6 +10,7 @@ members = [
     "crates/sandbolt-compiler",
     "crates/sandbolt-runtime",
     "crates/sandbolt-test262",
+    "crates/sandbolt",
 ]
 
 [workspace.package]
@@ -17,6 +18,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
+repository = "https://github.com/mesa-hills-research/sandbolt"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -26,11 +28,11 @@ unreachable_pub = "warn"
 all = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
-sandbolt-unicode = { path = "crates/sandbolt-unicode" }
-sandbolt-dtoa = { path = "crates/sandbolt-dtoa" }
-sandbolt-bigint = { path = "crates/sandbolt-bigint" }
-sandbolt-regexp = { path = "crates/sandbolt-regexp" }
-sandbolt-syntax = { path = "crates/sandbolt-syntax" }
-sandbolt-bytecode = { path = "crates/sandbolt-bytecode" }
-sandbolt-compiler = { path = "crates/sandbolt-compiler" }
-sandbolt-runtime = { path = "crates/sandbolt-runtime" }
+sandbolt-unicode = { path = "crates/sandbolt-unicode", version = "0.1.0" }
+sandbolt-dtoa = { path = "crates/sandbolt-dtoa", version = "0.1.0" }
+sandbolt-bigint = { path = "crates/sandbolt-bigint", version = "0.1.0" }
+sandbolt-regexp = { path = "crates/sandbolt-regexp", version = "0.1.0" }
+sandbolt-syntax = { path = "crates/sandbolt-syntax", version = "0.1.0" }
+sandbolt-bytecode = { path = "crates/sandbolt-bytecode", version = "0.1.0" }
+sandbolt-compiler = { path = "crates/sandbolt-compiler", version = "0.1.0" }
+sandbolt-runtime = { path = "crates/sandbolt-runtime", version = "0.1.0" }
