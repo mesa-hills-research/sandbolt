@@ -874,7 +874,61 @@ pub(crate) fn run_frame(
                             stack[sp] = value;
                             sp += 1;
                         }
-                        FastOp::PutVarRef(n) | FastOp::SetVarRef(n) => {
+                        FastOp::GetLocCheck(n) => {
+                            let value = stack[var_base + usize::from(n)];
+                            if value == Value::UNINITIALIZED {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            }
+                            stack[sp] = value;
+                            sp += 1;
+                        }
+                        FastOp::PutLocCheck(n) => {
+                            let slot = var_base + usize::from(n);
+                            if stack[slot] == Value::UNINITIALIZED {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            }
+                            sp -= 1;
+                            stack[slot] = stack[sp];
+                        }
+                        FastOp::PutLocCheckInit(n) => {
+                            let slot = var_base + usize::from(n);
+                            if stack[slot] != Value::UNINITIALIZED {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            }
+                            sp -= 1;
+                            stack[slot] = stack[sp];
+                        }
+                        FastOp::SetLocUninitialized(n) => {
+                            stack[var_base + usize::from(n)] = Value::UNINITIALIZED;
+                        }
+                        FastOp::GetVarRefCheck(n) => {
+                            let ObjectData::BytecodeFunction(data) =
+                                &heap.object(frame.callee).data
+                            else {
+                                unreachable!()
+                            };
+                            let Some(ValueKind::VarRef(id)) =
+                                data.closure.get(usize::from(n)).map(|v| v.decode())
+                            else {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            };
+                            let value = match heap.var_refs.get(id).unwrap().state {
+                                VarRefState::OpenStack(i) => stack[i as usize],
+                                VarRefState::OpenCoro { coro, local } => {
+                                    heap.coroutines.get(coro).unwrap().stack[local as usize]
+                                }
+                                VarRefState::Closed(value) => value,
+                            };
+                            if value == Value::UNINITIALIZED {
+                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            }
+                            stack[sp] = value;
+                            sp += 1;
+                        }
+                        FastOp::PutVarRef(n)
+                        | FastOp::SetVarRef(n)
+                        | FastOp::PutVarRefCheck(n)
+                        | FastOp::PutVarRefCheckInit(n) => {
                             let ObjectData::BytecodeFunction(data) =
                                 &heap.object(frame.callee).data
                             else {
@@ -886,6 +940,22 @@ pub(crate) fn run_frame(
                                 break FastBreak::Slow(orig_pcs[cur_ip]);
                             };
                             let value = stack[sp - 1];
+                            if matches!(
+                                op,
+                                FastOp::PutVarRefCheck(_) | FastOp::PutVarRefCheckInit(_)
+                            ) {
+                                let current = match heap.var_refs.get(id).unwrap().state {
+                                    VarRefState::OpenStack(i) => stack[i as usize],
+                                    VarRefState::OpenCoro { coro, local } => {
+                                        heap.coroutines.get(coro).unwrap().stack[local as usize]
+                                    }
+                                    VarRefState::Closed(value) => value,
+                                };
+                                let uninitialized = current == Value::UNINITIALIZED;
+                                if uninitialized == matches!(op, FastOp::PutVarRefCheck(_)) {
+                                    break FastBreak::Slow(orig_pcs[cur_ip]);
+                                }
+                            }
                             let entry = heap.var_refs.get_mut(id).unwrap();
                             match entry.state {
                                 VarRefState::OpenStack(i) => stack[i as usize] = value,
@@ -895,7 +965,7 @@ pub(crate) fn run_frame(
                                 }
                                 VarRefState::Closed(_) => entry.state = VarRefState::Closed(value),
                             }
-                            if matches!(op, FastOp::PutVarRef(_)) {
+                            if !matches!(op, FastOp::SetVarRef(_)) {
                                 sp -= 1;
                             }
                         }

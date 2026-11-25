@@ -20,8 +20,14 @@ pub(crate) enum FastOp {
     SpecialObject(u8),
     PushConst(u32),
     PushRegExpConst(u32),
-    PushConstRepeat { index: u32, count: u16 },
-    PushConstSeq { start: u32, count: u16 },
+    PushConstRepeat {
+        index: u32,
+        count: u16,
+    },
+    PushConstSeq {
+        start: u32,
+        count: u16,
+    },
     Drop,
     Dup,
     Dup1,
@@ -46,6 +52,15 @@ pub(crate) enum FastOp {
     GetVarRef(u16),
     PutVarRef(u16),
     SetVarRef(u16),
+    /// The checked forms of lexical bindings' loads and stores. A binding
+    /// in its temporal dead zone takes the slow path, which throws.
+    GetLocCheck(u16),
+    PutLocCheck(u16),
+    PutLocCheckInit(u16),
+    SetLocUninitialized(u16),
+    GetVarRefCheck(u16),
+    PutVarRefCheck(u16),
+    PutVarRefCheckInit(u16),
     IncLoc(u16),
     DecLoc(u16),
     IncArg(u16),
@@ -56,9 +71,16 @@ pub(crate) enum FastOp {
     AddPutLoc(u16),
     SubPutLoc(u16),
     GetLoc2Mul(u16, u16),
-    GetLoc2MulAddLoc { dst: u8, a: u8, b: u8 },
+    GetLoc2MulAddLoc {
+        dst: u8,
+        a: u8,
+        b: u8,
+    },
     GetLoc2Add(u16, u16),
-    GetLocAddLoc { dst: u16, src: u16 },
+    GetLocAddLoc {
+        dst: u16,
+        src: u16,
+    },
     Add,
     Sub,
     Mul,
@@ -111,21 +133,65 @@ pub(crate) enum FastOp {
     StrictEqIfTrue(u32),
     StrictNeqIfFalse(u32),
     StrictNeqIfTrue(u32),
-    IncLocGoto { loc: u16, target: u32 },
-    DecLocGoto { loc: u16, target: u32 },
-    GetLocLtArgIfFalse { loc: u8, arg: u8, target: u32 },
-    GetLocLtLocIfFalse { a: u8, b: u8, target: u32 },
-    GetLocLtImmIfFalse { loc: u8, imm: u16, target: u32 },
-    GetLocLteArgIfFalse { loc: u8, arg: u8, target: u32 },
-    GetLocLteLocIfFalse { a: u8, b: u8, target: u32 },
-    GetLocLteImmIfFalse { loc: u8, imm: u16, target: u32 },
+    IncLocGoto {
+        loc: u16,
+        target: u32,
+    },
+    DecLocGoto {
+        loc: u16,
+        target: u32,
+    },
+    GetLocLtArgIfFalse {
+        loc: u8,
+        arg: u8,
+        target: u32,
+    },
+    GetLocLtLocIfFalse {
+        a: u8,
+        b: u8,
+        target: u32,
+    },
+    GetLocLtImmIfFalse {
+        loc: u8,
+        imm: u16,
+        target: u32,
+    },
+    GetLocLteArgIfFalse {
+        loc: u8,
+        arg: u8,
+        target: u32,
+    },
+    GetLocLteLocIfFalse {
+        a: u8,
+        b: u8,
+        target: u32,
+    },
+    GetLocLteImmIfFalse {
+        loc: u8,
+        imm: u16,
+        target: u32,
+    },
     GetField(u16),
     GetField2(u16),
     PutField(u16),
-    GetLocGetField { loc: u16, ic: u16 },
-    GetLocGetFieldAddLoc { dst: u8, obj: u8, ic: u16 },
-    PutLocField { obj: u8, val: u8, ic: u16 },
-    GetLocGetVarAddLoc { dst: u8, ic: u16 },
+    GetLocGetField {
+        loc: u16,
+        ic: u16,
+    },
+    GetLocGetFieldAddLoc {
+        dst: u8,
+        obj: u8,
+        ic: u16,
+    },
+    PutLocField {
+        obj: u8,
+        val: u8,
+        ic: u16,
+    },
+    GetLocGetVarAddLoc {
+        dst: u8,
+        ic: u16,
+    },
     GetVar(u16),
     GetVarUndef(u16),
     PutVar(u16),
@@ -136,11 +202,29 @@ pub(crate) enum FastOp {
     GetArrayEl,
     GetArrayEl2,
     PutArrayEl,
-    GetLoc2ArrayEl { arr: u16, idx: u16 },
-    GetLoc2ArrayElAddLoc { dst: u8, arr: u8, idx: u8 },
-    GetLocImmArrayEl { arr: u8, idx: u16 },
-    GetLocImmArrayElAddLoc { dst: u8, arr: u8, idx: u16 },
-    PutLocImmArrayEl { arr: u8, idx: u16, val: u8 },
+    GetLoc2ArrayEl {
+        arr: u16,
+        idx: u16,
+    },
+    GetLoc2ArrayElAddLoc {
+        dst: u8,
+        arr: u8,
+        idx: u8,
+    },
+    GetLocImmArrayEl {
+        arr: u8,
+        idx: u16,
+    },
+    GetLocImmArrayElAddLoc {
+        dst: u8,
+        arr: u8,
+        idx: u16,
+    },
+    PutLocImmArrayEl {
+        arr: u8,
+        idx: u16,
+        val: u8,
+    },
     Delete,
     ForOfStart,
     ForOfNext(u16),
@@ -286,6 +370,168 @@ fn as_plain_opcode(op: MidOp) -> Option<Opcode> {
     }
 }
 
+/// Marks the checked loads and stores of lexical bindings that can't find
+/// their binding uninitialized, following each binding's state along every
+/// path through the code. Dropping those checks lets loops over `let`
+/// bindings fuse as loops over `var` bindings do. Only slots the code sets
+/// uninitialized are followed, and nothing is assumed where control enters
+/// from elsewhere (the start, an exception handler, the end of a `finally`).
+fn initialized_checks(function: &CompiledFunc, raw: &[(u32, Instruction)]) -> Vec<bool> {
+    use Opcode::*;
+    let mut unchecked = vec![false; raw.len()];
+    let mut lexical: Vec<u16> = raw
+        .iter()
+        .filter_map(|&(_, inst)| match (inst.opcode, inst.operands) {
+            (SetLocUninitialized, Operands::Local(n)) => Some(n),
+            _ => None,
+        })
+        .collect();
+    lexical.sort_unstable();
+    lexical.dedup();
+    // A reference to a local, or code evaluated into the function, can
+    // reach a slot past this analysis.
+    if lexical.is_empty()
+        || function.eval.is_some()
+        || raw.iter().any(|&(_, inst)| inst.opcode == MakeLocRef)
+    {
+        return unchecked;
+    }
+    let words = lexical.len().div_ceil(64);
+    let bit = |n: u16| {
+        lexical
+            .binary_search(&n)
+            .ok()
+            .map(|i| (i / 64, 1u64 << (i % 64)))
+    };
+    let index_of = |pc: i64| {
+        u32::try_from(pc)
+            .ok()
+            .and_then(|pc| raw.binary_search_by_key(&pc, |&(p, _)| p).ok())
+    };
+
+    let mut targets = vec![false; raw.len()];
+    for &(at, inst) in raw {
+        if let Some(i) = inst.branch_target(at).and_then(index_of) {
+            targets[i] = true;
+        }
+    }
+    // Where control can enter without passing through the code before.
+    let mut entries = vec![false; raw.len()];
+    if let Some(first) = entries.first_mut() {
+        *first = true;
+    }
+    for handler in function.handlers.iter() {
+        if let Some(i) = index_of(i64::from(handler.handler_pc)) {
+            entries[i] = true;
+        }
+    }
+    for (i, &(at, inst)) in raw.iter().enumerate() {
+        if inst.opcode == Catch
+            && let Some(i) = inst.branch_target(at).and_then(index_of)
+        {
+            entries[i] = true;
+        }
+        if inst.opcode == Gosub && i + 1 < raw.len() {
+            entries[i + 1] = true;
+        }
+    }
+
+    // A self-copy (`get_loc n`, maybe `close_loc n`, `put_loc n`) keeps the
+    // slot's state. Any other store of a plain value may store a copy of an
+    // uninitialized slot.
+    let copies_itself = |i: usize, n: u16| {
+        let mut j = i;
+        loop {
+            if j == 0 || entries[j] || targets[j] {
+                return false;
+            }
+            j -= 1;
+            match (raw[j].1.opcode, raw[j].1.operands) {
+                (CloseLoc, Operands::Local(m)) if m == n => {}
+                (GetLoc | GetLoc8 | GetLoc0 | GetLoc1 | GetLoc2 | GetLoc3, Operands::Local(m)) => {
+                    return m == n;
+                }
+                _ => return false,
+            }
+        }
+    };
+
+    // `state[i]` holds the slots initialized on every path into `i`.
+    let mut state = vec![!0u64; raw.len() * words];
+    for (i, &entry) in entries.iter().enumerate() {
+        if entry {
+            state[i * words..(i + 1) * words].fill(0);
+        }
+    }
+    let mut out = vec![0u64; words];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (i, &(at, inst)) in raw.iter().enumerate() {
+            out.copy_from_slice(&state[i * words..(i + 1) * words]);
+            let mut set = |n: u16, on: bool| {
+                if let Some((word, mask)) = bit(n) {
+                    if on {
+                        out[word] |= mask;
+                    } else {
+                        out[word] &= !mask;
+                    }
+                }
+            };
+            match (inst.opcode, inst.operands) {
+                (SetLocUninitialized, Operands::Local(n)) => set(n, false),
+                (GetLocCheck | PutLocCheck | PutLocCheckInit, Operands::Local(n)) => set(n, true),
+                (GetLoc | GetLoc8 | GetLoc0 | GetLoc1 | GetLoc2 | GetLoc3 | CloseLoc, _) => {}
+                (
+                    PutLoc | PutLoc8 | PutLoc0 | PutLoc1 | PutLoc2 | PutLoc3 | SetLoc | SetLoc8
+                    | SetLoc0 | SetLoc1 | SetLoc2 | SetLoc3,
+                    Operands::Local(n),
+                ) if copies_itself(i, n) => {}
+                (UsingDispose | UsingDisposeAsync, Operands::Local(n)) => {
+                    set(n, false);
+                    set(n.saturating_add(1), false);
+                }
+                (_, Operands::Local(n)) => set(n, false),
+                _ => {}
+            }
+            let falls_through = !matches!(
+                inst.opcode,
+                Goto | Goto8
+                    | Goto16
+                    | Return
+                    | ReturnUndef
+                    | ReturnAsync
+                    | Throw
+                    | ThrowError
+                    | Ret
+                    | TailCall
+                    | TailCallMethod
+            );
+            let next = (falls_through && i + 1 < raw.len()).then_some(i + 1);
+            let jump = inst.branch_target(at).and_then(index_of);
+            for successor in [next, jump].into_iter().flatten() {
+                let into = &mut state[successor * words..(successor + 1) * words];
+                for (word, &bits) in into.iter_mut().zip(&out) {
+                    let met = *word & bits;
+                    if met != *word {
+                        *word = met;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    for (i, &(_, inst)) in raw.iter().enumerate() {
+        if let (GetLocCheck | PutLocCheck, Operands::Local(n)) = (inst.opcode, inst.operands)
+            && let Some((word, mask)) = bit(n)
+        {
+            unchecked[i] = state[i * words + word] & mask != 0;
+        }
+    }
+    unchecked
+}
+
 impl FastProgram {
     pub(crate) fn compile(ledger: &HeapLedger, function: &CompiledFunc) -> AllocResult<Self> {
         use Opcode::*;
@@ -297,6 +543,18 @@ impl FastProgram {
             let inst = Instruction::decode(bytes, pc).expect("verified instruction");
             raw.push((pc as u32, inst));
             pc += usize::from(inst.opcode.info().size);
+        }
+        // (`get_loc` and `put_loc` are the size of their checked forms, so
+        // the program counters stay as they are.)
+        for (i, unchecked) in initialized_checks(function, &raw).into_iter().enumerate() {
+            if unchecked {
+                let inst = &mut raw[i].1;
+                inst.opcode = if inst.opcode == GetLocCheck {
+                    GetLoc
+                } else {
+                    PutLoc
+                };
+            }
         }
 
         // Mark all control-flow targets and exception-handler boundaries.
@@ -1139,6 +1397,13 @@ impl FastProgram {
                         SetVarRef | SetVarRef0 | SetVarRef1 | SetVarRef2 | SetVarRef3,
                         Operands::VarRef(n),
                     ) => FastOp::SetVarRef(n),
+                    (GetLocCheck, Operands::Local(n)) => FastOp::GetLocCheck(n),
+                    (PutLocCheck, Operands::Local(n)) => FastOp::PutLocCheck(n),
+                    (PutLocCheckInit, Operands::Local(n)) => FastOp::PutLocCheckInit(n),
+                    (SetLocUninitialized, Operands::Local(n)) => FastOp::SetLocUninitialized(n),
+                    (GetVarRefCheck, Operands::VarRef(n)) => FastOp::GetVarRefCheck(n),
+                    (PutVarRefCheck, Operands::VarRef(n)) => FastOp::PutVarRefCheck(n),
+                    (PutVarRefCheckInit, Operands::VarRef(n)) => FastOp::PutVarRefCheckInit(n),
                     (IncLoc, Operands::Local(n)) => FastOp::IncLoc(n),
                     (DecLoc, Operands::Local(n)) => FastOp::DecLoc(n),
                     (AddLoc, Operands::Local(n)) => FastOp::AddLoc(n),

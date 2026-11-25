@@ -1702,3 +1702,101 @@ fn wave4_fast_paths_preserve_edge_semantics() {
         "true|-2|3|true|12345|87.5|TypeError|7|42|0.5|0|54043196333752325|3533694129556768659166595001485837034313423785321069662050826523145928705|5164499756173817179311838344006023748659411585658447025661321926957383762014233473183475388885480707277793909531165589505|false|TypeError|true|false|99|0:10,1:20,2:30,01:999|1,2,4,2,6|77|true|true|30|true|false|true|123|true|false|0|8|11|5|ff|1.3|1.3|1.3e+1|NaN|Infinity|-Infinity|4"
     );
 }
+
+/// The fast program of global function `name` once `script` has run it.
+fn fast_ops(script: &str, name: &str) -> Vec<super::fast::FastOp> {
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    engine.eval(script, EvalOptions::default()).unwrap();
+    let realm = engine.default_realm();
+    engine.runtime_mut().with_scope(realm, |ctx| {
+        let global = ctx
+            .root(crate::Value::object(ctx.realm().global_object))
+            .unwrap();
+        let key = ctx.intern_str(name).unwrap();
+        let function = crate::ops::property::get_property(ctx, global, key).unwrap();
+        let crate::object::ObjectData::BytecodeFunction(data) =
+            &ctx.heap().object(function.as_object().unwrap()).data
+        else {
+            panic!("{name} isn't a function");
+        };
+        let compiled = ctx.heap().bytecode.get(data.code).unwrap();
+        let fast = compiled.compiled.as_ref().unwrap().fast.as_ref();
+        fast.expect("the function ran").ops.to_vec()
+    })
+}
+
+/// Loads and stores of `let` bindings that can't be in their temporal dead
+/// zone run unchecked, so a `let` loop runs the fast program a `var` loop
+/// does, with nothing left to the slow path.
+#[test]
+fn let_loops_run_without_checks_or_the_slow_path() {
+    use super::fast::FastOp;
+    for script in [
+        "function f(n) { let s = 0; for (let i = 0; i < n; i++) s += i; return s; } f(10);",
+        "function f(n) { const k = 2; let s = 0; let i = 0; while (i < n) { s += i * k; i++; } return s; } f(10);",
+        "function f(n) { let s = 0; for (let i = 0; i < n; i++) { let t = i + 1; s += t; } return s; } f(10);",
+    ] {
+        let ops = fast_ops(script, "f");
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op,
+                FastOp::Slow | FastOp::GetLocCheck(_) | FastOp::PutLocCheck(_)
+            )),
+            "{script}\n{ops:?}"
+        );
+    }
+}
+
+/// Where a binding may be uninitialized, reading or writing it still throws.
+#[test]
+fn bindings_that_may_be_uninitialized_keep_their_checks() {
+    let name = |body: &str| {
+        format!("(function () {{ try {{ {body} }} catch (e) {{ return e.constructor.name; }} }})()")
+    };
+    for (body, expected) in [
+        ("x; let x = 1; return x;", "ReferenceError"),
+        ("x = 2; let x = 1; return x;", "ReferenceError"),
+        (
+            "f(); let x = 1; function f() { return x; } return 'no';",
+            "ReferenceError",
+        ),
+        (
+            "for (let i = 0; i < 2; i++) { if (i === 1) return z; let z = i; } return 'no';",
+            "ReferenceError",
+        ),
+        (
+            "const h = (c) => { switch (c) { case 0: let x = 1; case 1: return x; } }; h(0); return h(1);",
+            "ReferenceError",
+        ),
+        (
+            "for (let i = 0; i < 3; i++) { if (i === 1) continue; if (i === 2) return y; } let y = 1; return 'no';",
+            "ReferenceError",
+        ),
+        (
+            "let r = []; for (let i = 0; i < 3; i++) { try { if (i) r.push(w); } catch (e) { r.push(e.constructor.name); } let w = i; r.push(w); } return r.join();",
+            "0,ReferenceError,1,ReferenceError,2",
+        ),
+        (
+            "let a; try { a = 1; throw 0; } catch { } finally { a += 1; } return a;",
+            "2",
+        ),
+        (
+            "function* g() { yield 1; let b = 2; yield b; } return [...g()].join();",
+            "1,2",
+        ),
+        (
+            "const fs = []; for (let i = 0; i < 3; i++) fs.push(() => i); return fs.map((f) => f()).join();",
+            "0,1,2",
+        ),
+        (
+            "let s = 0; outer: for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) { if (j === 1) continue outer; s += i + j; } } return s;",
+            "3",
+        ),
+        (
+            "class B { constructor() { this.v = 1; } } class C extends B { constructor() { this.v; super(); } } new C(); return 'no';",
+            "ReferenceError",
+        ),
+    ] {
+        assert_eq!(run(&name(body)), expected, "{body}");
+    }
+}
