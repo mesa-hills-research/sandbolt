@@ -5,7 +5,7 @@ use crate::heap::{Heap, PersistentRoot};
 use crate::ledger::{AllocError, AllocResult, HeapLedger, TrackedBox, TrackedVec};
 use crate::object::*;
 use crate::realm::{NativeFnId, Realm, Runtime, bootstrap_error_message};
-use crate::string::{INLINE_LATIN1_CAPACITY, JsString, MAX_ROPE_DEPTH};
+use crate::string::{INLINE_LATIN1_CAPACITY, JsString, MAX_ROPE_DEPTH, UnitBuffer};
 use crate::symbol::SymbolDescription;
 use crate::value::*;
 use crate::vm::{BytecodeFunc, Job, MiniOp};
@@ -445,6 +445,27 @@ impl<'s> ExecCtx<'_, 's> {
             self.runtime.heap.atoms.cache_ascii_string(slot, id);
         }
         Ok(string)
+    }
+
+    /// A string of `units`, which takes their buffer.
+    pub(crate) fn new_string_from_units(&mut self, units: UnitBuffer) -> JsResult<Handle<'s>> {
+        match units.len() {
+            0 => return self.new_latin1(&[]),
+            1 => return self.new_utf16(&[units.get(0).unwrap_or_default()]),
+            _ => (),
+        }
+        let mut string = Some(units.into_string(&self.heap().ledger));
+        let id = self.allocate(|runtime| {
+            runtime
+                .heap
+                .strings
+                .try_reserve_slot(&runtime.heap.ledger)?;
+            Ok(runtime
+                .heap
+                .strings
+                .insert_reserved(string.take().expect("the string goes in once")))
+        })?;
+        self.root(Value::string(id))
     }
 
     pub(crate) fn make_string(

@@ -258,6 +258,148 @@ impl JsString {
     }
 }
 
+/// Code units gathered for a new string. They take a byte each until a unit
+/// above 0xFF comes, as in a Latin-1 string, and the string takes the buffer.
+#[derive(Debug)]
+pub(crate) enum UnitBuffer {
+    Latin1(TrackedVec<u8>),
+    Utf16(TrackedVec<u16>),
+}
+
+impl Default for UnitBuffer {
+    fn default() -> Self {
+        Self::Latin1(TrackedVec::new())
+    }
+}
+
+impl UnitBuffer {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Latin1(bytes) => bytes.len(),
+            Self::Utf16(units) => units.len(),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Latin1(bytes) => bytes.capacity(),
+            Self::Utf16(units) => units.capacity(),
+        }
+    }
+
+    /// Whether `additional` more units fit, units above 0xFF among them
+    /// when `wide` says.
+    pub(crate) fn has_room(&self, additional: usize, wide: bool) -> bool {
+        let wide_enough = !wide || matches!(self, Self::Utf16(_));
+        wide_enough && self.capacity() - self.len() >= additional
+    }
+
+    /// Makes room for `additional` more units, units above 0xFF among them
+    /// when `wide` says. A buffer that grows takes half its size again at
+    /// least, so many small writes copy it a few times only.
+    pub(crate) fn reserve(
+        &mut self,
+        ledger: &HeapLedger,
+        additional: usize,
+        wide: bool,
+    ) -> AllocResult<()> {
+        if self.has_room(additional, wide) {
+            return Ok(());
+        }
+        let required = self
+            .len()
+            .checked_add(additional)
+            .filter(|&len| u32::try_from(len).is_ok())
+            .ok_or(AllocError::Limit)?;
+        let capacity = self.capacity();
+        let target = if required <= capacity {
+            capacity
+        } else {
+            required.max(capacity.saturating_add(capacity / 2))
+        };
+        match self.grow(ledger, target, wide) {
+            Err(AllocError::Limit) if target > required => self.grow(ledger, required, wide),
+            result => result,
+        }
+    }
+
+    fn grow(&mut self, ledger: &HeapLedger, capacity: usize, wide: bool) -> AllocResult<()> {
+        match self {
+            Self::Latin1(bytes) if wide => {
+                let mut units = TrackedVec::new();
+                units.try_reserve_exact(ledger, capacity)?;
+                for &byte in bytes.iter() {
+                    units.push_reserved(u16::from(byte));
+                }
+                *self = Self::Utf16(units);
+                Ok(())
+            }
+            Self::Latin1(bytes) => bytes.try_reserve_exact(ledger, capacity - bytes.len()),
+            Self::Utf16(units) => units.try_reserve_exact(ledger, capacity - units.len()),
+        }
+    }
+
+    /// Adds `unit`, which [`Self::reserve`] made room for.
+    pub(crate) fn push_reserved(&mut self, unit: u16) {
+        match self {
+            Self::Latin1(bytes) => {
+                bytes.push_reserved(u8::try_from(unit).expect("a unit above 0xFF in Latin-1"));
+            }
+            Self::Utf16(units) => units.push_reserved(unit),
+        }
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<u16> {
+        match self {
+            Self::Latin1(bytes) => bytes.get(index).copied().map(u16::from),
+            Self::Utf16(units) => units.get(index).copied(),
+        }
+    }
+
+    /// The string of the units, in the buffer. A buffer with room for more
+    /// than a quarter of its length again is copied to fit first, since the
+    /// copy holds both for a moment.
+    pub(crate) fn into_string(self, ledger: &HeapLedger) -> JsString {
+        match self {
+            Self::Latin1(bytes) if bytes.len() <= INLINE_LATIN1_CAPACITY => {
+                let mut data = [0; INLINE_LATIN1_CAPACITY];
+                data[..bytes.len()].copy_from_slice(&bytes);
+                JsString::InlineLatin1 {
+                    len: bytes.len() as u8,
+                    is_ascii: bytes.is_ascii(),
+                    data,
+                }
+            }
+            Self::Utf16(units) if units.len() <= INLINE_UTF16_CAPACITY => {
+                let mut data = [0; INLINE_UTF16_CAPACITY];
+                data[..units.len()].copy_from_slice(&units);
+                JsString::InlineUtf16 {
+                    len: units.len() as u8,
+                    data,
+                }
+            }
+            Self::Latin1(mut bytes) => {
+                fit(&mut bytes, ledger);
+                let is_ascii = bytes.is_ascii();
+                JsString::Latin1 {
+                    data: bytes,
+                    is_ascii,
+                }
+            }
+            Self::Utf16(mut units) => {
+                fit(&mut units, ledger);
+                JsString::Utf16(units)
+            }
+        }
+    }
+}
+
+fn fit<T>(buffer: &mut TrackedVec<T>, ledger: &HeapLedger) {
+    if buffer.capacity() - buffer.len() > buffer.len() / 4 {
+        buffer.shrink_to(ledger, buffer.len());
+    }
+}
+
 pub struct StringUnits<'a> {
     arena: &'a Arena<JsString>,
     pending: [Option<StrId>; MAX_ROPE_DEPTH as usize + 1],

@@ -2,12 +2,14 @@ use std::cell::Cell;
 
 use super::*;
 use crate::atom::KeyKind;
+use crate::heap::Heap;
 use crate::ledger::TrackedBox;
 use crate::object::ErrorKind;
 use crate::ops::compare::same_value_raw;
 use crate::ops::convert::{key_value, to_length, to_number, to_string};
 use crate::ops::property::{delete_property, get_own_property_descriptor, own_property_keys};
-use crate::value::{Abrupt, ObjId};
+use crate::string::UnitBuffer;
+use crate::value::{Abrupt, ObjId, StrId};
 
 const PARSE: NativeFnId = NativeFnId(BASE + 0x80);
 const STRINGIFY: NativeFnId = NativeFnId(BASE + 0x81);
@@ -60,23 +62,27 @@ fn raw_text(ctx: &ExecCtx<'_, '_>, value: Value) -> Option<Value> {
 fn parse<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>, raw: bool) -> JsResult<Value> {
     let input = arg(ctx, args, 0)?;
     let text = to_string(ctx, input)?;
-    let input = units(ctx, ctx.get(text))?;
+    // Read where it is, so the text takes no copy.
+    ctx.flatten_string(text)?;
+    let ValueKind::String(id) = ctx.get(text).decode() else {
+        unreachable!()
+    };
     let reviver = args
         .get(1)
         .filter(|&value| !raw && callable(ctx, ctx.get(value)));
     let mut parser = Parser {
-        input: &input,
+        text: id,
         pos: 0,
         record_source: reviver.is_some(),
     };
-    if raw && matches!(parser.peek(), None | Some(9 | 10 | 13 | 32 | 91 | 123)) {
+    if raw && matches!(parser.peek(ctx), None | Some(9 | 10 | 13 | 32 | 91 | 123)) {
         return Err(invalid(ctx));
     }
     let (value, meta) = parser.value(ctx)?;
     if !raw {
         parser.whitespace(ctx)?;
     }
-    if parser.peek().is_some() {
+    if parser.peek(ctx).is_some() {
         return Err(invalid(ctx));
     }
     if raw {
@@ -98,10 +104,184 @@ fn parse<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>, raw: bool) -> JsResult<V
     let empty = ctx.intern_str("")?;
     super::super::define_data(ctx, root, empty, value, DATA)?;
     Reviver {
-        input: &input,
+        text: id,
         callback: ctx.get(reviver),
     }
     .visit(ctx, root, empty, meta)
+}
+
+/// The units of a flat string.
+#[derive(Clone, Copy)]
+enum Flat<'h> {
+    Latin1(&'h [u8]),
+    Utf16(&'h [u16]),
+}
+
+impl<'h> Flat<'h> {
+    fn of(heap: &'h Heap, id: StrId) -> Self {
+        let string = heap.string(id);
+        if let Some(bytes) = string.as_latin1() {
+            Self::Latin1(bytes)
+        } else if let Some(units) = string.as_utf16() {
+            Self::Utf16(units)
+        } else {
+            unreachable!("JSON.parse reads a flat string")
+        }
+    }
+
+    fn get(self, index: usize) -> Option<u16> {
+        match self {
+            Self::Latin1(bytes) => bytes.get(index).map(|&byte| u16::from(byte)),
+            Self::Utf16(units) => units.get(index).copied(),
+        }
+    }
+
+    fn units(self, start: usize, end: usize) -> impl Iterator<Item = u16> + 'h {
+        let (bytes, units): (&[u8], &[u16]) = match self {
+            Self::Latin1(bytes) => (&bytes[start..end], &[]),
+            Self::Utf16(units) => (&[], &units[start..end]),
+        };
+        bytes
+            .iter()
+            .map(|&byte| u16::from(byte))
+            .chain(units.iter().copied())
+    }
+}
+
+/// A unit of JSON text, a byte of Latin-1 text or a UTF-16 code unit.
+trait Unit: Copy + Into<u16> {}
+
+impl Unit for u8 {}
+
+impl Unit for u16 {}
+
+/// Why reading or writing JSON text stopped.
+enum Fault {
+    Invalid,
+    Interrupted,
+}
+
+impl Fault {
+    fn throw(self, ctx: &mut ExecCtx<'_, '_>) -> Abrupt {
+        match self {
+            Self::Invalid => invalid(ctx),
+            Self::Interrupted => {
+                ctx.take_exception();
+                Abrupt::Interrupted
+            }
+        }
+    }
+}
+
+/// Polls the interrupt handler, which the heap can stay borrowed beside.
+fn interrupted(stop: &mut Option<Box<dyn FnMut() -> bool>>) -> bool {
+    stop.as_mut().is_some_and(|stop| stop())
+}
+
+/// The end of the string token whose units start at `start` (after its
+/// opening quote), and whether a unit of the string is above 0xFF.
+fn scan<U: Unit>(
+    units: &[U],
+    start: usize,
+    stop: &mut Option<Box<dyn FnMut() -> bool>>,
+) -> Result<(usize, bool), Fault> {
+    let mut end = start;
+    let mut wide = false;
+    for step in 1usize.. {
+        if step.is_multiple_of(4096) && interrupted(stop) {
+            return Err(Fault::Interrupted);
+        }
+        let unit: u16 = (*units.get(end).ok_or(Fault::Invalid)?).into();
+        match unit {
+            34 => break,
+            0..=31 => return Err(Fault::Invalid),
+            92 => {
+                if units.get(end + 1).map(|&unit| unit.into()) == Some(117) {
+                    wide |= hex(units.get(end + 2..end + 6)).is_some_and(|unit| unit > 0xff);
+                }
+                end += 2;
+            }
+            _ => {
+                wide |= unit > 0xff;
+                end += 1;
+            }
+        }
+    }
+    Ok((end, wide))
+}
+
+/// The four hex digits of a `\u` escape as the unit they write.
+fn hex<U: Unit>(digits: Option<&[U]>) -> Option<u16> {
+    digits?.iter().try_fold(0, |unit, &digit| {
+        let digit = match digit.into() {
+            digit @ 48..=57 => digit - 48,
+            digit @ 65..=70 => digit - 65 + 10,
+            digit @ 97..=102 => digit - 97 + 10,
+            _ => return None,
+        };
+        Some((unit << 4) | digit)
+    })
+}
+
+/// Writes the string that the raw units of a string token stand for into
+/// `out`, which has room for as many units as `units` has, wide ones too
+/// where [`scan`] found them.
+fn decode<U: Unit>(
+    units: &[U],
+    out: &mut UnitBuffer,
+    stop: &mut Option<Box<dyn FnMut() -> bool>>,
+) -> Result<(), Fault> {
+    let mut index = 0;
+    for step in 1usize.. {
+        let Some(&unit) = units.get(index) else {
+            break;
+        };
+        if step.is_multiple_of(4096) && interrupted(stop) {
+            return Err(Fault::Interrupted);
+        }
+        let unit: u16 = unit.into();
+        if unit != 92 {
+            out.push_reserved(unit);
+            index += 1;
+            continue;
+        }
+        let escape: u16 = (*units.get(index + 1).ok_or(Fault::Invalid)?).into();
+        let unit = match escape {
+            34 | 47 | 92 => escape,
+            98 => 8,
+            102 => 12,
+            110 => 10,
+            114 => 13,
+            116 => 9,
+            117 => {
+                let unit = hex(units.get(index + 2..index + 6)).ok_or(Fault::Invalid)?;
+                index += 4;
+                unit
+            }
+            _ => return Err(Fault::Invalid),
+        };
+        out.push_reserved(unit);
+        index += 2;
+    }
+    Ok(())
+}
+
+/// The string of units `start..end` of flat string `text`.
+fn slice<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    text: StrId,
+    start: usize,
+    end: usize,
+) -> JsResult<Handle<'s>> {
+    let wide = Flat::of(ctx.heap(), text)
+        .units(start, end)
+        .any(|unit| unit > 0xff);
+    let mut out = UnitBuffer::default();
+    reserve(ctx, &mut out, end - start, wide)?;
+    for unit in Flat::of(ctx.heap(), text).units(start, end) {
+        out.push_reserved(unit);
+    }
+    ctx.new_string_from_units(out)
 }
 
 fn invalid(ctx: &mut ExecCtx<'_, '_>) -> Abrupt {
@@ -138,17 +318,18 @@ impl Drop for TraversalFrame {
     }
 }
 
-struct Parser<'a> {
-    input: &'a [u16],
+struct Parser {
+    /// The text, a flat string.
+    text: StrId,
     pos: usize,
     record_source: bool,
 }
 
 type Parsed<'s> = (Handle<'s>, Option<Handle<'s>>);
 
-impl Parser<'_> {
-    fn peek(&self) -> Option<u16> {
-        self.input.get(self.pos).copied()
+impl Parser {
+    fn peek(&self, ctx: &ExecCtx<'_, '_>) -> Option<u16> {
+        Flat::of(ctx.heap(), self.text).get(self.pos)
     }
 
     fn advance(&mut self, ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
@@ -159,8 +340,8 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn eat(&mut self, byte: u8) -> bool {
-        if self.peek() != Some(u16::from(byte)) {
+    fn eat(&mut self, ctx: &ExecCtx<'_, '_>, byte: u8) -> bool {
+        if self.peek(ctx) != Some(u16::from(byte)) {
             return false;
         }
         self.pos += 1;
@@ -168,7 +349,7 @@ impl Parser<'_> {
     }
 
     fn expect(&mut self, ctx: &mut ExecCtx<'_, '_>, byte: u8) -> JsResult<()> {
-        if self.eat(byte) {
+        if self.eat(ctx, byte) {
             Ok(())
         } else {
             Err(invalid(ctx))
@@ -176,7 +357,7 @@ impl Parser<'_> {
     }
 
     fn whitespace(&mut self, ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
-        while matches!(self.peek(), Some(9 | 10 | 13 | 32)) {
+        while matches!(self.peek(ctx), Some(9 | 10 | 13 | 32)) {
             self.advance(ctx)?;
         }
         Ok(())
@@ -198,7 +379,7 @@ impl Parser<'_> {
         let _frame = TraversalFrame::enter(ctx)?;
         self.whitespace(ctx)?;
         let start = self.pos;
-        let value = match self.peek() {
+        let value = match self.peek(ctx) {
             Some(34) => self.string(ctx),
             Some(110) => self.literal(ctx, b"null", Value::NULL),
             Some(116) => self.literal(ctx, b"true", Value::bool(true)),
@@ -224,7 +405,7 @@ impl Parser<'_> {
     }
 
     fn compound<'s>(&mut self, ctx: &mut ExecCtx<'_, 's>) -> JsResult<Parsed<'s>> {
-        let array = self.eat(b'[');
+        let array = self.eat(ctx, b'[');
         let close = if array {
             b']'
         } else {
@@ -249,7 +430,7 @@ impl Parser<'_> {
             None
         };
         self.whitespace(ctx)?;
-        if self.eat(close) {
+        if self.eat(ctx, close) {
             return Ok((object, meta));
         }
         for index in 0.. {
@@ -276,7 +457,7 @@ impl Parser<'_> {
                 Ok(())
             })?;
             self.whitespace(ctx)?;
-            if self.eat(close) {
+            if self.eat(ctx, close) {
                 break;
             }
             self.expect(ctx, b',')?;
@@ -286,54 +467,33 @@ impl Parser<'_> {
 
     fn string<'s>(&mut self, ctx: &mut ExecCtx<'_, 's>) -> JsResult<Handle<'s>> {
         self.expect(ctx, b'"')?;
-        let mut out = TrackedVec::new();
-        loop {
-            let unit = self.peek().ok_or_else(|| invalid(ctx))?;
-            self.advance(ctx)?;
-            let unit = match unit {
-                34 => break,
-                0..=31 => return Err(invalid(ctx)),
-                92 => self.escape(ctx)?,
-                _ => unit,
-            };
-            push(ctx, &mut out, unit)?;
-        }
-        ctx.new_utf16(&out)
-    }
-
-    fn escape(&mut self, ctx: &mut ExecCtx<'_, '_>) -> JsResult<u16> {
-        let unit = self.peek().ok_or_else(|| invalid(ctx))?;
-        self.advance(ctx)?;
-        Ok(match unit {
-            34 | 47 | 92 => unit,
-            98 => 8,
-            102 => 12,
-            110 => 10,
-            114 => 13,
-            116 => 9,
-            117 => {
-                let mut char = 0;
-                for _ in 0..4 {
-                    let digit = match self.peek() {
-                        Some(n @ 48..=57) => n - 48,
-                        Some(n @ 65..=70) => n - 65 + 10,
-                        Some(n @ 97..=102) => n - 97 + 10,
-                        _ => return Err(invalid(ctx)),
-                    };
-                    self.advance(ctx)?;
-                    char = (char << 4) | digit;
-                }
-                char
-            }
-            _ => return Err(invalid(ctx)),
-        })
+        let start = self.pos;
+        let runtime = &mut *ctx.runtime;
+        let stop = &mut runtime.vm.interrupt_handler;
+        let scanned = match Flat::of(&runtime.heap, self.text) {
+            Flat::Latin1(units) => scan(units, start, stop),
+            Flat::Utf16(units) => scan(units, start, stop),
+        };
+        let (end, wide) = scanned.map_err(|fault| fault.throw(ctx))?;
+        // Escapes only shorten it, so the string fits in the token's length.
+        let mut out = UnitBuffer::default();
+        reserve(ctx, &mut out, end - start, wide)?;
+        let runtime = &mut *ctx.runtime;
+        let stop = &mut runtime.vm.interrupt_handler;
+        let decoded = match Flat::of(&runtime.heap, self.text) {
+            Flat::Latin1(units) => decode(&units[start..end], &mut out, stop),
+            Flat::Utf16(units) => decode(&units[start..end], &mut out, stop),
+        };
+        decoded.map_err(|fault| fault.throw(ctx))?;
+        self.pos = end + 1;
+        ctx.new_string_from_units(out)
     }
 
     fn digits(&mut self, ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
-        if !matches!(self.peek(), Some(48..=57)) {
+        if !matches!(self.peek(ctx), Some(48..=57)) {
             return Err(invalid(ctx));
         }
-        while matches!(self.peek(), Some(48..=57)) {
+        while matches!(self.peek(ctx), Some(48..=57)) {
             self.advance(ctx)?;
         }
         Ok(())
@@ -341,26 +501,22 @@ impl Parser<'_> {
 
     fn number<'s>(&mut self, ctx: &mut ExecCtx<'_, 's>) -> JsResult<Handle<'s>> {
         let start = self.pos;
-        self.eat(b'-');
-        if !self.eat(b'0') {
+        self.eat(ctx, b'-');
+        if !self.eat(ctx, b'0') {
             self.digits(ctx)?;
         }
-        if self.eat(b'.') {
+        if self.eat(ctx, b'.') {
             self.digits(ctx)?;
         }
-        if self.eat(b'e') || self.eat(b'E') {
-            if !self.eat(b'+') {
-                self.eat(b'-');
+        if self.eat(ctx, b'e') || self.eat(ctx, b'E') {
+            if !self.eat(ctx, b'+') {
+                self.eat(ctx, b'-');
             }
             self.digits(ctx)?;
         }
-        let units = &self.input[start..self.pos];
         let mut bytes = TrackedVec::new();
-        ctx.allocate(|runtime| bytes.try_reserve_exact(&runtime.heap.ledger, units.len()))?;
-        for (index, &unit) in units.iter().enumerate() {
-            if index % 4096 == 0 {
-                ctx.check_interrupt()?;
-            }
+        ctx.allocate(|runtime| bytes.try_reserve_exact(&runtime.heap.ledger, self.pos - start))?;
+        for unit in Flat::of(ctx.heap(), self.text).units(start, self.pos) {
             bytes.push_reserved(unit as u8);
         }
         let text = std::str::from_utf8(&bytes).unwrap();
@@ -378,12 +534,33 @@ fn push<T: Copy>(ctx: &mut ExecCtx<'_, '_>, buffer: &mut TrackedVec<T>, value: T
     }
 }
 
-struct Reviver<'a> {
-    input: &'a [u16],
+/// Makes room in `buffer` for `additional` more units, units above 0xFF
+/// among them when `wide` says.
+fn reserve(
+    ctx: &mut ExecCtx<'_, '_>,
+    buffer: &mut UnitBuffer,
+    additional: usize,
+    wide: bool,
+) -> JsResult<()> {
+    if buffer.has_room(additional, wide) {
+        return Ok(());
+    }
+    ctx.allocate(|runtime| buffer.reserve(&runtime.heap.ledger, additional, wide))
+}
+
+fn push_unit(ctx: &mut ExecCtx<'_, '_>, buffer: &mut UnitBuffer, unit: u16) -> JsResult<()> {
+    reserve(ctx, buffer, 1, unit > 0xff)?;
+    buffer.push_reserved(unit);
+    Ok(())
+}
+
+struct Reviver {
+    /// The text, a flat string.
+    text: StrId,
     callback: Value,
 }
 
-impl Reviver<'_> {
+impl Reviver {
     fn visit<'s>(
         &self,
         ctx: &mut ExecCtx<'_, 's>,
@@ -432,7 +609,7 @@ impl Reviver<'_> {
                 }
             }
         } else if let Some((start, end)) = record {
-            source = Some(ctx.new_utf16(&self.input[start..end])?);
+            source = Some(slice(ctx, self.text, start, end)?);
         }
         let context = ctx.new_object()?;
         if let Some(source) = source {
@@ -520,14 +697,14 @@ fn stringify<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>) -> JsResult<Value> {
         keys: keys.as_deref(),
         replacer,
         gap: &gap[..size],
-        output: TrackedVec::new(),
+        output: UnitBuffer::default(),
         parents: TrackedVec::new(),
     };
     let Some(value) = writer.prepare(ctx, holder, empty)? else {
         return Ok(Value::UNDEFINED);
     };
     writer.emit(ctx, value, 0)?;
-    let text = ctx.new_utf16(&writer.output)?;
+    let text = ctx.new_string_from_units(std::mem::take(&mut writer.output))?;
     Ok(ctx.get(text))
 }
 
@@ -600,7 +777,7 @@ struct Writer<'a> {
     keys: Option<&'a [PropKey]>,
     replacer: Option<Value>,
     gap: &'a [u16],
-    output: TrackedVec<u16>,
+    output: UnitBuffer,
     parents: TrackedVec<ObjId>,
 }
 
@@ -700,7 +877,7 @@ impl Writer<'_> {
     ) -> JsResult<()> {
         let is_array = is_array(ctx, ctx.get(value))?;
         let (open, close) = if is_array { (b'[', b']') } else { (b'{', b'}') };
-        push(ctx, &mut self.output, u16::from(open))?;
+        self.ascii(ctx, &[open])?;
         let mut written = false;
         if is_array {
             let length = get(ctx, value, LENGTH)?;
@@ -749,12 +926,13 @@ impl Writer<'_> {
         if written {
             self.indent(ctx, depth)?;
         }
-        push(ctx, &mut self.output, u16::from(close))
+        self.ascii(ctx, &[close])
     }
 
     fn ascii(&mut self, ctx: &mut ExecCtx<'_, '_>, text: &[u8]) -> JsResult<()> {
+        reserve(ctx, &mut self.output, text.len(), false)?;
         for &byte in text {
-            push(ctx, &mut self.output, u16::from(byte))?;
+            self.output.push_reserved(u16::from(byte));
         }
         Ok(())
     }
@@ -776,7 +954,7 @@ impl Writer<'_> {
             self.ascii(ctx, b"\n")?;
             for _ in 0..depth {
                 for &unit in self.gap {
-                    push(ctx, &mut self.output, unit)?;
+                    push_unit(ctx, &mut self.output, unit)?;
                 }
             }
         }
@@ -784,51 +962,82 @@ impl Writer<'_> {
     }
 
     fn text(&mut self, ctx: &mut ExecCtx<'_, '_>, value: Value, quote: bool) -> JsResult<()> {
-        let text = units(ctx, value)?;
-        let mut marks = text.iter().copied().enumerate().peekable();
-        if quote {
-            self.ascii(ctx, b"\"")?;
+        let ValueKind::String(id) = value.decode() else {
+            unreachable!()
+        };
+        // Measured first, so the text goes in without a copy of its own.
+        let mut len = 0;
+        let mut wide = false;
+        escape(ctx, id, quote, |unit| {
+            len += 1;
+            wide |= unit > 0xff;
+        })?;
+        reserve(ctx, &mut self.output, len, wide)?;
+        let output = &mut self.output;
+        escape(ctx, id, quote, |unit| output.push_reserved(unit))
+    }
+}
+
+/// Gives `emit` the units JSON.stringify writes for string `id`: its units
+/// as they are, or when `quote` says, in quotes with JSON's escapes. It
+/// polls the interrupt handler every 4096 units.
+fn escape(
+    ctx: &mut ExecCtx<'_, '_>,
+    id: StrId,
+    quote: bool,
+    mut emit: impl FnMut(u16),
+) -> JsResult<()> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let runtime = &mut *ctx.runtime;
+    let stop = &mut runtime.vm.interrupt_handler;
+    let mut units = runtime.heap.string_units(id).peekable();
+    if quote {
+        emit(u16::from(b'"'));
+    }
+    let mut index = 0usize;
+    while let Some(unit) = units.next() {
+        if index.is_multiple_of(4096) && interrupted(stop) {
+            return Err(Fault::Interrupted.throw(ctx));
         }
-        while let Some((index, unit)) = marks.next() {
-            if index % 4096 == 0 {
-                ctx.check_interrupt()?;
-            }
-            if !quote {
-                push(ctx, &mut self.output, unit)?;
+        index += 1;
+        if !quote {
+            emit(unit);
+            continue;
+        }
+        let letter = match unit {
+            8 => b'b',
+            9 => b't',
+            10 => b'n',
+            12 => b'f',
+            13 => b'r',
+            34 => b'"',
+            92 => b'\\',
+            0xd800..=0xdbff if matches!(units.peek(), Some(0xdc00..=0xdfff)) => {
+                emit(unit);
+                if let Some(low) = units.next() {
+                    index += 1;
+                    emit(low);
+                }
                 continue;
             }
-            match unit {
-                8 => self.ascii(ctx, b"\\b")?,
-                9 => self.ascii(ctx, b"\\t")?,
-                10 => self.ascii(ctx, b"\\n")?,
-                12 => self.ascii(ctx, b"\\f")?,
-                13 => self.ascii(ctx, b"\\r")?,
-                34 => self.ascii(ctx, b"\\\"")?,
-                92 => self.ascii(ctx, b"\\\\")?,
-                0xd800..=0xdbff if matches!(marks.peek(), Some((_, 0xdc00..=0xdfff))) => {
-                    push(ctx, &mut self.output, unit)?;
-                    push(ctx, &mut self.output, marks.next().unwrap().1)?;
+            0..=31 | 0xd800..=0xdfff => {
+                emit(u16::from(b'\\'));
+                emit(u16::from(b'u'));
+                for shift in [12, 8, 4, 0] {
+                    emit(u16::from(HEX[usize::from((unit >> shift) & 15)]));
                 }
-                0..=31 | 0xd800..=0xdfff => {
-                    let hex = b"0123456789abcdef";
-                    self.ascii(
-                        ctx,
-                        &[
-                            b'\\',
-                            b'u',
-                            hex[usize::from(unit >> 12)],
-                            hex[usize::from((unit >> 8) & 15)],
-                            hex[usize::from((unit >> 4) & 15)],
-                            hex[usize::from(unit & 15)],
-                        ],
-                    )?;
-                }
-                _ => push(ctx, &mut self.output, unit)?,
+                continue;
             }
-        }
-        if quote {
-            self.ascii(ctx, b"\"")?;
-        }
-        Ok(())
+            _ => {
+                emit(unit);
+                continue;
+            }
+        };
+        emit(u16::from(b'\\'));
+        emit(u16::from(letter));
     }
+    if quote {
+        emit(u16::from(b'"'));
+    }
+    Ok(())
 }

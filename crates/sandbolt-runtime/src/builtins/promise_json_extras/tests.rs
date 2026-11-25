@@ -660,12 +660,22 @@ fn json_traversals_check_stack_heap_and_interrupt_limits() {
         let large = ctx.new_string(&"x".repeat(20_000)).unwrap();
         let stringify = get_named(ctx, json, "stringify").unwrap();
         let args = ctx.args(&[large]).unwrap();
+        // Each of its allocations failing in turn throws out of memory.
         let ledger = ctx.heap().ledger.clone();
-        ledger.fail_after(Some(1));
-        assert_eq!(call(ctx, stringify, json, args), Err(Abrupt::Thrown));
-        assert!(ctx.is_oom());
-        ledger.fail_after(None);
-        ctx.take_exception();
+        let mut failures = 0;
+        for successes in 0.. {
+            ledger.fail_after(Some(successes));
+            let result = call(ctx, stringify, json, args);
+            ledger.fail_after(None);
+            if result.is_ok() {
+                break;
+            }
+            assert_eq!(result, Err(Abrupt::Thrown));
+            assert!(ctx.is_oom());
+            ctx.take_exception();
+            failures += 1;
+        }
+        assert!(failures > 0);
         let calls = Rc::new(Cell::new(0));
         let count = calls.clone();
         ctx.runtime.set_interrupt_handler(Some(Box::new(move || {
@@ -912,4 +922,88 @@ fn performance_and_globals_have_expected_surface() {
         assert!(origin > 1.0e12 && origin <= wall);
         assert_eq!(origin, ctx.realm().time_origin_epoch_ms);
     });
+}
+
+/// A fresh engine with a 64 MB heap and the ledger it charges.
+fn engine() -> (crate::api::JsEngine, crate::ledger::HeapLedger) {
+    let limits = EngineLimits {
+        heap_bytes: 64 << 20,
+        ..EngineLimits::default()
+    };
+    let ledger = crate::ledger::HeapLedger::new(limits.heap_bytes, 4096).unwrap();
+    let engine = crate::api::JsEngine::new_with_ledger(limits, ledger.clone()).unwrap();
+    (engine, ledger)
+}
+
+fn eval(engine: &mut crate::api::JsEngine, code: &str) -> String {
+    let options = crate::api::EvalOptions {
+        strict: true,
+        ..Default::default()
+    };
+    engine.eval_to_string(code, options).unwrap()
+}
+
+/// JSON text in Latin-1 takes a byte a unit as JSON reads and writes it,
+/// and the result keeps the buffer it was built in.
+#[test]
+fn json_of_latin1_text_takes_a_byte_a_unit() {
+    const UNITS: usize = 4 << 20;
+    for (setup, code, expected) in [
+        (
+            "globalThis.s = 'x'.repeat(4 << 20);",
+            "globalThis.out = JSON.stringify({ big: s }); out.length",
+            UNITS + 10,
+        ),
+        (
+            "globalThis.s = '\u{e9}'.repeat(4 << 20);",
+            "globalThis.out = JSON.stringify([s]); out.length",
+            UNITS + 4,
+        ),
+        (
+            r#"globalThis.s = '{"text": "{\\"big\\": \\"' + 'x'.repeat(4 << 20) + '\\"}"}';"#,
+            "globalThis.out = JSON.parse(s).text; out.length",
+            UNITS + 11,
+        ),
+    ] {
+        let (mut engine, ledger) = engine();
+        eval(&mut engine, setup);
+        let before = ledger.used_bytes();
+        assert!(ledger.peak_bytes() - before < UNITS / 8, "{setup}");
+        assert_eq!(eval(&mut engine, code), expected.to_string(), "{code}");
+        let peak = ledger.peak_bytes() - before;
+        assert!(peak <= 4 * UNITS, "{code}: {peak} bytes at the peak");
+        let kept = ledger.used_bytes() - before;
+        assert!(
+            kept <= UNITS + UNITS / 4 + 4096,
+            "{code}: {kept} bytes kept"
+        );
+    }
+}
+
+/// A unit above 0xFF, written or read in an escape, widens what was Latin-1.
+#[test]
+fn json_widens_its_text_at_the_first_wide_unit() {
+    let (mut engine, _) = engine();
+    for (code, expected) in [
+        (r#"JSON.parse('"ab\\u20acc"') === 'ab\u20acc'"#, "true"),
+        (r#"JSON.parse('"a\\"b\\\\c"') === 'a"b\\c'"#, "true"),
+        (
+            r#"JSON.parse('["\u20ac", "x\\n"]').join('|') === '\u20ac|x\n'"#,
+            "true",
+        ),
+        (
+            r#"JSON.parse('"' + 'x'.repeat(40) + '\\u20ac"').length"#,
+            "41",
+        ),
+        (
+            r#"JSON.stringify('\u00e9' + 'x'.repeat(40) + '\u20ac\ud800\ud83d\ude00\n')"#,
+            "\"\u{e9}xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\u{20ac}\\ud800\u{1f600}\\n\"",
+        ),
+        (
+            r#"JSON.stringify({ a: [1, '\u00e9'] }, null, '\u2003')"#,
+            "{\n\u{2003}\"a\": [\n\u{2003}\u{2003}1,\n\u{2003}\u{2003}\"\u{e9}\"\n\u{2003}]\n}",
+        ),
+    ] {
+        assert_eq!(eval(&mut engine, code), expected, "{code}");
+    }
 }
