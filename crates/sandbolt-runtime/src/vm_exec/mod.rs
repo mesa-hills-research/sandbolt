@@ -676,6 +676,7 @@ pub(crate) fn run_frame(
                 let stack_bytes_limit = vm.limits.stack_bytes;
                 let reentry_bytes = vm.reentry_depth.saturating_mul(crate::vm::REENTRY_COST);
                 let stack: &mut [Value] = &mut vm.stack[..];
+                let global_object = heap.realm(frame.realm).global_object;
 
                 loop {
                     let cur_ip = ip;
@@ -721,7 +722,7 @@ pub(crate) fn run_frame(
                             let value = if function.strict || raw.as_object().is_some() {
                                 raw
                             } else if raw == Value::NULL || raw == Value::UNDEFINED {
-                                Value::object(heap.realm(frame.realm).global_object)
+                                Value::object(global_object)
                             } else {
                                 break FastBreak::Slow(orig_pcs[cur_ip]);
                             };
@@ -1888,9 +1889,9 @@ pub(crate) fn run_frame(
                         }
                         FastOp::GetLocGetVarAddLoc { dst, ic } => {
                             let idx = usize::from(ic);
-                            let id = heap.realm(frame.realm).global_object;
+                            let id = global_object;
                             let object = heap.object(id);
-                            let Some((slot, _)) = cache::global_slot(
+                            let value = match cache::global_slot(
                                 heap,
                                 function,
                                 &caches[idx],
@@ -1901,14 +1902,24 @@ pub(crate) fn run_frame(
                                 vm.global_lexical_epoch,
                                 modules,
                                 frame.realm,
-                            ) else {
-                                break FastBreak::Slow(orig_pcs[cur_ip]);
+                            ) {
+                                Some(cache::GlobalBinding::Property { slot, .. }) => {
+                                    object.props[slot]
+                                }
+                                Some(cache::GlobalBinding::Lexical { binding, .. }) => {
+                                    let value = var_ref_value(heap, stack, binding);
+                                    if value == Value::UNINITIALIZED {
+                                        break FastBreak::Slow(orig_pcs[cur_ip]);
+                                    }
+                                    value
+                                }
+                                None => break FastBreak::Slow(orig_pcs[cur_ip]),
                             };
                             let d = var_base + usize::from(dst);
                             let Some(sum) = fast_binary(
                                 Opcode::Add,
                                 stack[d],
-                                object.props[slot],
+                                value,
                                 vm.interrupt_handler.is_some(),
                             ) else {
                                 break FastBreak::Slow(orig_pcs[cur_ip]);
@@ -1920,11 +1931,11 @@ pub(crate) fn run_frame(
                         | FastOp::PutVar(ic)
                         | FastOp::MakeVarRef(ic) => {
                             let idx = usize::from(ic);
-                            let id = heap.realm(frame.realm).global_object;
+                            let id = global_object;
                             let object = heap.object(id);
                             let writing = matches!(op, FastOp::PutVar(_));
                             let want_ref = matches!(op, FastOp::MakeVarRef(_));
-                            let Some((slot, ref_key)) = cache::global_slot(
+                            let Some(binding) = cache::global_slot(
                                 heap,
                                 function,
                                 &caches[idx],
@@ -1938,26 +1949,67 @@ pub(crate) fn run_frame(
                             ) else {
                                 break FastBreak::Slow(orig_pcs[cur_ip]);
                             };
-                            match op {
-                                FastOp::PutVar(_) => {
+                            match (op, binding) {
+                                (
+                                    FastOp::PutVar(_),
+                                    cache::GlobalBinding::Property { slot, .. },
+                                ) => {
                                     sp -= 1;
                                     heap.objects.get_mut(id).unwrap().props[slot] = stack[sp];
                                 }
-                                FastOp::MakeVarRef(_) => {
+                                (
+                                    FastOp::MakeVarRef(_),
+                                    cache::GlobalBinding::Property { key, .. },
+                                ) => {
                                     stack[sp] = Value::object(id);
-                                    stack[sp + 1] = ref_key;
+                                    stack[sp + 1] = key;
                                     sp += 2;
                                 }
-                                _ => {
+                                (_, cache::GlobalBinding::Property { slot, .. }) => {
                                     stack[sp] = object.props[slot];
                                     sp += 1;
+                                }
+                                (
+                                    FastOp::MakeVarRef(_),
+                                    cache::GlobalBinding::Lexical { binding, key, .. },
+                                ) => {
+                                    stack[sp] = Value::var_ref(binding);
+                                    stack[sp + 1] = key;
+                                    sp += 2;
+                                }
+                                // A binding in its temporal dead zone, or a
+                                // constant being written, throws on the slow path.
+                                (
+                                    _,
+                                    cache::GlobalBinding::Lexical {
+                                        binding, writable, ..
+                                    },
+                                ) => {
+                                    let value = var_ref_value(heap, stack, binding);
+                                    if value == Value::UNINITIALIZED || (writing && !writable) {
+                                        break FastBreak::Slow(orig_pcs[cur_ip]);
+                                    }
+                                    if writing {
+                                        sp -= 1;
+                                        let value = stack[sp];
+                                        set_var_ref_value(
+                                            &mut heap.var_refs,
+                                            &mut heap.coroutines,
+                                            stack,
+                                            binding,
+                                            value,
+                                        );
+                                    } else {
+                                        stack[sp] = value;
+                                        sp += 1;
+                                    }
                                 }
                             }
                         }
                         FastOp::GetRefValue(ic) | FastOp::PutRefValue(ic) => {
                             let writing = matches!(op, FastOp::PutRefValue(_));
                             let source = sp - 2 - usize::from(writing);
-                            let global = heap.realm(frame.realm).global_object;
+                            let global = global_object;
                             if stack[source] != Value::object(global) {
                                 break FastBreak::Slow(orig_pcs[cur_ip]);
                             }
@@ -4046,6 +4098,39 @@ fn handle_fast_break(
         | FastBreak::ReturnToCaller { .. }
         | FastBreak::ReturnTop { .. }
         | FastBreak::Interrupted(_) => unreachable!(),
+    }
+}
+
+/// The value of closure or global binding `binding`.
+#[inline]
+fn var_ref_value(heap: &crate::heap::Heap, stack: &[Value], binding: VarRefId) -> Value {
+    match heap.var_refs.get(binding).unwrap().state {
+        VarRefState::OpenStack(i) => stack[i as usize],
+        VarRefState::OpenCoro { coro, local } => {
+            heap.coroutines.get(coro).unwrap().stack[local as usize]
+        }
+        VarRefState::Closed(value) => value,
+    }
+}
+
+/// Stores `value` in closure or global binding `binding`. It takes the
+/// heap's arenas apart, so the fast loop can call it while it holds the
+/// function's bytecode.
+#[inline]
+fn set_var_ref_value(
+    var_refs: &mut crate::arena::Arena<crate::vm::VarRef>,
+    coroutines: &mut crate::arena::Arena<crate::vm::CoroutineState>,
+    stack: &mut [Value],
+    binding: VarRefId,
+    value: Value,
+) {
+    let entry = var_refs.get_mut(binding).unwrap();
+    match entry.state {
+        VarRefState::OpenStack(i) => stack[i as usize] = value,
+        VarRefState::OpenCoro { coro, local } => {
+            coroutines.get_mut(coro).unwrap().stack[local as usize] = value;
+        }
+        VarRefState::Closed(_) => entry.state = VarRefState::Closed(value),
     }
 }
 

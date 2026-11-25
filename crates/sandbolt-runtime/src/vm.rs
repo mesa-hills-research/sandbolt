@@ -132,6 +132,15 @@ pub(crate) enum InlineCache {
         flags: PropFlags,
         key: Value,
     },
+    /// A global `let`, `const` or `class` binding, with the name a
+    /// reference to it carries.
+    GlobalLexical {
+        realm: RealmId,
+        epoch: usize,
+        binding: VarRefId,
+        writable: bool,
+        key: Value,
+    },
 }
 
 impl CompiledFunc {

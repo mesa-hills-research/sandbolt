@@ -451,7 +451,20 @@ fn fill_put_field(
     PutFieldResult::Done
 }
 
-#[inline]
+/// Where a global name's binding is.
+#[derive(Clone, Copy)]
+pub(super) enum GlobalBinding {
+    /// A data property of the global object, at `slot`.
+    Property { slot: usize, key: Value },
+    /// A lexical binding of the global scope.
+    Lexical {
+        binding: VarRefId,
+        writable: bool,
+        key: Value,
+    },
+}
+
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn global_slot(
     heap: &Heap,
@@ -464,23 +477,44 @@ pub(super) fn global_slot(
     epoch: usize,
     modules: &[ModId],
     realm: RealmId,
-) -> Option<(usize, Value)> {
-    if let InlineCache::Global {
-        realm: cached_realm,
-        shape,
-        slot,
-        flags,
-        epoch: cached_epoch,
-        key,
-    } = cell.get()
-        && cached_realm == realm
-        && cached_epoch == epoch
-        && shape == object.shape
-        && (!writing || flags.contains(PropFlags::WRITABLE))
-        && (!want_ref_key || key != Value::EMPTY)
-        && (writing || want_ref_key || !object.props[slot as usize].is_auto_native())
-    {
-        return Some((slot as usize, key));
+) -> Option<GlobalBinding> {
+    match cell.get() {
+        InlineCache::Global {
+            realm: cached_realm,
+            shape,
+            slot,
+            flags,
+            epoch: cached_epoch,
+            key,
+        } if cached_realm == realm
+            && cached_epoch == epoch
+            && shape == object.shape
+            && (!writing || flags.contains(PropFlags::WRITABLE))
+            && (!want_ref_key || key != Value::EMPTY)
+            && (writing || want_ref_key || !object.props[slot as usize].is_auto_native()) =>
+        {
+            return Some(GlobalBinding::Property {
+                slot: slot as usize,
+                key,
+            });
+        }
+        InlineCache::GlobalLexical {
+            realm: cached_realm,
+            epoch: cached_epoch,
+            binding,
+            writable,
+            key,
+        } if cached_realm == realm
+            && cached_epoch == epoch
+            && (!want_ref_key || key != Value::EMPTY) =>
+        {
+            return Some(GlobalBinding::Lexical {
+                binding,
+                writable,
+                key,
+            });
+        }
+        _ => {}
     }
     fill_global(
         heap,
@@ -509,16 +543,8 @@ fn fill_global(
     epoch: usize,
     modules: &[ModId],
     realm: RealmId,
-) -> Option<(usize, Value)> {
-    if object.flags.contains(ObjectFlags::IS_EXOTIC)
-        || (writing && object.flags.contains(ObjectFlags::IS_PROTOTYPE))
-    {
-        return None;
-    }
+) -> Option<GlobalBinding> {
     let key = super::compiled_key(heap, function, atom);
-    if super::bindings::lexical_in(heap, modules, realm, key).is_some() {
-        return None;
-    }
     let ref_value = if want_ref_key {
         let crate::atom::KeyKind::String(atom) = key.decode() else {
             return None;
@@ -527,6 +553,25 @@ fn fill_global(
     } else {
         Value::EMPTY
     };
+    if let Some((binding, writable)) = super::bindings::lexical_in(heap, modules, realm, key) {
+        cell.set(InlineCache::GlobalLexical {
+            realm,
+            epoch,
+            binding,
+            writable,
+            key: ref_value,
+        });
+        return Some(GlobalBinding::Lexical {
+            binding,
+            writable,
+            key: ref_value,
+        });
+    }
+    if object.flags.contains(ObjectFlags::IS_EXOTIC)
+        || (writing && object.flags.contains(ObjectFlags::IS_PROTOTYPE))
+    {
+        return None;
+    }
     let shape = heap.shape(object.shape);
     if shape.is_mutable() {
         return None;
@@ -546,7 +591,10 @@ fn fill_global(
         epoch,
         key: ref_value,
     });
-    Some((slot, ref_value))
+    Some(GlobalBinding::Property {
+        slot,
+        key: ref_value,
+    })
 }
 
 #[inline]

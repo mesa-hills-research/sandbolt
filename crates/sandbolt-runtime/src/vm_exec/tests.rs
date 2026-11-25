@@ -1800,3 +1800,111 @@ fn bindings_that_may_be_uninitialized_keep_their_checks() {
         assert_eq!(run(&name(body)), expected, "{body}");
     }
 }
+
+/// Updates of globals load and store them by name, with global `let`
+/// bindings cached as `var` ones are, so neither leaves the fast program.
+#[test]
+fn global_updates_stay_on_the_fast_path() {
+    use super::fast::FastOp;
+    for script in [
+        "var s = 0, i = 0; function f() { for (i = 0; i < 10; i++) s += i; return s; } f();",
+        "let s = 0, i = 0; function f() { for (i = 0; i < 10; i++) s += i; return s; } f();",
+        "'use strict'; let s = 0; function f() { for (let i = 0; i < 10; i++) s = s + i; return s; } f();",
+    ] {
+        let ops = fast_ops(script, "f");
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op,
+                FastOp::Slow
+                    | FastOp::MakeVarRef(_)
+                    | FastOp::GetRefValue(_)
+                    | FastOp::PutRefValue(_)
+            )),
+            "{script}\n{ops:?}"
+        );
+    }
+}
+
+/// Loading and storing a global by name keeps what a reference to it does.
+#[test]
+fn global_updates_keep_reference_semantics() {
+    let caught = |body: &str| {
+        format!("(() => {{ try {{ {body} }} catch (e) {{ return e.constructor.name; }} }})()")
+    };
+    for (script, expected) in [
+        // Strict code can't store to a name that didn't exist when its
+        // reference was made, even if the value creates it.
+        (
+            &*format!(
+                "'use strict'; {}",
+                caught("fresh1 = (globalThis.fresh1 = 1, 2); return 'stored';")
+            ),
+            "ReferenceError",
+        ),
+        // Sloppy code makes the global again after the value deletes it.
+        (
+            "gone1 = 1; gone1 += (delete globalThis.gone1, 1); gone1",
+            "2",
+        ),
+        (
+            &*format!(
+                "gone2 = 1; (function () {{ 'use strict'; return {} }})()",
+                caught("gone2 += (delete globalThis.gone2, 1); return 'stored';")
+            ),
+            "ReferenceError",
+        ),
+        (
+            &*format!(
+                "const fixed1 = 1; {}",
+                caught("fixed1 += 1; return 'stored';")
+            ),
+            "TypeError",
+        ),
+        (
+            &*format!(
+                "{}; let early1 = 0;",
+                caught("early1 += 1; return 'stored';")
+            ),
+            "ReferenceError",
+        ),
+        (
+            &*format!("{}; let early2 = 0;", caught("early2++; return 'stored';")),
+            "ReferenceError",
+        ),
+        ("missing1 += 1", "ReferenceError: missing1 is not defined"),
+    ] {
+        let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+        let got = match engine.eval_to_string(script, EvalOptions::default()) {
+            Ok(value) => value,
+            Err(EngineError::Thrown { message, .. }) => {
+                message.split(':').next().unwrap().to_string()
+            }
+            Err(other) => panic!("{other:?}"),
+        };
+        assert_eq!(got, expected.split(':').next().unwrap(), "{script}");
+    }
+}
+
+/// A global `let` read and written through the cache keeps its temporal
+/// dead zone and `const` its value, across scripts.
+#[test]
+fn cached_global_lexicals_keep_their_checks() {
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let options = EvalOptions::default();
+    let mut eval = |code: &str| engine.eval_to_string(code, options.clone()).unwrap();
+    eval(
+        "function read() { return later; }
+         function write(value) { later = value; }
+         function bump() { fixed += 1; }
+         function attempt(f, arg) { try { f(arg); return 'ok'; } catch (e) { return e.constructor.name; } }",
+    );
+    assert_eq!(eval("attempt(read)"), "ReferenceError");
+    assert_eq!(
+        eval("let later = 1; const fixed = 1; [read(), write(5), read(), later].join()"),
+        "1,,5,5"
+    );
+    assert_eq!(
+        eval("[attempt(bump), attempt(bump), fixed, attempt(write, 7), read()].join()"),
+        "TypeError,TypeError,1,ok,7"
+    );
+}

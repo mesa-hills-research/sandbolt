@@ -117,12 +117,12 @@ impl Emitter<'_> {
         loop {
             match &self.ast().pattern(pattern).kind {
                 Pattern::Identifier(i) => {
-                    reference = Some(self.reference_name(i, init)?);
+                    reference = Some(self.reference_name(i, init, false)?);
                     name = Some(self.atom(&i.name)?);
                     break;
                 }
                 Pattern::Reference(id) => {
-                    reference = Some(self.reference(*id)?);
+                    reference = Some(self.reference(*id, false)?);
                     break;
                 }
                 Pattern::Rest(id) => pattern = *id,
@@ -335,7 +335,7 @@ impl Emitter<'_> {
             let name = self.pattern_atom(entry.binding)?;
             let reference = if decl.kind == DeclKind::Var && entry.initializer.is_some() {
                 if let Pattern::Identifier(id) = &self.ast().pattern(entry.binding).kind {
-                    Some(self.reference_name(id, false)?)
+                    Some(self.reference_name(id, false, false)?)
                 } else {
                     None
                 }

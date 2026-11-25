@@ -776,10 +776,25 @@ impl Emitter<'_> {
         Ok(())
     }
 
-    pub(crate) fn reference_name(&mut self, name: &Ident, init: bool) -> Result<Reference> {
+    /// The reference `name` makes. `reads_first` says its value is read
+    /// before anything is stored to it.
+    pub(crate) fn reference_name(
+        &mut self,
+        name: &Ident,
+        init: bool,
+        reads_first: bool,
+    ) -> Result<Reference> {
         let atom = self.atom(&name.name)?;
         let binding = self.scoped(atom);
         if init || self.local_binding(binding) {
+            return Ok(Reference::Binding(binding));
+        }
+        // Loading and storing a global by name gives what a reference gives,
+        // unless strict code stores to a name it hasn't read and this script
+        // doesn't declare, which must still exist after its value is made.
+        if let Some(declared) = self.static_global(binding)
+            && (declared || reads_first || !self.f().bytecode.strict)
+        {
             return Ok(Reference::Binding(binding));
         }
         self.ir(IrOp::ScopeMakeRef {
@@ -789,11 +804,11 @@ impl Emitter<'_> {
         Ok(Reference::Dynamic(binding, self.stash()?))
     }
 
-    pub(crate) fn reference(&mut self, id: ExprId) -> Result<Reference> {
+    pub(crate) fn reference(&mut self, id: ExprId, reads_first: bool) -> Result<Reference> {
         use Opcode::*;
         let node = self.ast().expr(self.unparen(id));
         Ok(match &node.kind {
-            Expr::Identifier(name) => return self.reference_name(name, false),
+            Expr::Identifier(name) => return self.reference_name(name, false, reads_first),
             Expr::Member { object, key, .. } if self.is_super(*object) => {
                 self.super_base(key)?;
                 Reference::Super
@@ -941,8 +956,11 @@ impl Emitter<'_> {
         use AssignOp::*;
         let pattern = &self.ast().pattern(target).kind;
         let (r, name) = match pattern {
-            Pattern::Identifier(i) => (self.reference_name(i, false)?, Some(self.atom(&i.name)?)),
-            Pattern::Reference(id) => (self.reference(*id)?, None),
+            Pattern::Identifier(i) => (
+                self.reference_name(i, false, !matches!(op, Assign))?,
+                Some(self.atom(&i.name)?),
+            ),
+            Pattern::Reference(id) => (self.reference(*id, !matches!(op, Assign))?, None),
             _ => {
                 self.expression(expr)?;
                 self.plain(Opcode::Dup);
@@ -1005,7 +1023,7 @@ impl Emitter<'_> {
 
     fn update(&mut self, op: UpdateOp, id: ExprId, prefix: bool) -> Result {
         use Opcode::*;
-        let reference = self.reference(id)?;
+        let reference = self.reference(id, true)?;
         self.load_reference(reference);
         self.plain(match (prefix, op) {
             (true, UpdateOp::Inc) => Inc,

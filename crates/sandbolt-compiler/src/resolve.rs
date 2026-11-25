@@ -46,6 +46,33 @@ impl Emitter<'_> {
         }
     }
 
+    /// Whether `name` resolves to a global without passing a `with` or eval
+    /// scope, and if so, whether this script declares it, which makes the
+    /// binding one that can't be missing or deleted.
+    pub(crate) fn static_global(&self, name: ScopedName) -> Option<bool> {
+        let mut function = self.current;
+        let mut scope = name.scope;
+        loop {
+            let draft = &self.functions[function];
+            let block = &draft.scopes[usize::from(scope)];
+            if let Some(slot) = block.names.get(&name.name) {
+                return matches!(slot, Slot::Global(_))
+                    .then_some(self.options.goal == sandbolt_syntax::ParseGoal::Script);
+            }
+            if block.with_object.is_some() || block.eval_object.is_some() {
+                return None;
+            }
+            if let Some(parent) = block.info.parent {
+                scope = parent;
+            } else if let Some((parent, enclosing)) = draft.parent {
+                function = parent;
+                scope = enclosing;
+            } else {
+                return Some(false);
+            }
+        }
+    }
+
     pub(crate) fn capture_frame_slot(&mut self, function: usize, slot: Slot) -> Result {
         let f = &mut self.functions[function].bytecode;
         let index = match slot {
