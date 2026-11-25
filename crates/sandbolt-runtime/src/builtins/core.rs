@@ -90,13 +90,13 @@ fn require_callable(ctx: &mut ExecCtx<'_, '_>, value: Value) -> JsResult<()> {
     {
         Ok(())
     } else {
-        Err(ctx.throw_type_error("expected a callable function"))
+        Err(ctx.throw_type_error("not a function"))
     }
 }
 
 fn require_coercible(ctx: &mut ExecCtx<'_, '_>, value: Value) -> JsResult<()> {
     if matches!(value, Value::NULL | Value::UNDEFINED) {
-        Err(ctx.throw_type_error("cannot convert null or undefined to object"))
+        Err(ctx.throw_type_error("Cannot convert undefined or null to object"))
     } else {
         Ok(())
     }

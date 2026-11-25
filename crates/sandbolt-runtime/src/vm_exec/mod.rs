@@ -4534,10 +4534,7 @@ fn slow_op(
             return Err(match kind {
                 0 => ctx.throw_type_error(&format!("'{name}' is read-only")),
                 1 => ctx.throw_error(ErrorKind::Syntax, &format!("redeclaration of '{name}'")),
-                2 => ctx.throw_error(
-                    ErrorKind::Reference,
-                    &format!("'{name}' is not initialized"),
-                ),
+                2 => ctx.throw_error(ErrorKind::Reference, &format!("{name} is not initialized")),
                 3 => ctx.throw_error(ErrorKind::Reference, "unsupported reference to 'super'"),
                 4 => ctx.throw_type_error("iterator does not have a throw method"),
                 _ => ctx.throw_error(ErrorKind::Internal, "invalid throw error kind"),
@@ -4620,9 +4617,10 @@ fn slow_op(
             match op {
                 GetLocCheck => {
                     if current == Value::UNINITIALIZED {
-                        ctx.with_realm(frame.caller_realm, |ctx| {
-                            bindings::check_initialized(ctx, current)
-                        })?;
+                        let name = bindings::local_name(ctx, code, n);
+                        return Err(ctx.with_realm(frame.caller_realm, |ctx| {
+                            bindings::throw_uninitialized(ctx, name.as_deref())
+                        }));
                     }
                     replace(ctx, 0, &[current]);
                 }
@@ -4630,14 +4628,14 @@ fn slow_op(
                 SetLocUninitialized => ctx.runtime.vm.stack[slot] = Value::UNINITIALIZED,
                 _ => {
                     if op == PutLocCheck && current == Value::UNINITIALIZED {
-                        ctx.with_realm(frame.caller_realm, |ctx| {
-                            bindings::check_initialized(ctx, current)
-                        })?;
+                        let name = bindings::local_name(ctx, code, n);
+                        return Err(ctx.with_realm(frame.caller_realm, |ctx| {
+                            bindings::throw_uninitialized(ctx, name.as_deref())
+                        }));
                     }
                     if op == PutLocCheckInit && current != Value::UNINITIALIZED {
-                        return Err(
-                            ctx.throw_error(ErrorKind::Reference, "binding already initialized")
-                        );
+                        let name = bindings::local_name(ctx, code, n);
+                        return Err(bindings::throw_already_initialized(ctx, name.as_deref()));
                     }
                     ctx.runtime.vm.stack[slot] = value(ctx, 1);
                     replace(ctx, 1, &[]);
@@ -4926,7 +4924,7 @@ fn expand_array_like<'s>(
         .as_object()
         .is_some_and(|id| call::is_callable(ctx.heap(), id));
     if !valid {
-        return Err(ctx.throw_type_error("expected a callable function"));
+        return Err(ctx.throw_type_error("not a function"));
     }
     let count = if allow_nullish && (raw == Value::NULL || raw == Value::UNDEFINED) {
         0

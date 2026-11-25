@@ -438,6 +438,9 @@ impl Parser<'_> {
         self.expect_word("function")?;
         let is_generator = self.eat("*")?;
         let name = if named || !self.punct("(") {
+            if named && !matches!(self.current.kind, TokenKind::Word(_)) {
+                return Err(self.error("function name expected"));
+            }
             Some(self.ident()?)
         } else {
             None
@@ -487,6 +490,9 @@ impl Parser<'_> {
         let outer = self.ctx;
         self.ctx.strict = true;
         let name = if named || (!self.punct("{") && !self.word("extends")) {
+            if named && !matches!(self.current.kind, TokenKind::Word(_)) {
+                return Err(self.error("class statement requires a name"));
+            }
             Some(self.ident()?)
         } else {
             None

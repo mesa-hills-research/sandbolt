@@ -146,7 +146,7 @@ pub(super) fn dispatch<'s>(
         QUEUE_MICROTASK => {
             let callback = arg(ctx, args, 0)?;
             if !callable(ctx, ctx.get(callback)) {
-                return Err(ctx.throw_type_error("expected a callable function"));
+                return Err(ctx.throw_type_error("not a function"));
             }
             let job = closure(ctx, MICROTASK_JOB, callback, 0)?;
             let undefined = ctx.root(Value::UNDEFINED)?;

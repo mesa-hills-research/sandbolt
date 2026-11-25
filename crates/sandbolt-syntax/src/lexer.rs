@@ -197,9 +197,16 @@ impl<'a> Lexer<'a> {
             _ if self.cp().is_some_and(|(c, _)| id_start(c)) => {
                 TokenKind::Word(self.identifier(start)?)
             }
-            _ => self
-                .punctuation()
-                .ok_or_else(|| self.error(start, "Unexpected character"))?,
+            _ => self.punctuation().ok_or_else(|| {
+                let message = match self.cp() {
+                    Some((c, _)) if (0x20..=0x7e).contains(&c) => {
+                        format!("unexpected token: '{}'", char::from_u32(c).unwrap())
+                    }
+                    Some((c, _)) => format!("unexpected token: '\\u{c:04x}'"),
+                    None => "Unexpected end of input".into(),
+                };
+                self.error(start, &message)
+            })?,
         };
         self.line_head = false;
         Ok(Token {

@@ -293,7 +293,7 @@ fn enter_call(
     let mut require_object = false;
     let mut callee = ctx.runtime.vm.stack[base]
         .as_object()
-        .ok_or_else(|| ctx.throw_type_error("expected a callable function"))?;
+        .ok_or_else(|| ctx.throw_type_error("not a function"))?;
     loop {
         if let Some(target) = new_target {
             for id in [callee, target] {
@@ -333,7 +333,7 @@ fn enter_call(
             }
             ObjectData::Proxy(proxy) => {
                 if !proxy.callable && new_target.is_none() {
-                    return Err(ctx.throw_type_error("expected a callable function"));
+                    return Err(ctx.throw_type_error("not a function"));
                 }
                 let (target, handler) = super::property::proxy_parts(ctx, callee)?;
                 if let Some(trap) = proxy_call(ctx, base, count, target, handler, new_target)? {
@@ -360,11 +360,11 @@ fn enter_call(
                 (count, new_target) = exec::transform_native_call(ctx, forward, base, count)?;
                 callee = ctx.runtime.vm.stack[base]
                     .as_object()
-                    .ok_or_else(|| ctx.throw_type_error("expected a callable function"))?;
+                    .ok_or_else(|| ctx.throw_type_error("not a function"))?;
                 ctx.check_interrupt()?;
             }
             ObjectData::BytecodeFunction(_) | ObjectData::NativeFunction(_) => break,
-            _ => return Err(ctx.throw_type_error("expected a callable function")),
+            _ => return Err(ctx.throw_type_error("not a function")),
         }
     }
     let (realm, code, preallocate) = match &ctx.heap().object(callee).data {

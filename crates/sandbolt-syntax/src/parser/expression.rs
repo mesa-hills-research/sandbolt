@@ -400,7 +400,13 @@ impl Parser<'_> {
                 }
                 Expr::Identifier(self.ident()?)
             }
-            _ => return Err(self.error("Expected an expression")),
+            _ => {
+                if self.eof() {
+                    return Err(self.error("Unexpected end of input"));
+                }
+                let text = String::from_utf8_lossy(self.source.slice(self.current.span));
+                return Err(self.error(&format!("unexpected token in expression: '{text}'")));
+            }
         };
         self.expr(start, kind)
     }

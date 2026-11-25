@@ -74,16 +74,17 @@ fn parse<'s>(ctx: &mut ExecCtx<'_, 's>, args: Args<'s>, raw: bool) -> JsResult<V
         text: id,
         pos: 0,
         record_source: reviver.is_some(),
+        raw,
     };
     if raw && matches!(parser.peek(ctx), None | Some(9 | 10 | 13 | 32 | 91 | 123)) {
-        return Err(invalid(ctx));
+        return Err(parser.raw_invalid(ctx));
     }
     let (value, meta) = parser.value(ctx)?;
     if !raw {
         parser.whitespace(ctx)?;
     }
     if parser.peek(ctx).is_some() {
-        return Err(invalid(ctx));
+        return Err(parser.syntax_error(ctx, "unexpected data at the end"));
     }
     if raw {
         let raw = ctx.get(text);
@@ -157,14 +158,22 @@ impl Unit for u16 {}
 
 /// Why reading or writing JSON text stopped.
 enum Fault {
-    Invalid,
+    UnexpectedEof,
+    BadControl(usize),
+    BadEscape(usize),
+    BadUnicodeEscape(usize),
     Interrupted,
 }
 
 impl Fault {
-    fn throw(self, ctx: &mut ExecCtx<'_, '_>) -> Abrupt {
+    fn throw(self, parser: &Parser, ctx: &mut ExecCtx<'_, '_>) -> Abrupt {
         match self {
-            Self::Invalid => invalid(ctx),
+            Self::UnexpectedEof => parser.unexpected_eof(ctx),
+            Self::BadControl(pos) => {
+                parser.error_at(ctx, pos, "Bad control character in string literal")
+            }
+            Self::BadEscape(pos) => parser.error_at(ctx, pos, "Bad escaped character"),
+            Self::BadUnicodeEscape(pos) => parser.error_at(ctx, pos, "Bad Unicode escape"),
             Self::Interrupted => {
                 ctx.take_exception();
                 Abrupt::Interrupted
@@ -176,6 +185,15 @@ impl Fault {
 /// Polls the interrupt handler, which the heap can stay borrowed beside.
 fn interrupted(stop: &mut Option<Box<dyn FnMut() -> bool>>) -> bool {
     stop.as_mut().is_some_and(|stop| stop())
+}
+
+fn hex_digit(unit: u16) -> Option<u16> {
+    match unit {
+        48..=57 => Some(unit - 48),
+        65..=70 => Some(unit - 65 + 10),
+        97..=102 => Some(unit - 97 + 10),
+        _ => None,
+    }
 }
 
 /// The end of the string token whose units start at `start` (after its
@@ -191,15 +209,31 @@ fn scan<U: Unit>(
         if step.is_multiple_of(4096) && interrupted(stop) {
             return Err(Fault::Interrupted);
         }
-        let unit: u16 = (*units.get(end).ok_or(Fault::Invalid)?).into();
+        let unit: u16 = (*units.get(end).ok_or(Fault::UnexpectedEof)?).into();
         match unit {
             34 => break,
-            0..=31 => return Err(Fault::Invalid),
+            0..=31 => return Err(Fault::BadControl(end)),
             92 => {
-                if units.get(end + 1).map(|&unit| unit.into()) == Some(117) {
-                    wide |= hex(units.get(end + 2..end + 6)).is_some_and(|unit| unit > 0xff);
+                let escape: u16 = (*units.get(end + 1).ok_or(Fault::UnexpectedEof)?).into();
+                match escape {
+                    34 | 47 | 92 | 98 | 102 | 110 | 114 | 116 => end += 2,
+                    117 => {
+                        let mut code = 0u16;
+                        for offset in 0..4 {
+                            let pos = end + 2 + offset;
+                            let Some(&digit) = units.get(pos) else {
+                                return Err(Fault::BadUnicodeEscape(pos));
+                            };
+                            let Some(nibble) = hex_digit(digit.into()) else {
+                                return Err(Fault::BadUnicodeEscape(pos));
+                            };
+                            code = (code << 4) | nibble;
+                        }
+                        wide |= code > 0xff;
+                        end += 6;
+                    }
+                    _ => return Err(Fault::BadEscape(end + 1)),
                 }
-                end += 2;
             }
             _ => {
                 wide |= unit > 0xff;
@@ -213,13 +247,7 @@ fn scan<U: Unit>(
 /// The four hex digits of a `\u` escape as the unit they write.
 fn hex<U: Unit>(digits: Option<&[U]>) -> Option<u16> {
     digits?.iter().try_fold(0, |unit, &digit| {
-        let digit = match digit.into() {
-            digit @ 48..=57 => digit - 48,
-            digit @ 65..=70 => digit - 65 + 10,
-            digit @ 97..=102 => digit - 97 + 10,
-            _ => return None,
-        };
-        Some((unit << 4) | digit)
+        Some((unit << 4) | hex_digit(digit.into())?)
     })
 }
 
@@ -245,7 +273,7 @@ fn decode<U: Unit>(
             index += 1;
             continue;
         }
-        let escape: u16 = (*units.get(index + 1).ok_or(Fault::Invalid)?).into();
+        let escape: u16 = (*units.get(index + 1).ok_or(Fault::UnexpectedEof)?).into();
         let unit = match escape {
             34 | 47 | 92 => escape,
             98 => 8,
@@ -254,11 +282,12 @@ fn decode<U: Unit>(
             114 => 13,
             116 => 9,
             117 => {
-                let unit = hex(units.get(index + 2..index + 6)).ok_or(Fault::Invalid)?;
+                let unit = hex(units.get(index + 2..index + 6))
+                    .ok_or(Fault::BadUnicodeEscape(index + 2))?;
                 index += 4;
                 unit
             }
-            _ => return Err(Fault::Invalid),
+            _ => return Err(Fault::BadEscape(index + 1)),
         };
         out.push_reserved(unit);
         index += 2;
@@ -284,8 +313,34 @@ fn slice<'s>(
     ctx.new_string_from_units(out)
 }
 
-fn invalid(ctx: &mut ExecCtx<'_, '_>) -> Abrupt {
-    ctx.throw_error(ErrorKind::Syntax, "invalid JSON")
+fn line_col(flat: Flat<'_>, pos: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut line_start = 0usize;
+    let mut i = 0usize;
+    while i < pos {
+        match flat.get(i) {
+            Some(13) => {
+                i += 1 + usize::from(flat.get(i + 1) == Some(10));
+                line += 1;
+                line_start = i;
+            }
+            Some(10) => {
+                i += 1;
+                line += 1;
+                line_start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    (line, pos.saturating_sub(line_start) + 1)
+}
+
+fn is_ident_start(unit: u16) -> bool {
+    matches!(unit, 65..=90 | 97..=122 | 95 | 36)
+}
+
+fn is_ident_continue(unit: u16) -> bool {
+    is_ident_start(unit) || matches!(unit, 48..=57)
 }
 
 thread_local! {
@@ -323,11 +378,64 @@ struct Parser {
     text: StrId,
     pos: usize,
     record_source: bool,
+    raw: bool,
 }
 
 type Parsed<'s> = (Handle<'s>, Option<Handle<'s>>);
 
 impl Parser {
+    fn raw_invalid(&self, ctx: &mut ExecCtx<'_, '_>) -> Abrupt {
+        ctx.throw_error(ErrorKind::Syntax, "invalid rawJSON string")
+    }
+
+    fn syntax_error(&self, ctx: &mut ExecCtx<'_, '_>, message: &str) -> Abrupt {
+        if self.raw {
+            return self.raw_invalid(ctx);
+        }
+        ctx.throw_error(ErrorKind::Syntax, message)
+    }
+
+    fn error_at(&self, ctx: &mut ExecCtx<'_, '_>, pos: usize, reason: &str) -> Abrupt {
+        if self.raw {
+            return self.raw_invalid(ctx);
+        }
+        let (line, col) = line_col(Flat::of(ctx.heap(), self.text), pos);
+        ctx.throw_error(
+            ErrorKind::Syntax,
+            &format!("{reason} in JSON at position {pos} (line {line} column {col})"),
+        )
+    }
+
+    fn unexpected_eof(&self, ctx: &mut ExecCtx<'_, '_>) -> Abrupt {
+        self.syntax_error(ctx, "Unexpected end of JSON input")
+    }
+
+    fn unexpected_token(&self, ctx: &mut ExecCtx<'_, '_>, start: usize) -> Abrupt {
+        if self.raw {
+            return self.raw_invalid(ctx);
+        }
+        let flat = Flat::of(ctx.heap(), self.text);
+        let Some(first) = flat.get(start) else {
+            return self.unexpected_eof(ctx);
+        };
+        if is_ident_start(first) {
+            let mut end = start + 1;
+            while flat.get(end).is_some_and(is_ident_continue) {
+                end += 1;
+            }
+            let mut token = String::with_capacity(end - start);
+            for unit in flat.units(start, end) {
+                token.push(char::from(unit as u8));
+            }
+            return ctx.throw_error(ErrorKind::Syntax, &format!("unexpected token: '{token}'"));
+        }
+        if (0x20..=0x7e).contains(&first) {
+            let ch = char::from(first as u8);
+            return ctx.throw_error(ErrorKind::Syntax, &format!("unexpected token: '{ch}'"));
+        }
+        self.error_at(ctx, start, &format!("Unexpected token '\\u{first:04x}'"))
+    }
+
     fn peek(&self, ctx: &ExecCtx<'_, '_>) -> Option<u16> {
         Flat::of(ctx.heap(), self.text).get(self.pos)
     }
@@ -348,14 +456,6 @@ impl Parser {
         true
     }
 
-    fn expect(&mut self, ctx: &mut ExecCtx<'_, '_>, byte: u8) -> JsResult<()> {
-        if self.eat(ctx, byte) {
-            Ok(())
-        } else {
-            Err(invalid(ctx))
-        }
-    }
-
     fn whitespace(&mut self, ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
         while matches!(self.peek(ctx), Some(9 | 10 | 13 | 32)) {
             self.advance(ctx)?;
@@ -369,8 +469,14 @@ impl Parser {
         word: &[u8],
         value: Value,
     ) -> JsResult<Handle<'s>> {
+        let start = self.pos;
         for &byte in word {
-            self.expect(ctx, byte)?;
+            if !self.eat(ctx, byte) {
+                return Err(self.unexpected_token(ctx, start));
+            }
+        }
+        if self.peek(ctx).is_some_and(is_ident_continue) {
+            return Err(self.unexpected_token(ctx, start));
         }
         ctx.root(value)
     }
@@ -380,13 +486,14 @@ impl Parser {
         self.whitespace(ctx)?;
         let start = self.pos;
         let value = match self.peek(ctx) {
+            None => return Err(self.unexpected_eof(ctx)),
             Some(34) => self.string(ctx),
             Some(110) => self.literal(ctx, b"null", Value::NULL),
             Some(116) => self.literal(ctx, b"true", Value::bool(true)),
             Some(102) => self.literal(ctx, b"false", Value::bool(false)),
             Some(45 | 48..=57) => self.number(ctx),
             Some(91 | 123) => return self.compound(ctx),
-            _ => return Err(invalid(ctx)),
+            Some(_) => return Err(self.unexpected_token(ctx, start)),
         }?;
         let meta = self
             .record_source
@@ -409,7 +516,8 @@ impl Parser {
         let close = if array {
             b']'
         } else {
-            self.expect(ctx, b'{')?;
+            let eaten = self.eat(ctx, b'{');
+            debug_assert!(eaten);
             b'}'
         };
         let object = if array {
@@ -442,10 +550,19 @@ impl Parser {
                     index_key(ctx, index)?
                 } else {
                     self.whitespace(ctx)?;
+                    if self.peek(ctx) != Some(34) {
+                        return Err(self.error_at(ctx, self.pos, "Expected property name or '}'"));
+                    }
                     let key = self.string(ctx)?;
                     let key = ctx.intern(key)?;
                     self.whitespace(ctx)?;
-                    self.expect(ctx, b':')?;
+                    if !self.eat(ctx, b':') {
+                        return Err(self.error_at(
+                            ctx,
+                            self.pos,
+                            "Expected ':' after property name",
+                        ));
+                    }
                     key
                 };
                 let (value, child) = self.value(ctx)?;
@@ -460,13 +577,21 @@ impl Parser {
             if self.eat(ctx, close) {
                 break;
             }
-            self.expect(ctx, b',')?;
+            if !self.eat(ctx, b',') {
+                let reason = if array {
+                    "Expected ',' or ']' after array element"
+                } else {
+                    "Expected ',' or '}' after property value"
+                };
+                return Err(self.error_at(ctx, self.pos, reason));
+            }
         }
         Ok((object, meta))
     }
 
     fn string<'s>(&mut self, ctx: &mut ExecCtx<'_, 's>) -> JsResult<Handle<'s>> {
-        self.expect(ctx, b'"')?;
+        let eaten = self.eat(ctx, b'"');
+        debug_assert!(eaten);
         let start = self.pos;
         let runtime = &mut *ctx.runtime;
         let stop = &mut runtime.vm.interrupt_handler;
@@ -474,7 +599,7 @@ impl Parser {
             Flat::Latin1(units) => scan(units, start, stop),
             Flat::Utf16(units) => scan(units, start, stop),
         };
-        let (end, wide) = scanned.map_err(|fault| fault.throw(ctx))?;
+        let (end, wide) = scanned.map_err(|fault| fault.throw(self, ctx))?;
         // Escapes only shorten it, so the string fits in the token's length.
         let mut out = UnitBuffer::default();
         reserve(ctx, &mut out, end - start, wide)?;
@@ -484,15 +609,12 @@ impl Parser {
             Flat::Latin1(units) => decode(&units[start..end], &mut out, stop),
             Flat::Utf16(units) => decode(&units[start..end], &mut out, stop),
         };
-        decoded.map_err(|fault| fault.throw(ctx))?;
+        decoded.map_err(|fault| fault.throw(self, ctx))?;
         self.pos = end + 1;
         ctx.new_string_from_units(out)
     }
 
     fn digits(&mut self, ctx: &mut ExecCtx<'_, '_>) -> JsResult<()> {
-        if !matches!(self.peek(ctx), Some(48..=57)) {
-            return Err(invalid(ctx));
-        }
         while matches!(self.peek(ctx), Some(48..=57)) {
             self.advance(ctx)?;
         }
@@ -501,16 +623,31 @@ impl Parser {
 
     fn number<'s>(&mut self, ctx: &mut ExecCtx<'_, 's>) -> JsResult<Handle<'s>> {
         let start = self.pos;
-        self.eat(ctx, b'-');
-        if !self.eat(ctx, b'0') {
+        let neg = self.eat(ctx, b'-');
+        let int_start = self.pos;
+        if self.eat(ctx, b'0') {
+            if matches!(self.peek(ctx), Some(48..=57)) {
+                return Err(self.error_at(ctx, int_start, "Unexpected number"));
+            }
+        } else if matches!(self.peek(ctx), Some(48..=57)) {
             self.digits(ctx)?;
+        } else if neg {
+            return Err(self.error_at(ctx, start, "No number after minus sign"));
+        } else {
+            return Err(self.unexpected_token(ctx, start));
         }
         if self.eat(ctx, b'.') {
+            if !matches!(self.peek(ctx), Some(48..=57)) {
+                return Err(self.error_at(ctx, self.pos, "Unterminated fractional number"));
+            }
             self.digits(ctx)?;
         }
         if self.eat(ctx, b'e') || self.eat(ctx, b'E') {
             if !self.eat(ctx, b'+') {
                 self.eat(ctx, b'-');
+            }
+            if !matches!(self.peek(ctx), Some(48..=57)) {
+                return Err(self.error_at(ctx, self.pos, "Exponent part is missing a number"));
             }
             self.digits(ctx)?;
         }
@@ -997,7 +1134,8 @@ fn escape(
     let mut index = 0usize;
     while let Some(unit) = units.next() {
         if index.is_multiple_of(4096) && interrupted(stop) {
-            return Err(Fault::Interrupted.throw(ctx));
+            ctx.take_exception();
+            return Err(Abrupt::Interrupted);
         }
         index += 1;
         if !quote {

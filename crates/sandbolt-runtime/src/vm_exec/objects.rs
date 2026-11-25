@@ -159,11 +159,12 @@ fn strict_set<'s>(
     value: Handle<'s>,
     strict: bool,
 ) -> JsResult<()> {
-    let boxed = convert::to_object(ctx, object)?;
-    if !property::set_property_with_receiver(ctx, boxed, key, value, object)? && strict {
-        return Err(ctx.throw_type_error("cannot assign property"));
+    let kind = ctx.get(object).decode();
+    if matches!(kind, ValueKind::Null | ValueKind::Undefined) {
+        return Err(property::throw_nullish_set_key(ctx, kind, key));
     }
-    Ok(())
+    let boxed = convert::to_object(ctx, object)?;
+    property::set_property_with_receiver_strict(ctx, boxed, key, value, object, strict)
 }
 
 fn set_home(ctx: &mut ExecCtx<'_, '_>, function: Value, home: ObjId) {
@@ -286,9 +287,7 @@ pub(super) fn object_op(
             }
             PutSuperValue => {
                 let key = convert::to_property_key(ctx, h(2))?;
-                if !property::set_property_with_receiver(ctx, h(3), key, h(1), h(4))? && strict {
-                    return Err(ctx.throw_type_error("cannot assign super property"));
-                }
+                property::set_property_with_receiver_strict(ctx, h(3), key, h(1), h(4), strict)?;
                 none(4)
             }
             CheckObject => {
@@ -303,14 +302,16 @@ pub(super) fn object_op(
                 if op == ToPropkey2
                     && (ctx.get(h(2)) == Value::NULL || ctx.get(h(2)) == Value::UNDEFINED)
                 {
-                    return Err(ctx.throw_type_error("cannot access property of null or undefined"));
+                    return Err(ctx.throw_type_error("value has no property"));
                 }
                 let key = convert::to_property_key(ctx, h(1))?;
                 let value = convert::key_value(ctx, key)?;
                 one(1, ctx.get(value))
             }
             In => {
-                ctx.object_id(h(1))?;
+                if ctx.get(h(1)).as_object().is_none() {
+                    return Err(ctx.throw_type_error("invalid 'in' operand"));
+                }
                 let key = convert::to_property_key(ctx, h(2))?;
                 one(2, Value::bool(property::has_property(ctx, h(1), key)?))
             }
@@ -320,7 +321,7 @@ pub(super) fn object_op(
                 let object = convert::to_object(ctx, h(2))?;
                 let deleted = property::delete_property(ctx, object, key)?;
                 if !deleted && strict {
-                    return Err(ctx.throw_type_error("cannot delete property"));
+                    return Err(ctx.throw_type_error("could not delete property"));
                 }
                 one(2, Value::bool(deleted))
             }
@@ -349,9 +350,17 @@ pub(super) fn object_op(
                         none(2)
                     }
                     (DefinePrivateField, Some(_)) => {
-                        return Err(ctx.throw_type_error("private field already exists"));
+                        let field = property::key_text(ctx.heap(), name);
+                        return Err(ctx.throw_type_error(&format!(
+                            "private class field '{field}' already exists"
+                        )));
                     }
-                    _ => return Err(ctx.throw_type_error("object does not have the private field")),
+                    _ => {
+                        let field = property::key_text(ctx.heap(), name);
+                        return Err(ctx.throw_type_error(&format!(
+                            "private class field '{field}' does not exist"
+                        )));
+                    }
                 }
             }
             PrivateIn | CheckBrand => {
@@ -560,14 +569,16 @@ fn define_class<'s>(
         };
         (constructor, proto)
     } else {
-        let id = ctx.object_id(parent)?;
+        let Some(id) = parent_value.as_object() else {
+            return Err(ctx.throw_type_error("parent class must be constructor"));
+        };
         if !ctx
             .heap()
             .object(id)
             .flags
             .contains(ObjectFlags::IS_CONSTRUCTOR)
         {
-            return Err(ctx.throw_type_error("parent class must be a constructor"));
+            return Err(ctx.throw_type_error("parent class must be constructor"));
         }
         let proto = property::get_property(ctx, parent, Atom::get("prototype"))?;
         let proto = if proto.as_object().is_some() {
@@ -645,7 +656,9 @@ pub(super) fn get_method<'s>(
 fn instance_of<'s>(ctx: &mut ExecCtx<'_, 's>, lhs: Handle<'s>, rhs: Handle<'s>) -> JsResult<bool> {
     let mut rhs = rhs;
     loop {
-        let id = ctx.object_id(rhs)?;
+        let Some(id) = ctx.get(rhs).as_object() else {
+            return Err(ctx.throw_type_error("invalid 'instanceof' right operand"));
+        };
         if let Some(method) = get_method(ctx, rhs, well_known(ctx, WellKnown::HasInstance))? {
             let args = ctx.args(&[lhs])?;
             let result = call::call(ctx, method, rhs, args)?;
@@ -656,7 +669,7 @@ fn instance_of<'s>(ctx: &mut ExecCtx<'_, 's>, lhs: Handle<'s>, rhs: Handle<'s>) 
             continue;
         }
         if !call::is_callable(ctx.heap(), id) {
-            return Err(ctx.throw_type_error("right operand is not callable"));
+            return Err(ctx.throw_type_error("invalid 'instanceof' right operand"));
         }
         if ctx.get(lhs).as_object().is_none() {
             return Ok(false);
