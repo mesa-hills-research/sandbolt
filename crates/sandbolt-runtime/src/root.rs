@@ -850,7 +850,7 @@ impl<'s> ExecCtx<'_, 's> {
     ) -> JsResult<Handle<'s>> {
         let target = self.object_id(target)?;
         if !crate::ops::call::is_callable(self.heap(), target) {
-            return Err(self.throw_type_error("expected a callable function"));
+            return Err(self.throw_type_error("not a function"));
         }
         let value = self.get(this);
         let proto = self.heap().shape(self.heap().object(target).shape).proto;

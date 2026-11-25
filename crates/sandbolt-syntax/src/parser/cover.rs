@@ -239,7 +239,7 @@ impl Parser<'_> {
                     if binding {
                         "Invalid binding pattern"
                     } else {
-                        "Invalid assignment target"
+                        "invalid assignment left-hand side"
                     },
                 ));
             }

@@ -307,7 +307,7 @@ impl<'a> Validator<'a> {
                     .iter()
                     .any(|(label, _)| *label == name.name)
                 {
-                    return Err(self.error(name.span, "Duplicate label"));
+                    return Err(self.error(name.span, &format!("duplicate label '{}'", name.name)));
                 }
                 let mut end = *body;
                 while let Stmt::Label { body, .. } = self.arena.stmt(end).kind {
@@ -332,15 +332,22 @@ impl<'a> Validator<'a> {
                         .iter()
                         .any(|(name, iteration)| *name == label.name && (is_break || *iteration))
                     {
-                        return Err(self.error(label.span, "Label does not name a valid target"));
+                        return Err(
+                            self.error(label.span, &format!("undefined label '{}'", label.name))
+                        );
                     }
                 } else if self.ctx.loop_depth == 0 && (!is_break || self.ctx.switch_depth == 0) {
-                    return Err(self.error(span, "Statement has no control-flow target"));
+                    let msg = if is_break {
+                        "break must be inside loop or switch"
+                    } else {
+                        "continue must be inside loop"
+                    };
+                    return Err(self.error(span, msg));
                 }
             }
             Stmt::Return(value) => {
                 if !self.ctx.return_allowed {
-                    return Err(self.error(span, "'return' requires a function body"));
+                    return Err(self.error(span, "return not in a function"));
                 }
                 if let Some(id) = value {
                     self.expression(*id)?;
@@ -387,7 +394,7 @@ impl<'a> Validator<'a> {
                 .get(id.name.as_str())
                 .is_some_and(|k| *k != LexKind::SimpleCatch)
             {
-                return Err(self.error(id.span, "Variable conflicts with a lexical binding"));
+                return Err(self.error(id.span, &format!("redeclaration of '{}'", id.name)));
             }
             scope.var.insert(&id.name);
             if scope.kind != ScopeKind::Block {
@@ -409,7 +416,7 @@ impl<'a> Validator<'a> {
                     && kind == LexKind::OrdinaryFunction)
             })
         {
-            return Err(self.error(id.span, "Duplicate lexical binding"));
+            return Err(self.error(id.span, &format!("redeclaration of '{}'", id.name)));
         }
         scope.lexical.insert(name, kind);
         Ok(())
@@ -447,7 +454,7 @@ impl<'a> Validator<'a> {
                 }
                 self.expression(init)?;
             } else if loop_kind.is_none() && (!simple || using || decl.kind == DeclKind::Const) {
-                return Err(self.error(binding.span, "Binding requires an initializer"));
+                return Err(self.error(binding.span, "missing initializer for variable"));
             }
             self.pattern(
                 entry.binding,
@@ -519,7 +526,7 @@ impl<'a> Validator<'a> {
                         | "yield"
                 ));
         if reserved {
-            return Err(self.error(id.span, "Reserved word cannot be used as an identifier"));
+            return Err(self.error(id.span, &format!("'{}' is a reserved identifier", id.name)));
         }
         if binding {
             self.restricted_assignment(id)?;
@@ -528,7 +535,10 @@ impl<'a> Validator<'a> {
     }
     fn restricted_assignment(&self, id: &Ident) -> Result {
         if self.ctx.strict && matches!(id.name.as_str(), "eval" | "arguments") {
-            Err(self.error(id.span, "Cannot bind or assign this name in strict mode"))
+            Err(self.error(
+                id.span,
+                &format!("cannot bind or assign '{}' in strict mode", id.name),
+            ))
         } else {
             Ok(())
         }
@@ -543,7 +553,7 @@ impl<'a> Validator<'a> {
             Expr::Parenthesized(inner) => v.reference(*inner, annex_call),
             Expr::Member { .. } => v.expression_inner(node),
             Expr::Call { .. } if annex_call && v.annex_b() => v.expression_inner(node),
-            _ => Err(v.error(node.span, "Invalid assignment target")),
+            _ => Err(v.error(node.span, "invalid assignment left-hand side")),
         })
     }
     fn identifier_expr(&self, id: &Ident) -> Result {
@@ -576,7 +586,7 @@ impl<'a> Validator<'a> {
                     }
                     Binding::Parameter => {
                         if !v.scopes.last_mut().unwrap().params.insert(&id.name) && !exceptional {
-                            return Err(v.error(id.span, "Duplicate parameter"));
+                            return Err(v.error(id.span, &format!("duplicate parameter '{}'", id.name)));
                         }
                         Ok(())
                     }

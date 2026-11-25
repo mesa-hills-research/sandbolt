@@ -150,12 +150,60 @@ pub(super) fn closure(ctx: &mut ExecCtx<'_, '_>, frame: CallFrame, child: BcId) 
     Ok(ctx.get(closure))
 }
 
-pub(super) fn check_initialized(ctx: &mut ExecCtx<'_, '_>, value: Value) -> JsResult<()> {
-    if value == Value::UNINITIALIZED {
-        Err(ctx.throw_error(ErrorKind::Reference, "binding is not initialized"))
+fn display_binding_name(text: String) -> String {
+    if text == "<this>" {
+        "this".into()
     } else {
-        Ok(())
+        text
     }
+}
+
+fn binding_name(ctx: &ExecCtx<'_, '_>, key: PropKey) -> String {
+    display_binding_name(property::key_text(ctx.heap(), key))
+}
+
+pub(super) fn local_name(ctx: &ExecCtx<'_, '_>, code: BcId, local_index: u16) -> Option<String> {
+    let f = compiled(ctx, code);
+    let atom = f
+        .vars
+        .get(f.arg_count as usize + local_index as usize)?
+        .name;
+    let key = f.key(atom);
+    Some(binding_name(ctx, key))
+}
+
+fn closure_name(ctx: &ExecCtx<'_, '_>, frame: CallFrame, index: u16) -> Option<String> {
+    let f = compiled(ctx, frame.code?);
+    let atom = f.closures.get(index as usize)?.name;
+    let key = f.key(atom);
+    Some(binding_name(ctx, key))
+}
+
+pub(super) fn throw_uninitialized(ctx: &mut ExecCtx<'_, '_>, name: Option<&str>) -> Abrupt {
+    match name {
+        Some(name) => ctx.throw_error(ErrorKind::Reference, &format!("{name} is not initialized")),
+        None => ctx.throw_error(ErrorKind::Reference, "binding is not initialized"),
+    }
+}
+
+pub(super) fn throw_already_initialized(ctx: &mut ExecCtx<'_, '_>, name: Option<&str>) -> Abrupt {
+    match name {
+        Some(name) => ctx.throw_error(
+            ErrorKind::Reference,
+            &format!("'{name}' can be initialized only once"),
+        ),
+        None => ctx.throw_error(ErrorKind::Reference, "binding already initialized"),
+    }
+}
+
+fn throw_not_defined(ctx: &mut ExecCtx<'_, '_>, key: PropKey) -> Abrupt {
+    let name = binding_name(ctx, key);
+    ctx.throw_error(ErrorKind::Reference, &format!("{name} is not defined"))
+}
+
+fn throw_read_only(ctx: &mut ExecCtx<'_, '_>, key: PropKey) -> Abrupt {
+    let name = binding_name(ctx, key);
+    ctx.throw_type_error(&format!("'{name}' is read-only"))
 }
 
 pub(super) fn var_op(
@@ -173,17 +221,20 @@ pub(super) fn var_op(
     let current = read_ref(ctx, id);
     match inst.opcode {
         GetVarRef | GetVarRef0 | GetVarRef1 | GetVarRef2 | GetVarRef3 | GetVarRefCheck => {
-            if inst.opcode == GetVarRefCheck {
-                check_initialized(ctx, current)?;
+            if inst.opcode == GetVarRefCheck && current == Value::UNINITIALIZED {
+                let name = closure_name(ctx, frame, index);
+                return Err(throw_uninitialized(ctx, name.as_deref()));
             }
             replace(ctx, 0, &[current]);
         }
         op => {
-            if op == PutVarRefCheck {
-                check_initialized(ctx, current)?;
+            if op == PutVarRefCheck && current == Value::UNINITIALIZED {
+                let name = closure_name(ctx, frame, index);
+                return Err(throw_uninitialized(ctx, name.as_deref()));
             }
             if op == PutVarRefCheckInit && current != Value::UNINITIALIZED {
-                return Err(ctx.throw_error(ErrorKind::Reference, "binding already initialized"));
+                let name = closure_name(ctx, frame, index);
+                return Err(throw_already_initialized(ctx, name.as_deref()));
             }
             let value = *ctx.runtime.vm.stack.last().unwrap();
             write_ref(ctx, id, value);
@@ -310,13 +361,14 @@ fn read_binding<'s>(
     match ctx.get(binding).decode() {
         ValueKind::VarRef(id) => {
             let value = read_ref(ctx, id);
-            check_initialized(ctx, value)?;
+            if value == Value::UNINITIALIZED {
+                let name = binding_name(ctx, key);
+                return Err(throw_uninitialized(ctx, Some(&name)));
+            }
             Ok(value)
         }
         ValueKind::Undefined if missing_ok => Ok(Value::UNDEFINED),
-        ValueKind::Undefined => {
-            Err(ctx.throw_error(ErrorKind::Reference, "binding is not defined"))
-        }
+        ValueKind::Undefined => Err(throw_not_defined(ctx, key)),
         _ => property::get_property(ctx, binding, key),
     }
 }
@@ -332,33 +384,33 @@ fn write_binding<'s>(
     let object = match ctx.get(binding).decode() {
         ValueKind::VarRef(id) => {
             if !initialize {
-                check_initialized(ctx, read_ref(ctx, id))?;
+                if read_ref(ctx, id) == Value::UNINITIALIZED {
+                    let name = binding_name(ctx, key);
+                    return Err(throw_uninitialized(ctx, Some(&name)));
+                }
                 if let Some(kind) = super::eval::immutable_kind(ctx, id) {
                     if kind == sandbolt_bytecode::VarKind::FunctionName && !strict {
                         return Ok(());
                     }
-                    return Err(ctx.throw_type_error("assignment to constant binding"));
+                    return Err(throw_read_only(ctx, key));
                 }
                 if lexical(ctx, key) == Some((id, false)) {
-                    return Err(ctx.throw_type_error("assignment to constant binding"));
+                    return Err(throw_read_only(ctx, key));
                 }
             }
             write_ref(ctx, id, ctx.get(value));
             return Ok(());
         }
         ValueKind::Undefined if strict => {
-            return Err(ctx.throw_error(ErrorKind::Reference, "binding is not defined"));
+            return Err(throw_not_defined(ctx, key));
         }
         ValueKind::Undefined => ctx.root(Value::object(ctx.realm().global_object))?,
         _ => binding,
     };
     if strict && !property::has_property(ctx, object, key)? {
-        return Err(ctx.throw_error(ErrorKind::Reference, "binding is not defined"));
+        return Err(throw_not_defined(ctx, key));
     }
-    if !property::set_property(ctx, object, key, value)? && strict {
-        return Err(ctx.throw_type_error("cannot assign property"));
-    }
-    Ok(())
+    property::set_property_strict(ctx, object, key, value, strict)
 }
 
 pub(super) fn binding_op(
@@ -523,9 +575,10 @@ pub(super) fn binding_op(
                             || (lexical_binding
                                 && existing.is_some_and(|d| d.configurable == Some(false)))
                         {
+                            let name = binding_name(ctx, key);
                             return Err(ctx.throw_error(
                                 ErrorKind::Syntax,
-                                "redeclaration of global binding",
+                                &format!("redeclaration of '{name}'"),
                             ));
                         }
                         if !lexical_binding
@@ -642,9 +695,7 @@ pub(super) fn binding_op(
                             let result = if exists {
                                 property::get_property(ctx, object, key)?
                             } else if strict {
-                                return Err(
-                                    ctx.throw_error(ErrorKind::Reference, "binding is not defined")
-                                );
+                                return Err(throw_not_defined(ctx, key));
                             } else {
                                 Value::UNDEFINED
                             };
@@ -659,13 +710,9 @@ pub(super) fn binding_op(
                         WithPutVar => {
                             let exists = property::has_property(ctx, object, key)?;
                             if strict && !exists {
-                                return Err(
-                                    ctx.throw_error(ErrorKind::Reference, "binding is not defined")
-                                );
+                                return Err(throw_not_defined(ctx, key));
                             }
-                            if !property::set_property(ctx, object, key, h(2))? && strict {
-                                return Err(ctx.throw_type_error("cannot assign property"));
-                            }
+                            property::set_property_strict(ctx, object, key, h(2), strict)?;
                             (2, [Value::EMPTY; 2], target)
                         }
                         WithDeleteVar => (

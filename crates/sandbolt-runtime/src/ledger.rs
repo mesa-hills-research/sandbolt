@@ -265,6 +265,14 @@ impl<T> TrackedVec<T> {
         self.data.push(value);
     }
 
+    pub(crate) fn extend_from_slice_reserved(&mut self, items: &[T])
+    where
+        T: Copy,
+    {
+        assert!(self.capacity() - self.len() >= items.len());
+        self.data.extend_from_slice(items);
+    }
+
     pub fn extend_from_slice(&mut self, ledger: &HeapLedger, items: &[T]) -> AllocResult<()>
     where
         T: Copy,

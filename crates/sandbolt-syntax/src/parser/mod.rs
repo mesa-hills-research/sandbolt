@@ -200,23 +200,35 @@ impl<'a> Parser<'a> {
             Ok(false)
         }
     }
+    fn unexpected_token(&self) -> String {
+        match &self.current.kind {
+            TokenKind::Eof => "Unexpected end of input".into(),
+            TokenKind::Word(ident) => format!("Unexpected identifier '{}'", ident.name),
+            TokenKind::Private(ident) => format!("Unexpected token '#{}'", ident.name),
+            TokenKind::Punct(punct) => format!("Unexpected token '{punct}'"),
+            TokenKind::Number(_) => "Unexpected number".into(),
+            TokenKind::String(_) => "Unexpected string".into(),
+            TokenKind::RegExp(_) => "Unexpected regexp".into(),
+            TokenKind::Template { .. } => "Unexpected string template".into(),
+        }
+    }
     fn expect(&mut self, punct: &str) -> Result<()> {
         if self.eat(punct)? {
             Ok(())
         } else {
-            Err(self.error(&format!("Expected '{punct}'")))
+            Err(self.error(&self.unexpected_token()))
         }
     }
     fn expect_word(&mut self, word: &str) -> Result<()> {
         if self.eat_word(word)? {
             Ok(())
         } else {
-            Err(self.error(&format!("Expected '{word}'")))
+            Err(self.error(&self.unexpected_token()))
         }
     }
     fn ident(&mut self) -> Result<Ident> {
         if !matches!(self.current.kind, TokenKind::Word(_)) {
-            return Err(self.error("Expected an identifier"));
+            return Err(self.error(&self.unexpected_token()));
         }
         match self.next()?.kind {
             TokenKind::Word(ident) => Ok(ident),
@@ -233,7 +245,7 @@ impl<'a> Parser<'a> {
         if self.eat(";")? || self.current.line_before || self.eof() || self.punct("}") {
             Ok(())
         } else {
-            Err(self.error("Expected ';'"))
+            Err(self.error(&self.unexpected_token()))
         }
     }
 }

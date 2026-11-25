@@ -475,7 +475,7 @@ pub(crate) fn primitive_prototype(ctx: &ExecCtx<'_, '_>, kind: ValueKind) -> Opt
 
 pub(crate) fn require_object_coercible(ctx: &mut ExecCtx<'_, '_>, value: Value) -> JsResult<()> {
     if matches!(value, Value::NULL | Value::UNDEFINED) {
-        Err(ctx.throw_type_error("cannot convert value to object"))
+        Err(ctx.throw_type_error("Cannot convert undefined or null to object"))
     } else {
         Ok(())
     }
@@ -488,7 +488,7 @@ pub fn to_object<'s>(ctx: &mut ExecCtx<'_, 's>, handle: Handle<'s>) -> JsResult<
         return Ok(handle);
     }
     let proto = primitive_prototype(ctx, kind)
-        .ok_or_else(|| ctx.throw_type_error("cannot convert value to object"))?;
+        .ok_or_else(|| ctx.throw_type_error("Cannot convert undefined or null to object"))?;
     macro_rules! boxed {
         ($variant:ident, $data:ident) => {{
             ctx.make_object(Some(proto), ObjectFlags::EXTENSIBLE, |ledger| {

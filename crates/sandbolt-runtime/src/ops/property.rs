@@ -485,12 +485,13 @@ fn namespace_binding(heap: &Heap, id: ObjId, key: PropKey) -> Option<VarRefId> {
         .find_map(|&(name, cell)| (name == key).then_some(cell))
 }
 
-fn namespace_value(ctx: &mut ExecCtx<'_, '_>, cell: VarRefId) -> JsResult<Value> {
+fn namespace_value(ctx: &mut ExecCtx<'_, '_>, key: PropKey, cell: VarRefId) -> JsResult<Value> {
     let value = crate::vm::exec::read_ref(ctx, cell);
     if value == Value::UNINITIALIZED {
+        let name = key_text(ctx.heap(), key);
         return Err(ctx.throw_error(
             crate::object::ErrorKind::Reference,
-            "module binding is not initialized",
+            &format!("{name} is not initialized"),
         ));
     }
     Ok(value)
@@ -502,7 +503,7 @@ fn own_descriptor(
     key: PropKey,
 ) -> JsResult<Option<PropertyDescriptor>> {
     if let Some(cell) = namespace_binding(ctx.heap(), id, key) {
-        let value = namespace_value(ctx, cell)?;
+        let value = namespace_value(ctx, key, cell)?;
         return Ok(Some(PropertyDescriptor {
             configurable: Some(false),
             ..PropertyDescriptor::data(value)
@@ -701,27 +702,71 @@ fn throw_nullish_read<'s>(
     receiver: ValueKind,
     key: Handle<'s>,
 ) -> JsResult<Value> {
+    Err(throw_nullish_access(
+        ctx,
+        receiver,
+        key,
+        "cannot read property '",
+    ))
+}
+
+pub(crate) fn throw_nullish_set_key(
+    ctx: &mut ExecCtx<'_, '_>,
+    receiver: ValueKind,
+    key: PropKey,
+) -> Abrupt {
+    match ctx.with_scope(|ctx| {
+        let key = super::convert::key_value(ctx, key)?;
+        Err::<(), _>(throw_nullish_access(
+            ctx,
+            receiver,
+            key,
+            "cannot set property '",
+        ))
+    }) {
+        Err(err) => err,
+        Ok(()) => unreachable!(),
+    }
+}
+
+fn throw_nullish_access<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    receiver: ValueKind,
+    key: Handle<'s>,
+    prefix: &str,
+) -> Abrupt {
     // Report the key without invoking ToPrimitive on objects.
     let text = match ctx.get(key).decode() {
-        ValueKind::Object(_) => ctx.new_string("{}")?,
-        ValueKind::Symbol(id) => match ctx.heap().symbols.get(id).unwrap().description {
-            SymbolDescription::None => ctx.new_string("")?,
-            SymbolDescription::String(id) => ctx.root(Value::string(id))?,
-            SymbolDescription::WellKnown(symbol) => ctx.new_string(symbol.description())?,
+        ValueKind::Object(_) => match ctx.new_string("{}") {
+            Ok(text) => text,
+            Err(err) => return err,
         },
+        ValueKind::Symbol(id) => {
+            let res = match ctx.heap().symbols.get(id).unwrap().description {
+                SymbolDescription::None => ctx.new_string(""),
+                SymbolDescription::String(id) => ctx.root(Value::string(id)),
+                SymbolDescription::WellKnown(symbol) => ctx.new_string(symbol.description()),
+            };
+            match res {
+                Ok(text) => text,
+                Err(err) => return err,
+            }
+        }
         ValueKind::String(_) => key,
-        _ => super::convert::to_string(ctx, key)?,
+        _ => match super::convert::to_string(ctx, key) {
+            Ok(text) => text,
+            Err(err) => return err,
+        },
     };
     let ValueKind::String(id) = ctx.get(text).decode() else {
         unreachable!()
     };
-    let prefix = "cannot read property '";
     let suffix = if matches!(receiver, ValueKind::Null) {
         "' of null"
     } else {
         "' of undefined"
     };
-    Err(ctx.throw_error_with(ErrorKind::Type, |heap| {
+    ctx.throw_error_with(ErrorKind::Type, |heap| {
         let key = || heap.string_units(id).take_while(|&unit| unit != 0);
         JsString::from_units(
             &heap.ledger,
@@ -732,7 +777,7 @@ fn throw_nullish_read<'s>(
                 .chain(key())
                 .chain(suffix.encode_utf16()),
         )
-    }))
+    })
 }
 
 pub fn get_property_with_receiver<'s>(
@@ -757,7 +802,7 @@ pub fn get_property_with_receiver<'s>(
         id
     } else {
         super::convert::primitive_prototype(ctx, kind)
-            .ok_or_else(|| ctx.throw_type_error("cannot convert value to object"))?
+            .ok_or_else(|| ctx.throw_type_error("Cannot convert undefined or null to object"))?
     };
     let receiver = ctx.get(receiver);
     ctx.with_scope(|ctx| {
@@ -795,7 +840,7 @@ fn get_from<'s>(
             continue;
         }
         if let Some(cell) = namespace_binding(ctx.heap(), id, key) {
-            return namespace_value(ctx, cell);
+            return namespace_value(ctx, key, cell);
         }
         if let Some(index) = typed_index(ctx.heap(), id, key) {
             return if let Some(index) = index {
@@ -883,6 +928,56 @@ pub fn set_property<'s>(
     set_property_with_receiver(ctx, object, key, value, object)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetFailure {
+    ReadOnly,
+    NotExtensible,
+    NoSetter,
+    NotObject,
+    Proxy,
+    Generic,
+}
+
+fn throw_set_failure(ctx: &mut ExecCtx<'_, '_>, key: PropKey, failure: SetFailure) -> Abrupt {
+    match failure {
+        SetFailure::ReadOnly => {
+            let name = key_text(ctx.heap(), key);
+            ctx.throw_type_error(&format!("'{name}' is read-only"))
+        }
+        SetFailure::NotExtensible => ctx.throw_type_error("object is not extensible"),
+        SetFailure::NoSetter => ctx.throw_type_error("no setter for property"),
+        SetFailure::NotObject => ctx.throw_type_error("not an object"),
+        SetFailure::Proxy => ctx.throw_type_error("proxy: cannot set property"),
+        SetFailure::Generic => ctx.throw_type_error("cannot assign property"),
+    }
+}
+
+pub(crate) fn set_property_strict<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    object: Handle<'s>,
+    key: PropKey,
+    value: Handle<'s>,
+    strict: bool,
+) -> JsResult<()> {
+    set_property_with_receiver_strict(ctx, object, key, value, object, strict)
+}
+
+pub(crate) fn set_property_with_receiver_strict<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    object: Handle<'s>,
+    key: PropKey,
+    value: Handle<'s>,
+    receiver: Handle<'s>,
+    strict: bool,
+) -> JsResult<()> {
+    if let Err(failure) = set_property_with_receiver_outcome(ctx, object, key, value, receiver)?
+        && strict
+    {
+        return Err(throw_set_failure(ctx, key, failure));
+    }
+    Ok(())
+}
+
 pub fn set_property_with_receiver<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     object: Handle<'s>,
@@ -890,6 +985,16 @@ pub fn set_property_with_receiver<'s>(
     value: Handle<'s>,
     receiver: Handle<'s>,
 ) -> JsResult<bool> {
+    set_property_with_receiver_outcome(ctx, object, key, value, receiver).map(|res| res.is_ok())
+}
+
+fn set_property_with_receiver_outcome<'s>(
+    ctx: &mut ExecCtx<'_, 's>,
+    object: Handle<'s>,
+    key: PropKey,
+    value: Handle<'s>,
+    receiver: Handle<'s>,
+) -> JsResult<Result<(), SetFailure>> {
     let id = ctx.object_id(object)?;
     if ctx.get(receiver) == Value::object(id) {
         let heap = ctx.heap();
@@ -903,7 +1008,7 @@ pub fn set_property_with_receiver<'s>(
             && ctx.runtime.vm.can_root_without_growing(4)
         {
             if !array.length_writable {
-                return Ok(false);
+                return Ok(Err(SetFailure::ReadOnly));
             }
             let ObjectData::Array(array) = &mut ctx.runtime.heap.objects.get_mut(id).unwrap().data
             else {
@@ -911,7 +1016,7 @@ pub fn set_property_with_receiver<'s>(
             };
             array.elements.truncate(length as usize);
             array.length = length as u32;
-            return Ok(true);
+            return Ok(Ok(()));
         }
         if !obj.flags.contains(ObjectFlags::IS_EXOTIC)
             && !matches!(obj.data, ObjectData::MappedArguments(_))
@@ -926,7 +1031,7 @@ pub fn set_property_with_receiver<'s>(
                     if is_proto {
                         invalidate_array_prototypes(ctx, id);
                     }
-                    return Ok(true);
+                    return Ok(Ok(()));
                 }
             } else if obj.flags.contains(ObjectFlags::EXTENSIBLE) {
                 let mut proto = shape.proto;
@@ -965,7 +1070,7 @@ pub fn set_property_with_receiver<'s>(
                     if is_proto {
                         invalidate_array_prototypes(ctx, id);
                     }
-                    return Ok(true);
+                    return Ok(Ok(()));
                 }
             }
         }
@@ -985,7 +1090,7 @@ fn set_from<'s>(
     key: PropKey,
     receiver: Handle<'s>,
     value: Handle<'s>,
-) -> JsResult<bool> {
+) -> JsResult<Result<(), SetFailure>> {
     loop {
         if let ObjectData::Proxy(proxy) = &ctx.heap().object(id).data {
             let (target, handler) = (proxy.target, proxy.handler);
@@ -999,34 +1104,35 @@ fn set_from<'s>(
                     let args = ctx.args(&[target_root, key_value, value, receiver])?;
                     let result = super::call::call(ctx, trap, handler, args)?;
                     if !super::convert::to_boolean_value(ctx.heap(), result) {
-                        return Ok(false);
+                        return Ok(Err(SetFailure::Proxy));
                     }
                     if let Some(desc) = get_own_property_descriptor(ctx, target_root, key)? {
                         check_proxy_get_set(ctx, desc, ctx.get(value), true)?;
                     }
-                    return Ok(true);
+                    return Ok(Ok(()));
                 }
             }
             id = target;
             continue;
         }
         if module_namespace(ctx.heap(), id).is_some() {
-            return Ok(false);
+            return Ok(Err(SetFailure::ReadOnly));
         }
         if let Some(index) = typed_index(ctx.heap(), id, key) {
             let same_receiver = ctx.get(receiver) == Value::object(id);
             if same_receiver {
                 return crate::builtins::typed_atomics::typed_array_set_index(
                     ctx, id, index, value,
-                );
+                )
+                .map(|ok| if ok { Ok(()) } else { Err(SetFailure::Generic) });
             }
             if !typed_has(ctx.heap(), id, index) {
-                return Ok(true);
+                return Ok(Ok(()));
             }
             break;
         }
         if string_property(ctx.heap(), id, key).is_some() {
-            return Ok(false);
+            return Ok(Err(SetFailure::ReadOnly));
         }
         if let Some((old, flags)) = own(ctx.heap(), id, key) {
             if let ValueKind::Accessor(acc) = old.decode() {
@@ -1035,15 +1141,15 @@ fn set_from<'s>(
                     setter = materialize_accessor_fn(ctx, acc, key, true, setter)?;
                 }
                 if setter == Value::UNDEFINED {
-                    return Ok(false);
+                    return Ok(Err(SetFailure::NoSetter));
                 }
                 let callee = ctx.root(setter)?;
                 let args = ctx.args(&[value])?;
                 super::call::call(ctx, callee, receiver, args)?;
-                return Ok(true);
+                return Ok(Ok(()));
             }
             if !flags.contains(PropFlags::WRITABLE) {
-                return Ok(false);
+                return Ok(Err(SetFailure::ReadOnly));
             }
             break;
         }
@@ -1052,14 +1158,17 @@ fn set_from<'s>(
         };
         id = proto;
     }
-    if ctx.get(receiver).as_object().is_none() {
-        return Ok(false);
-    }
+    let Some(receiver_id) = ctx.get(receiver).as_object() else {
+        return Ok(Err(SetFailure::NotObject));
+    };
     if let Some(desc) = get_own_property_descriptor(ctx, receiver, key)? {
-        if desc.is_accessor() || desc.writable == Some(false) {
-            return Ok(false);
+        if desc.is_accessor() {
+            return Ok(Err(SetFailure::NoSetter));
         }
-        define_own_property(
+        if desc.writable == Some(false) {
+            return Ok(Err(SetFailure::ReadOnly));
+        }
+        let ok = define_own_property(
             ctx,
             receiver,
             key,
@@ -1067,9 +1176,23 @@ fn set_from<'s>(
                 value: Some(value),
                 ..PropertyDescriptor::default()
             },
-        )
+        )?;
+        Ok(if ok {
+            Ok(())
+        } else if is_proxy(ctx, receiver_id) {
+            Err(SetFailure::Proxy)
+        } else {
+            Err(SetFailure::ReadOnly)
+        })
     } else {
-        define_own_property(ctx, receiver, key, PropertyDescriptor::data(value))
+        let ok = define_own_property(ctx, receiver, key, PropertyDescriptor::data(value))?;
+        Ok(if ok {
+            Ok(())
+        } else if is_proxy(ctx, receiver_id) {
+            Err(SetFailure::Proxy)
+        } else {
+            Err(SetFailure::NotExtensible)
+        })
     }
 }
 
@@ -1439,7 +1562,7 @@ fn define_raw(
         return proxy_define(ctx, id, key, desc);
     }
     if let Some(cell) = namespace_binding(ctx.heap(), id, key) {
-        let value = namespace_value(ctx, cell)?;
+        let value = namespace_value(ctx, key, cell)?;
         return Ok(!desc.is_accessor()
             && desc.configurable != Some(true)
             && desc.enumerable != Some(false)
@@ -1713,6 +1836,23 @@ fn define_new_slot(
         object.shape = next;
         Ok(())
     })
+}
+
+pub(crate) fn define_plain_data(
+    ctx: &mut ExecCtx<'_, '_>,
+    id: ObjId,
+    key: PropKey,
+    value: Value,
+) -> JsResult<()> {
+    define_slot(
+        ctx,
+        id,
+        ShapeProp {
+            key,
+            flags: PropFlags::DEFAULT_DATA,
+        },
+        value,
+    )
 }
 
 fn define_slot(

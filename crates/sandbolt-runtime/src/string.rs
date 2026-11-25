@@ -340,12 +340,49 @@ impl UnitBuffer {
     }
 
     /// Adds `unit`, which [`Self::reserve`] made room for.
+    #[inline]
     pub(crate) fn push_reserved(&mut self, unit: u16) {
         match self {
             Self::Latin1(bytes) => {
                 bytes.push_reserved(u8::try_from(unit).expect("a unit above 0xFF in Latin-1"));
             }
             Self::Utf16(units) => units.push_reserved(unit),
+        }
+    }
+
+    /// Adds Latin-1 `byte`, which [`Self::reserve`] made room for.
+    #[inline]
+    pub(crate) fn push_byte_reserved(&mut self, byte: u8) {
+        match self {
+            Self::Latin1(bytes) => bytes.push_reserved(byte),
+            Self::Utf16(units) => units.push_reserved(u16::from(byte)),
+        }
+    }
+
+    /// Adds Latin-1 `slice`, which [`Self::reserve`] made room for.
+    #[inline]
+    pub(crate) fn push_latin1_reserved(&mut self, slice: &[u8]) {
+        match self {
+            Self::Latin1(bytes) => bytes.extend_from_slice_reserved(slice),
+            Self::Utf16(units) => {
+                for &byte in slice {
+                    units.push_reserved(u16::from(byte));
+                }
+            }
+        }
+    }
+
+    /// Adds UTF-16 `slice`, which [`Self::reserve`] made room for (with `wide = true`
+    /// if any unit is above 0xFF).
+    #[inline]
+    pub(crate) fn push_utf16_reserved(&mut self, slice: &[u16]) {
+        match self {
+            Self::Latin1(bytes) => {
+                for &unit in slice {
+                    bytes.push_reserved(u8::try_from(unit).expect("a unit above 0xFF in Latin-1"));
+                }
+            }
+            Self::Utf16(units) => units.extend_from_slice_reserved(slice),
         }
     }
 
