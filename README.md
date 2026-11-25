@@ -43,7 +43,7 @@ Use `set_interrupt_handler` to stop scripts with an uncatchable `EngineError::In
 
 ## Benchmarks and footprint
 
-The table compares default release builds of Sandbolt (`cargo build --release`, `rustc 1.97.1`) against C QuickJS-ng v0.17.0 (`-O3 -DNDEBUG`). Clang 21.1.8 was the fastest of three C compilers tested, and ratios below 1.000 mean Sandbolt took less time.
+The table compares default release builds of Sandbolt at commit `5d1faf5` (`cargo build --release`, `rustc 1.97.1`) against C QuickJS-ng v0.17.0 (`6d46d07`, `-O3 -DNDEBUG`). Clang 21.1.8 was the fastest of three C compilers tested, and ratios below 1.000 mean Sandbolt took less time.
 
 | Metric | Sandbolt | C QuickJS-ng v0.17.0 |
 |---|---:|---:|
