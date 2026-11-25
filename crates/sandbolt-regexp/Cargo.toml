@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "ECMAScript regular expression compiler and VM for Sandbolt"
+readme = "README.md"
+keywords = ["javascript", "ecmascript", "quickjs", "regex", "regexp"]
+categories = ["text-processing", "parser-implementations"]
 
 [dependencies]
 sandbolt-unicode.workspace = true

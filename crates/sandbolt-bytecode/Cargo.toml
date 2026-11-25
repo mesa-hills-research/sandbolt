@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Bytecode format, codec, verifier and disassembler for Sandbolt"
+readme = "README.md"
+keywords = ["javascript", "ecmascript", "quickjs", "bytecode", "disassembler"]
+categories = ["compilers", "encoding"]
 
 [lints]
 workspace = true

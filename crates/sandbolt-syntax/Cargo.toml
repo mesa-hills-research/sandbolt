@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "ECMAScript lexer, parser and syntax validator for Sandbolt"
+readme = "README.md"
+keywords = ["javascript", "ecmascript", "quickjs", "parser", "ast"]
+categories = ["parsing", "parser-implementations"]
 
 [dependencies]
 sandbolt-unicode.workspace = true

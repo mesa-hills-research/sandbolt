@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "JavaScript runtime and VM for Sandbolt, a pure-Rust port of QuickJS-ng v0.17.0"
+readme = "../../README.md"
+keywords = ["javascript", "ecmascript", "quickjs", "sandbox", "interpreter"]
+categories = ["compilers", "development-tools"]
 
 [features]
 default = []

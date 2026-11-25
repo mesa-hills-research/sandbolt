@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "ECMAScript number parsing and formatting (dtoa/atod) for Sandbolt"
+readme = "README.md"
+keywords = ["javascript", "ecmascript", "quickjs", "dtoa", "formatting"]
+categories = ["value-formatting", "parsing"]
 
 [lints]
 workspace = true

@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "ECMAScript BigInt arithmetic and conversions for Sandbolt"
+readme = "README.md"
+keywords = ["javascript", "ecmascript", "quickjs", "bigint", "math"]
+categories = ["mathematics", "algorithms"]
 
 [lints]
 workspace = true

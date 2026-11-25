@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "ECMAScript bytecode compiler for Sandbolt"
+readme = "README.md"
+keywords = ["javascript", "ecmascript", "quickjs", "compiler", "bytecode"]
+categories = ["compilers"]
 
 [dependencies]
 sandbolt-syntax.workspace = true
