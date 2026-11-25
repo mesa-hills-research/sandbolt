@@ -1,6 +1,7 @@
 //! Atom IDs shared by the lexer, compiler and VM.
 
 use std::fmt;
+use std::sync::OnceLock;
 
 macro_rules! builtin_atoms {
     ($first:ident => $first_text:literal, $($atom:ident => $text:literal,)+) => {
@@ -285,6 +286,25 @@ impl BuiltinAtom {
         }
     }
 
+    /// The predefined atom spelled `text`, the first in ID order where two
+    /// share a spelling.
+    pub fn from_text(text: &[u8]) -> Option<Self> {
+        static BY_TEXT: OnceLock<Vec<(&'static [u8], BuiltinAtom)>> = OnceLock::new();
+        let by_text = BY_TEXT.get_or_init(|| {
+            let mut all: Vec<_> = Self::ALL
+                .iter()
+                .map(|&atom| (atom.as_str().as_bytes(), atom))
+                .collect();
+            all.sort_by_key(|&(text, atom)| (text, atom as u32));
+            all.dedup_by_key(|&mut (text, _)| text);
+            all
+        });
+        by_text
+            .binary_search_by_key(&text, |&(spelling, _)| spelling)
+            .ok()
+            .map(|i| by_text[i].1)
+    }
+
     /// Looks up the keyword and reserved-word prefix, including `using`
     /// and `await`. The parser decides when contextual words are reserved.
     pub fn from_str_keyword(text: &str) -> Option<Self> {
@@ -348,5 +368,31 @@ impl UnitAtom {
 impl From<BuiltinAtom> for UnitAtom {
     fn from(atom: BuiltinAtom) -> Self {
         atom.id()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_text_finds_the_first_atom_of_each_spelling() {
+        for atom in BuiltinAtom::ALL {
+            let first = BuiltinAtom::ALL
+                .iter()
+                .find(|other| other.as_str() == atom.as_str());
+            assert_eq!(
+                BuiltinAtom::from_text(atom.as_str().as_bytes()).as_ref(),
+                first
+            );
+        }
+        for text in ["", "lengthy", "Length", "toStrin", "\u{e9}"] {
+            let expected = BuiltinAtom::ALL.iter().find(|atom| atom.as_str() == text);
+            assert_eq!(
+                BuiltinAtom::from_text(text.as_bytes()).as_ref(),
+                expected,
+                "{text:?}"
+            );
+        }
     }
 }

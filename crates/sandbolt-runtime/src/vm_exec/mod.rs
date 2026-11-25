@@ -35,6 +35,7 @@ use crate::vm::{CallFrame, CompiledFunc, VarRefState};
 pub(crate) use bindings::{read_ref, write_ref};
 pub(crate) use fast::FastProgram;
 pub(crate) use iterators::{async_from_sync_call, close_original, for_in_next, iterator_result};
+pub(crate) use load::Origin;
 
 pub(crate) use coroutines::resume_generator;
 pub(crate) use objects::brand_key;
@@ -5240,11 +5241,12 @@ pub(crate) fn execute_image(
     ctx: &mut ExecCtx<'_, '_>,
     image: &sandbolt_bytecode::ProgramImage,
     source: Option<&SourceText>,
+    origin: Origin,
 ) -> JsResult<Value> {
     if !image.modules.is_empty() {
-        return modules::evaluate_image(ctx, image, source);
+        return modules::evaluate_image(ctx, image, source, origin);
     }
-    let entry = load::load(ctx, image, source)?;
+    let entry = load::load(ctx, image, source, origin)?;
     let this = ctx.root(Value::object(ctx.realm().global_object))?;
     call::call(ctx, entry, this, Args::empty())
 }

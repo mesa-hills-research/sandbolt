@@ -73,6 +73,16 @@ impl std::error::Error for ImageVerifyError {
 
 /// Checks every function and the image's cross-table references.
 pub fn verify_image(image: &ProgramImage) -> Result<(), ImageVerifyError> {
+    check_image(image, true)
+}
+
+/// Checks the image's cross-table references, for an image whose functions
+/// were each checked as they were assembled ([`compute_stack_size`]).
+pub fn verify_image_references(image: &ProgramImage) -> Result<(), ImageVerifyError> {
+    check_image(image, false)
+}
+
+fn check_image(image: &ProgramImage, functions: bool) -> Result<(), ImageVerifyError> {
     let metadata = |message: &str| ImageVerifyError::Metadata(message.into());
     if image.entry_function as usize >= image.functions.len() {
         return Err(metadata("entry function index is out of bounds"));
@@ -90,7 +100,9 @@ pub fn verify_image(image: &ProgramImage) -> Result<(), ImageVerifyError> {
                 "dynamic atom count exceeds the image table",
             )));
         }
-        verify(func).map_err(function_error)?;
+        if functions {
+            verify(func).map_err(function_error)?;
+        }
         for constant in &func.constants {
             if let ConstEntry::Function(child) = constant {
                 let child = image.functions.get(*child as usize).ok_or_else(|| {

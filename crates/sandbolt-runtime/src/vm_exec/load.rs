@@ -12,13 +12,23 @@ use crate::shape::PropFlags;
 use crate::value::*;
 use crate::vm::{BytecodeFunc, CompiledFunc};
 
+/// Where an image came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// This runtime's compiler, which verified it.
+    Compiler,
+    /// A caller, so it's verified before it loads.
+    Caller,
+}
+
 pub(super) fn load<'s>(
     ctx: &mut ExecCtx<'_, 's>,
     image: &ProgramImage,
     source: Option<&SourceText>,
+    origin: Origin,
 ) -> JsResult<Handle<'s>> {
     let entry = ctx.with_scope(|ctx| {
-        let functions = load_functions(ctx, image, source)?;
+        let functions = load_functions(ctx, image, source, origin)?;
         make_function(ctx, functions[image.entry_function as usize], &[]).map(|h| ctx.get(h))
     })?;
     ctx.root(entry)
@@ -28,9 +38,12 @@ pub(super) fn load_functions(
     ctx: &mut ExecCtx<'_, '_>,
     image: &ProgramImage,
     source: Option<&SourceText>,
+    origin: Origin,
 ) -> JsResult<TrackedVec<BcId>> {
-    sandbolt_bytecode::verify_image(image)
-        .map_err(|error| ctx.throw_error(ErrorKind::Syntax, &error.to_string()))?;
+    if origin == Origin::Caller {
+        sandbolt_bytecode::verify_image(image)
+            .map_err(|error| ctx.throw_error(ErrorKind::Syntax, &error.to_string()))?;
+    }
     let mut atoms = TrackedVec::new();
     ctx.allocate(|rt| atoms.try_reserve_exact(&rt.heap.ledger, image.atoms.len()))?;
     for text in &image.atoms {

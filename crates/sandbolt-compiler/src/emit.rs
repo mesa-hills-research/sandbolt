@@ -138,7 +138,8 @@ pub(crate) fn compile(
         emitter.charge(draft.ir.len().saturating_mul(40))?;
         image.functions.push(crate::assemble::assemble(draft)?);
     }
-    sandbolt_bytecode::verify_image(&image)
+    // (Assembling checked each function as it computed its stack size.)
+    sandbolt_bytecode::verify_image_references(&image)
         .map_err(|error| CompileError::Bytecode(error.to_string()))?;
     Ok(image)
 }
@@ -200,14 +201,15 @@ impl<'a> Emitter<'a> {
     }
 
     pub(crate) fn atom(&mut self, text: &str) -> Result<UnitAtom> {
+        if let Some(atom) = BuiltinAtom::from_text(text.as_bytes()) {
+            return Ok(atom.id());
+        }
         self.atom_string(string(&JsStrLit::from_units(text.encode_utf16().collect())))
     }
 
     pub(crate) fn atom_string(&mut self, value: ConstString) -> Result<UnitAtom> {
         if let ConstString::Latin1(bytes) = &value
-            && let Some(atom) = BuiltinAtom::ALL
-                .iter()
-                .find(|atom| atom.as_str().as_bytes() == bytes)
+            && let Some(atom) = BuiltinAtom::from_text(bytes)
         {
             return Ok(atom.id());
         }

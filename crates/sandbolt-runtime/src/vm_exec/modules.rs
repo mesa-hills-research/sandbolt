@@ -39,9 +39,10 @@ pub(super) fn evaluate_image(
     ctx: &mut ExecCtx<'_, '_>,
     image: &ProgramImage,
     source: Option<&SourceText>,
+    origin: load::Origin,
 ) -> JsResult<Value> {
     let linked = ctx.with_scope(|ctx| {
-        let id = register_image(ctx, image, source, NO_ATTRIBUTES)?;
+        let id = register_image(ctx, image, source, NO_ATTRIBUTES, origin)?;
         link(ctx, id)?;
         Ok(id)
     });
@@ -78,8 +79,9 @@ fn register_image(
     image: &ProgramImage,
     source: Option<&SourceText>,
     attributes: u8,
+    origin: load::Origin,
 ) -> JsResult<ModId> {
-    let functions = load::load_functions(ctx, image, source)?;
+    let functions = load::load_functions(ctx, image, source, origin)?;
     let saved_modules = ctx.runtime.modules.len();
     let result = (|| {
         let mut primary = None;
@@ -362,7 +364,13 @@ fn resolve_request(
         }
         let source = SourceText::from_utf8(name, &source);
         let image = crate::api::compile_text(ctx, &source, parse)?;
-        return register_image(ctx, &image, Some(&source), request.attributes);
+        return register_image(
+            ctx,
+            &image,
+            Some(&source),
+            request.attributes,
+            load::Origin::Compiler,
+        );
     }
     let value = match loaded {
         ResolvedModule::Json { source, .. } => {

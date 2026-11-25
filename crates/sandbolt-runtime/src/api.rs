@@ -182,7 +182,7 @@ impl JsEngine {
             .map_err(|error| compile_failure(&source, error))?;
         let realm = self.default_realm();
         let result = self.runtime.with_scope(realm, |ctx| {
-            let value = exec::execute_image(ctx, &image, Some(&source))?;
+            let value = exec::execute_image(ctx, &image, Some(&source), exec::Origin::Compiler)?;
             finish(ctx, value)
         });
         self.runtime.clear_kept_objects();
@@ -201,9 +201,9 @@ impl JsEngine {
     ) -> Result<(), EngineError> {
         self.begin_eval().map_err(|e| e.error)?;
         let realm = self.default_realm();
-        let result = self
-            .runtime
-            .with_scope(realm, |ctx| exec::execute_image(ctx, image, source));
+        let result = self.runtime.with_scope(realm, |ctx| {
+            exec::execute_image(ctx, image, source, exec::Origin::Caller)
+        });
         self.runtime.clear_kept_objects();
         result
             .map(|_| ())
@@ -347,7 +347,7 @@ pub(crate) fn eval_text(
 ) -> JsResult<Value> {
     ctx.check_interrupt()?;
     let image = compile_text(ctx, source, parse)?;
-    exec::execute_image(ctx, &image, Some(source))
+    exec::execute_image(ctx, &image, Some(source), exec::Origin::Compiler)
 }
 
 pub(crate) fn compile_text(

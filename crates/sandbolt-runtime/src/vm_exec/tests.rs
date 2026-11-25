@@ -1548,7 +1548,7 @@ fn regexp_literals_share_code_but_not_last_index() {
     let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
     let realm = engine.default_realm();
     engine.runtime_mut().with_scope(realm, |ctx| {
-        let object = super::execute_image(ctx, &image, None)
+        let object = super::execute_image(ctx, &image, None, super::Origin::Caller)
             .unwrap()
             .as_object()
             .unwrap();
@@ -1929,5 +1929,28 @@ fn cached_global_lexicals_keep_their_checks() {
     assert_eq!(
         eval("[attempt(bump), attempt(bump), fixed, attempt(write, 7), read()].join()"),
         "TypeError,TypeError,1,ok,7"
+    );
+}
+
+/// Names stay resolvable after a collection drops the atoms of others.
+#[test]
+fn atoms_resolve_after_a_collection_prunes_others() {
+    let mut engine = JsEngine::new(EngineLimits::default()).unwrap();
+    let options = EvalOptions::default();
+    engine
+        .eval(
+            "globalThis.keep = {}; for (let i = 0; i < 200; i++) { ({})['gone' + i] = 1; keep['kept' + i] = i; }",
+            options.clone(),
+        )
+        .unwrap();
+    engine.collect_garbage();
+    assert_eq!(
+        engine
+            .eval_to_string(
+                "const names = Object.keys(keep); [names.length, keep.kept150, names[199], keep['kept' + 7]].join()",
+                options,
+            )
+            .unwrap(),
+        "200,150,kept199,7"
     );
 }

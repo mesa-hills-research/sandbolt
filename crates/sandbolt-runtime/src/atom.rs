@@ -171,18 +171,36 @@ impl AtomTable {
     }
 
     pub fn dynamic_string(&self, atom: Atom) -> Option<StrId> {
-        let index = self
-            .dynamic
+        // Atoms are issued in order and pruning only closes gaps, so an
+        // atom sits at its issue number or before it.
+        let issued = atom.0.checked_sub(FIRST_DYNAMIC_ATOM)? as usize;
+        if let Some(entry) = self.dynamic.get(issued)
+            && entry.atom == atom
+        {
+            return Some(entry.id);
+        }
+        let before = &self.dynamic[..issued.min(self.dynamic.len())];
+        let index = before
             .binary_search_by_key(&atom.0, |entry| entry.atom.0)
             .ok()?;
-        Some(self.dynamic[index].id)
+        Some(before[index].id)
     }
 
+    /// The hash of the units' bytes, fed to the hasher in runs. It equals
+    /// feeding them one unit at a time.
     fn content_hash(&self, units: impl Iterator<Item = u16>) -> u64 {
         let mut hasher = self.seed.build_hasher();
+        let mut run = [0u8; 128];
+        let mut filled = 0;
         for unit in units {
-            hasher.write_u16(unit);
+            run[filled..filled + 2].copy_from_slice(&unit.to_ne_bytes());
+            filled += 2;
+            if filled == run.len() {
+                hasher.write(&run);
+                filled = 0;
+            }
         }
+        hasher.write(&run[..filled]);
         hasher.finish()
     }
 
@@ -587,6 +605,23 @@ pub const BUILTIN_ATOMS: [&str; 241] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_content_hash_fed_in_runs_equals_one_fed_unit_by_unit() {
+        let table = AtomTable::default();
+        for len in [0, 1, 2, 63, 64, 65, 128, 200] {
+            let units: Vec<u16> = (0..len).map(|i| (i * 7919 % 65_536) as u16).collect();
+            let mut hasher = table.seed.build_hasher();
+            for &unit in &units {
+                hasher.write_u16(unit);
+            }
+            assert_eq!(
+                table.content_hash(units.iter().copied()),
+                hasher.finish(),
+                "{len}"
+            );
+        }
+    }
 
     #[test]
     fn atom_ids_and_indices() {

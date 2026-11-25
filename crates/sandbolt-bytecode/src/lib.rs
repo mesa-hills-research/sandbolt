@@ -16,4 +16,7 @@ pub use disasm::{disassemble_function, disassemble_image};
 pub use image::*;
 pub use ir::*;
 pub use opcode::*;
-pub use verify::{ImageVerifyError, VerifyError, compute_stack_size, verify, verify_image};
+pub use verify::{
+    ImageVerifyError, VerifyError, compute_stack_size, verify, verify_image,
+    verify_image_references,
+};

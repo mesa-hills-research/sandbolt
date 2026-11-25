@@ -608,26 +608,27 @@ impl Emitter<'_> {
                 }
             }
             let f = self.fm();
-            f.ir = out
-                .into_iter()
-                .flat_map(|op| {
-                    match op {
-                        IrOp::Resolved(Instruction {
-                            opcode: SetLocUninitialized,
-                            operands: Operands::Local(n),
-                        }) if f.local(n).captured => {
-                            // A throw can skip the scope exit. Detach the old cell before resetting its slot.
-                            [Some(resolved(CloseLoc, Operands::Local(n))), Some(op)]
-                        }
-                        IrOp::Resolved(Instruction {
-                            opcode: CloseLoc,
-                            operands: Operands::Local(n),
-                        }) if !f.local(n).captured => [None, None],
-                        _ => [Some(op), None],
+            let mut ir = Vec::new();
+            ir.try_reserve_exact(out.len())
+                .map_err(|_| CompileError::OutOfMemory)?;
+            for op in out {
+                match op {
+                    IrOp::Resolved(Instruction {
+                        opcode: SetLocUninitialized,
+                        operands: Operands::Local(n),
+                    }) if f.local(n).captured => {
+                        // A throw can skip the scope exit. Detach the old cell before resetting its slot.
+                        ir.push(resolved(CloseLoc, Operands::Local(n)));
+                        ir.push(op);
                     }
-                })
-                .flatten()
-                .collect();
+                    IrOp::Resolved(Instruction {
+                        opcode: CloseLoc,
+                        operands: Operands::Local(n),
+                    }) if !f.local(n).captured => {}
+                    _ => ir.push(op),
+                }
+            }
+            f.ir = ir;
         }
         Ok(())
     }

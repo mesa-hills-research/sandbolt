@@ -40,7 +40,7 @@ pub(crate) fn execute_indirect<'s>(
     }
     let source = SourceText::from_utf16("<input>", ctx.heap().string_units(string).collect());
     let image = crate::api::compile_text(ctx, &source, parse)?;
-    let functions = load::load_functions(ctx, &image, Some(&source))?;
+    let functions = load::load_functions(ctx, &image, Some(&source), load::Origin::Compiler)?;
     let code = functions[image.entry_function as usize];
     let compiled = ctx
         .runtime
@@ -123,7 +123,7 @@ pub(super) fn execute(
             find_cell(ctx, &environment, home).unwrap_or(fallback_home),
         ]
     };
-    let functions = load::load_functions(ctx, &image, Some(&source))?;
+    let functions = load::load_functions(ctx, &image, Some(&source), load::Origin::Compiler)?;
     for (index, &function) in functions.iter().enumerate() {
         let entry = index == image.entry_function as usize;
         let eval = ctx.allocate(|rt| {
